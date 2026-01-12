@@ -52,11 +52,48 @@ dev = [
     "ipywidgets>=8.1.5",
     "matplotlib>=3.10.0",
     "pynvml>=12.0.0",
+    "faiss-cpu>=1.7.0",  # FAISS for similarity search
 ]
 rlds = [
     "dlimp",
     "tensorflow-cpu==2.15.0",
     "tensorflow-datasets==4.9.9",
+]
+libero = [
+    # MuJoCo and robotics simulation
+    "mujoco==3.2.3",
+    "robosuite==1.4.1",
+    "bddl==1.0.1",
+    # LIBERO core dependencies
+    "hydra-core==1.2.0",
+    "easydict==1.9",
+    # "robomimic==0.2.0",  # Commented out: requires egl-probe which needs CMake, not used in evaluation
+    "thop==0.1.1-2209072238",
+    "future==0.18.2",
+    "cloudpickle==2.1.0",
+    "gym==0.25.2",
+    # Graphics and visualization
+    "glfw==1.12.0",
+    "pyopengl==3.1.7",
+    "pynput==1.7.7",
+    "python-xlib==0.33",
+    "evdev==1.7.1",
+    # Additional utilities
+    "absl-py==2.1.0",
+    "etils>=1.9.1",  # Updated: tensorflow-datasets requires >=1.9.1 (was 1.3.0 in old LIBERO)
+    "numba>=0.57.0",  # Updated for Python 3.11 compatibility
+    "scipy>=1.11.1",  # Updated: jax requires >=1.11.1, was 1.10.1 in old LIBERO
+    "termcolor==2.4.0",
+    "llvmlite>=0.40.0",  # Version 0.36.0 doesn't support Python 3.11
+    # LIBERO requirements
+    "imageio[ffmpeg]>=2.35.1",
+    "tqdm>=4.67.1",
+    "pyyaml>=6.0.2",
+    "opencv-python>=4.6.0.66",
+    "matplotlib>=3.5.3",
+    "faiss-cpu>=1.7.0",  # FAISS for similarity search (used in build_faiss_index_incremental.py)
+    # Note: torch versions - using meta_vlas version (2.7.1) for Python 3.11 compatibility
+    # LIBERO originally used torch==1.11.0+cu113, but that's incompatible with Python 3.11
 ]
 
 [tool.uv]

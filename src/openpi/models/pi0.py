@@ -38,7 +38,11 @@ def make_attn_mask(input_mask, mask_ar):
         it and false where it shares the same attention mask as the previous token.
     """
     mask_ar = jnp.broadcast_to(mask_ar, input_mask.shape)
+
+    # with b=1 -> [0 0 0 1 1 1 2 2 2 2] for instance
     cumsum = jnp.cumsum(mask_ar, axis=1)
+    # [[0 0 1 1 2 2]] <= [[0] [0] [1] [1] [2] [2]]
+    # => [[1 1 0 0 0 0] [1 1 1 1 0 0] [1 1 1 1 1 1]]
     attn_mask = cumsum[:, None, :] <= cumsum[:, :, None]
     valid_mask = input_mask[:, None, :] * input_mask[:, :, None]
     return jnp.logical_and(attn_mask, valid_mask)
@@ -106,14 +110,31 @@ class Pi0(_model.BaseModel):
     def embed_prefix(
         self, obs: _model.Observation
     ) -> tuple[at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Bool[at.Array, " s"]]:
+        """
+        Embeds the prefix of the sequence.
+        The prefix is the initial part of the sequence that is used to condition the model.
+        It includes the images and the tokenized prompt.
+        The output is a tuple of tokens, input masks, and autoregressive masks.
+        - Input masks are used to mask out the padding tokens.
+        - Autoregressive masks are used to mask out the future tokens.
+        Args:
+            obs: _model.Observation
+        Returns:
+            tuple[at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Bool[at.Array, " s"]]:
+                tokens: (b, s_total, emb)
+                input_mask: (b, s_total)
+                ar_mask: (s_total)
+        """
         input_mask = []
         ar_mask = []
         tokens = []
         # embed images
         for name in obs.images:
+            # Encode image into tokens -> shape: (b, s, emb)
             image_tokens, _ = self.PaliGemma.img(obs.images[name], train=False)
 
             tokens.append(image_tokens)
+            # mask is boolean with shape (b,) -> repeat to (b, s)
             input_mask.append(
                 einops.repeat(
                     obs.image_masks[name],
@@ -122,6 +143,7 @@ class Pi0(_model.BaseModel):
                 )
             )
             # image tokens attend to each other
+            # TODO: check why False?
             ar_mask += [False] * image_tokens.shape[1]
 
         # add language (aka tokenized inputs)
@@ -131,7 +153,10 @@ class Pi0(_model.BaseModel):
             input_mask.append(obs.tokenized_prompt_mask)
             # full attention between image and language inputs
             ar_mask += [False] * tokenized_inputs.shape[1]
+        # Concatenate tokens along the sequence dimension -> shape: (b, s_total, emb)
+        # s_total = num_tokens_images + num_tokens_prompt
         tokens = jnp.concatenate(tokens, axis=1)
+        # Concatenate input masks along the sequence dimension -> shape: (b, s_total)
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)
         return tokens, input_mask, ar_mask
@@ -148,28 +173,33 @@ class Pi0(_model.BaseModel):
         input_mask = []
         ar_mask = []
         tokens = []
+        # Note pi0 encodes state, while pi0.5 does not.
         if not self.pi05:
-            # add a single state token
+            # add a single state token (projected to emb dim) -> shape: (b, 1, emb)
             state_token = self.state_proj(obs.state)[:, None, :]
             tokens.append(state_token)
             input_mask.append(jnp.ones((obs.state.shape[0], 1), dtype=jnp.bool_))
             # image/language inputs do not attend to state or actions
             ar_mask += [True]
 
-        action_tokens = self.action_in_proj(noisy_actions)
+        action_tokens = self.action_in_proj(noisy_actions) # shape: (b, s, emb)
         # embed timestep using sine-cosine positional encoding with sensitivity in the range [0, 1]
         time_emb = posemb_sincos(timestep, self.action_in_proj.out_features, min_period=4e-3, max_period=4.0)
         if self.pi05:
             # time MLP (for adaRMS)
+            # swish is an activation function: swish(x) = x * sigmoid(x)
             time_emb = self.time_mlp_in(time_emb)
             time_emb = nnx.swish(time_emb)
             time_emb = self.time_mlp_out(time_emb)
             time_emb = nnx.swish(time_emb)
+            # In pi0.5, the action tokens are ...
             action_expert_tokens = action_tokens
             adarms_cond = time_emb
         else:
             # mix timestep + action information using an MLP (no adaRMS)
             time_tokens = einops.repeat(time_emb, "b emb -> b s emb", s=self.action_horizon)
+            # In pi0, action tokens are concatenated with time tokens [a1, t1], [a2, t2], ...
+            # And processed by a MLP -> we get the action expert tokens
             action_time_tokens = jnp.concatenate([action_tokens, time_tokens], axis=-1)
             action_time_tokens = self.action_time_mlp_in(action_time_tokens)
             action_time_tokens = nnx.swish(action_time_tokens)
@@ -194,6 +224,7 @@ class Pi0(_model.BaseModel):
 
         batch_shape = actions.shape[:-2]
         noise = jax.random.normal(noise_rng, actions.shape)
+        # Draw a random diffusion timestep t ~ Beta(1.5, 1) in (0.001, 1.0)
         time = jax.random.beta(time_rng, 1.5, 1, batch_shape) * 0.999 + 0.001
         time_expanded = time[..., None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
@@ -209,6 +240,7 @@ class Pi0(_model.BaseModel):
         (prefix_out, suffix_out), _ = self.PaliGemma.llm(
             [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond]
         )
+        # v_t predicts "noise - action"
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
         return jnp.mean(jnp.square(v_t - u_t), axis=-1)
@@ -238,6 +270,8 @@ class Pi0(_model.BaseModel):
 
         def step(carry):
             x_t, time = carry
+
+            # The "suffix" consists of the current noisy action $x_t$ and the current timestamp $t$.
             suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
                 observation, x_t, jnp.broadcast_to(time, batch_size)
             )
@@ -266,8 +300,14 @@ class Pi0(_model.BaseModel):
                 adarms_cond=[None, adarms_cond],
             )
             assert prefix_out is None
+            # It is not using prefix as kv_cache is used.
+            # prediction: velocity at time t
             v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
+            # Return update: partial denoising step: x_t + dt * v_t
+            # the new time is time + dt
+
+            # v_t predicts "noise - action"
             return x_t + dt * v_t, time + dt
 
         def cond(carry):

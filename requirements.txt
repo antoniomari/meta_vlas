@@ -1,0 +1,114 @@
+# Requirements for meta_vlas + LIBERO environment
+# Compatible with Python 3.11.9 (as used in Dockerfile)
+#
+# Note: This combines dependencies from:
+# - meta_vlas (pyproject.toml)
+# - LIBERO (third_party/libero/requirements.txt + examples/libero/requirements.txt)
+#
+# Some version conflicts exist between meta_vlas (newer) and LIBERO (older).
+# This file prioritizes meta_vlas versions where possible.
+
+# Core meta_vlas dependencies
+augmax>=0.3.4
+dm-tree>=0.1.8
+einops>=0.8.0
+equinox>=0.11.8
+flatbuffers>=24.3.25
+flax==0.10.2
+fsspec[gcs]>=2024.6.0
+gym-aloha>=0.1.1
+imageio>=2.36.1
+jax[cuda12]==0.5.3
+jaxtyping==0.2.36
+ml_collections==1.0.0
+numpy>=1.22.4,<2.0.0
+numpydantic>=1.6.6
+opencv-python>=4.10.0.84
+orbax-checkpoint==0.11.13
+pillow>=11.0.0
+sentencepiece>=0.2.0
+torch==2.7.1
+tqdm-loggable>=0.2
+typing-extensions>=4.12.2
+tyro>=0.9.5
+wandb>=0.19.1
+filelock>=3.16.1
+beartype==0.19.0
+treescope>=0.1.7
+transformers==4.53.2
+rich>=14.0.0
+polars>=1.30.0
+
+# LIBERO-specific dependencies
+# Note: Some versions may conflict with meta_vlas requirements above
+# LIBERO originally uses older versions, but we try to use compatible ones
+
+# MuJoCo and robotics simulation
+# Note: robosuite 1.4.1 may have dependencies on older numba/llvmlite
+# If you encounter issues, you may need to pin to older versions or update robosuite
+mujoco==3.2.3
+robosuite==1.4.1
+bddl==1.0.1
+
+# LIBERO core dependencies
+hydra-core==1.2.0
+easydict==1.9
+# robomimic==0.2.0  # Commented out: requires egl-probe which needs CMake, not used in evaluation
+thop==0.1.1-2209072238
+future==0.18.2
+cloudpickle==2.1.0
+gym==0.25.2
+
+# Graphics and visualization (LIBERO)
+glfw==1.12.0
+pyopengl==3.1.7
+pynput==1.7.7
+python-xlib==0.33
+evdev==1.7.1
+
+# Additional utilities
+absl-py==2.1.0
+etils>=1.9.1  # Updated: tensorflow-datasets requires >=1.9.1 (was 1.3.0 in old LIBERO)
+numba>=0.57.0  # Updated to work with newer llvmlite and Python 3.11
+scipy>=1.11.1  # Updated: jax requires >=1.11.1 (was 1.10.1 in old LIBERO)
+termcolor==2.4.0
+llvmlite>=0.40.0  # Version 0.36.0 doesn't support Python 3.11, need >=0.40.0
+
+# CRITICAL: torch version conflict
+# - meta_vlas requires: torch==2.7.1 (Python 3.11 compatible)
+# - LIBERO originally used: torch==1.11.0+cu113 (Python 3.8, older CUDA)
+#
+# Using meta_vlas version (2.7.1) for Python 3.11 compatibility.
+# If LIBERO has issues, you may need to:
+# 1. Test if LIBERO works with torch 2.7.1 (recommended first)
+# 2. If not, use torch 1.11.0+cu113 with --extra-index-url https://download.pytorch.org/whl/cu113
+#    (but this may break meta_vlas compatibility)
+#
+# For now, using meta_vlas torch version:
+# torch==2.7.1
+# torchvision and torchaudio will be installed as dependencies
+
+# Additional dependencies that may be needed
+# (from examples/libero/requirements.txt)
+imageio-ffmpeg>=0.5.1
+pyyaml>=6.0.2
+tqdm>=4.67.1
+matplotlib>=3.10.0  # Used by LIBERO for visualization
+
+# Development tools (optional but recommended)
+ipykernel>=6.29.5
+ipywidgets>=8.1.5
+pytest>=8.3.4
+
+# FAISS for similarity search
+faiss-cpu>=1.7.0
+
+# Note: lerobot and openpi-client are workspace dependencies
+# They should be installed separately:
+# - lerobot: git+https://github.com/huggingface/lerobot@0cf864870cf29f4738d3ade893e6fd13fbd7cdb5
+# - openpi-client: install from packages/openpi-client (workspace member)
+
+# Note: For LIBERO, you may also need:
+# - git-lfs (system package)
+# - LIBERO submodule initialized: git submodule update --init --recursive
+

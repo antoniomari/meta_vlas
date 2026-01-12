@@ -100,6 +100,15 @@ def maybe_download(url: str, *, force_download: bool = False, **kwargs) -> pathl
 
 def _download_fsspec(url: str, local_path: pathlib.Path, **kwargs) -> None:
     """Download a file from a remote filesystem to the local cache, and return the local path."""
+        # For GCS URLs, ensure aiohttp trusts environment variables (for proxy support)
+
+    # NOTE: needed to add these lines to make it work
+    if url.startswith("gs://"):
+        # Merge session_kwargs to ensure trust_env is set
+        session_kwargs = kwargs.get("session_kwargs", {})
+        session_kwargs.setdefault("trust_env", True)
+        kwargs["session_kwargs"] = session_kwargs
+
     fs, _ = fsspec.core.url_to_fs(url, **kwargs)
     info = fs.info(url)
     # Folders are represented by 0-byte objects with a trailing forward slash.

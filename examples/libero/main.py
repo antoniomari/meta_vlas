@@ -77,9 +77,11 @@ def eval_libero(args: Args) -> None:
     for task_id in tqdm.tqdm(range(num_tasks_in_suite)):
         # Get task
         task = task_suite.get_task(task_id)
+        # TODO: insert task info and shapes
 
         # Get default LIBERO initial states
         initial_states = task_suite.get_task_init_states(task_id)
+        # TODO: insert initial states info and shapes
 
         # Initialize LIBERO environment and task description
         env, task_description = _get_libero_env(task, LIBERO_ENV_RESOLUTION, args.seed)
@@ -121,6 +123,9 @@ def eval_libero(args: Args) -> None:
                         image_tools.resize_with_pad(wrist_img, args.resize_size, args.resize_size)
                     )
 
+                    # Img shapes: (128, 128, 3) TODO: check
+                    # Wrist img shapes: (128, 128, 3) TODO: check
+
                     # Save preprocessed image for replay video
                     replay_images.append(img)
 
@@ -128,13 +133,13 @@ def eval_libero(args: Args) -> None:
                         # Finished executing previous action chunk -- compute new chunk
                         # Prepare observations dict
                         element = {
-                            "observation/image": img,
-                            "observation/wrist_image": wrist_img,
+                            "observation/image": img, # TODO: check shape (128x128x3)
+                            "observation/wrist_image": wrist_img, # TODO: same 128x128x3
                             "observation/state": np.concatenate(
                                 (
-                                    obs["robot0_eef_pos"],
-                                    _quat2axisangle(obs["robot0_eef_quat"]),
-                                    obs["robot0_gripper_qpos"],
+                                    obs["robot0_eef_pos"], # TODO: check shape (3,)
+                                    _quat2axisangle(obs["robot0_eef_quat"]), # TODO: check shape (3,)
+                                    obs["robot0_gripper_qpos"], # TODO: check shape (1,)
                                 )
                             ),
                             "prompt": str(task_description),
@@ -165,6 +170,7 @@ def eval_libero(args: Args) -> None:
             total_episodes += 1
 
             # Save a replay video of the episode
+            # NOTE: saves a video for each task and success/failure
             suffix = "success" if done else "failure"
             task_segment = task_description.replace(" ", "_")
             imageio.mimwrite(

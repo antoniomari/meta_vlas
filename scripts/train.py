@@ -125,7 +125,7 @@ def init_train_state(
     # Initialize the train state and mix in the partial params.
     train_state = jax.jit(
         init,
-        donate_argnums=(1,),  # donate the partial params buffer.
+        donate_argnums=(1,),  # Tells JAX to "donate" (transfer ownership of) the argument at position 1 (partial_params) so its memory can be reused, reducing copies during JIT execution.
         in_shardings=replicated_sharding,
         out_shardings=state_sharding,
     )(init_rng, partial_params)
@@ -244,6 +244,9 @@ def main(config: _config.TrainConfig):
         functools.partial(train_step, config),
         in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
         out_shardings=(train_state_sharding, replicated_sharding),
+        # This argument tells JAX to "donate" (transfer ownership of) the buffer for the second argument
+        # (in this case, the train_state) to the compiled computation rather than copying it, which can
+        # improve memory efficiency in training loops by avoiding unnecessary data duplication.
         donate_argnums=(1,),
     )
 

@@ -88,10 +88,12 @@ def create_default_policy(env: EnvMode, *, default_prompt: str | None = None) ->
 def create_policy(args: Args) -> _policy.Policy:
     """Create a policy from the given arguments."""
     match args.policy:
+        # This check if the policy is a Checkpoint object
         case Checkpoint():
             return _policy_config.create_trained_policy(
                 _config.get_config(args.policy.config), args.policy.dir, default_prompt=args.default_prompt
             )
+        # This checks if the policy is a Default object
         case Default():
             return create_default_policy(args.env, default_prompt=args.default_prompt)
 
