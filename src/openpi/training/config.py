@@ -307,6 +307,7 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
                         "observation/state": "state",
                         "actions": "actions",
                         "prompt": "prompt",
+                        "task_index": "task_index", # NOTE: added to keep track of task index
                     }
                 )
             ]
