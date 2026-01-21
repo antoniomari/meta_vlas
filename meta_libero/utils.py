@@ -315,31 +315,31 @@ def train_model_on_fly(
         rng = jax.random.key(seed)
         train_rng, init_rng = jax.random.split(rng)
 
-        # Initialize optimizer with cosine decay schedule
-        lr_schedule = optax.warmup_cosine_decay_schedule(
-            init_value=learning_rate / (warmup_steps + 1),
-            peak_value=learning_rate,
-            warmup_steps=warmup_steps,
+    # Initialize optimizer with cosine decay schedule
+    lr_schedule = optax.warmup_cosine_decay_schedule(
+        init_value=learning_rate / (warmup_steps + 1),
+        peak_value=learning_rate,
+        warmup_steps=warmup_steps,
             decay_steps=30000,
-            end_value=learning_rate * 0.1,
-        )
+        end_value=learning_rate * 0.1,
+    )
 
-        # Create optimizer
-        if weight_decay > 0:
-            tx = optax.chain(
-                optax.clip_by_global_norm(1.0),
-                optax.scale_by_adam(),
-                optax.add_decayed_weights(weight_decay),
-                optax.scale_by_schedule(lr_schedule),
-                optax.scale(-1.0),
-            )
-        else:
-            tx = optax.chain(
-                optax.clip_by_global_norm(1.0),
-                optax.scale_by_adam(),
-                optax.scale_by_schedule(lr_schedule),
-                optax.scale(-1.0),
-            )
+    # Create optimizer
+    if weight_decay > 0:
+        tx = optax.chain(
+            optax.clip_by_global_norm(1.0),
+            optax.scale_by_adam(),
+            optax.add_decayed_weights(weight_decay),
+            optax.scale_by_schedule(lr_schedule),
+            optax.scale(-1.0),
+        )
+    else:
+        tx = optax.chain(
+            optax.clip_by_global_norm(1.0),
+            optax.scale_by_adam(),
+            optax.scale_by_schedule(lr_schedule),
+            optax.scale(-1.0),
+        )
 
         # Following marco.py: wrap train state initialization in a function and JIT it
         def init_train_state(params_to_init: at.Params) -> training_utils.TrainState:
@@ -360,11 +360,11 @@ def train_model_on_fly(
             # Create and return TrainState
             # Following marco.py pattern: ema_params references same params initially
             return training_utils.TrainState(
-                step=0,
-                params=params,
-                model_def=graphdef,
-                tx=tx,
-                opt_state=opt_state,
+        step=0,
+        params=params,
+        model_def=graphdef,
+        tx=tx,
+        opt_state=opt_state,
                 ema_decay=config.ema_decay,
                 ema_params=None if config.ema_decay is None else params,
             )
