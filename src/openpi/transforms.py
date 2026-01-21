@@ -264,6 +264,7 @@ class TokenizePrompt(DataTransformFn):
 
         tokens, token_masks = self.tokenizer.tokenize(prompt, state)
         return {**data, "tokenized_prompt": tokens, "tokenized_prompt_mask": token_masks}
+        # TO DEBUG PROMPT return {**data, "prompt": prompt, "tokenized_prompt": tokens, "tokenized_prompt_mask": token_masks}
 
 
 @dataclasses.dataclass(frozen=True)

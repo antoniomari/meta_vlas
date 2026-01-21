@@ -1,14 +1,30 @@
 ## Fine-tune Model on First Task from libero_90
 
+# CRITICAL: Suppress warnings BEFORE any other imports (even os!)
+import sys
+import logging
 import warnings
-warnings.filterwarnings("ignore", category=DeprecationWarning)
-warnings.filterwarnings("ignore", category=FutureWarning)
-warnings.filterwarnings("ignore", message=".*shape requires ndarray.*")
-warnings.filterwarnings("ignore", message=".*linear_util.wrap_init.*")
+warnings.filterwarnings("ignore")  # Suppress ALL warnings
+# Specifically suppress the JAX shape deprecation warning from Flax
+warnings.filterwarnings("ignore", message=".*shape requires ndarray or scalar arguments.*")
+warnings.filterwarnings("ignore", category=DeprecationWarning, module="flax.core.scope")
 
-# Suppress absl logging (used by JAX)
+# Now set environment variables
 import os
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Suppress TF warnings if any
+os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.95'
+os.environ['XLA_FLAGS'] = '--xla_gpu_deterministic_ops=true'
+os.environ['JAX_TRACEBACK_FILTERING'] = 'off'  # Cleaner error messages
+
+import dataclasses
+
+class VersionWarningFilter(logging.Filter):
+    def filter(self, record):
+        # avoid lerobot warning
+        return "is in 2.0 format" not in record.getMessage()
+logging.getLogger().addFilter(VersionWarningFilter())
+
+
 
 import logging
 logging.getLogger('absl').setLevel(logging.ERROR)
@@ -20,121 +36,134 @@ import numpy as np
 from pathlib import Path
 from typing import Iterator, Tuple
 import jax.numpy as jnp
-
-os.environ['XLA_FLAGS'] = '--xla_gpu_deterministic_ops=true'
+import jax
 import sys
 import csv
 import argparse
+import time
 import matplotlib
 matplotlib.use('Agg')  # Use non-interactive backend for saving plots
 import matplotlib.pyplot as plt
 
 sys.path.append("./meta_libero")
 
+# To debug jax errors
+# jax.config.update('jax_disable_jit', True)
+
 
 from utils import run_evaluation, create_policy
-import openpi.models.model as _model
 from openpi.shared import image_tools
 from openpi.models.model import IMAGE_RESOLUTION
 from utils import train_model_on_fly
 from libero_dataset import prepare_task_dataset, override_create_torch_dataset
 from openpi.training import config as _config
 from openpi.training import data_loader as _data_loader
+from openpi.training import weight_loaders as _weight_loaders
 from openpi.models import model as _model
 import openpi.shared.download as download
+import openpi.shared.array_typing as at
+import openpi.shared.nnx_utils as nnx_utils
 from libero_dataset import override_create_torch_dataset
+import flax.nnx as nnx
+import flax.traverse_util as traverse_util
 
 
-"""
-Can call policy.infer(element), where element is structured this way,
-following the preprocessing in main.py.
 
-    element = {
-        "observation/image": img,
-        "observation/wrist_image": wrist_img,
-        "observation/state": np.concatenate(
-            (
-                obs["robot0_eef_pos"],
-                _quat2axisangle(obs["robot0_eef_quat"]),
-                obs["robot0_gripper_qpos"],
-            )
-        ),
-        "prompt": str(task_description),
-    }
-"""
+import dataclasses
+import functools
+import logging
+import platform
+from typing import Any
 
+import etils.epath as epath
+import flax.nnx as nnx
+from flax.training import common_utils
+import flax.traverse_util as traverse_util
+import jax
+import jax.experimental
+import jax.numpy as jnp
+import numpy as np
+import optax
+import tqdm_loggable.auto as tqdm
+import wandb
 
-"""
-
-episode demo_0 with 148 transitions
-    key: actions with shape (148, 7)
-    key: dones with shape (148,)
-    key: obs
-        observation key agentview_rgb with shape (148, 128, 128, 3)
-        observation key ee_ori with shape (148, 3)
-        observation key ee_pos with shape (148, 3)
-        observation key ee_states with shape (148, 6)
-        observation key eye_in_hand_rgb with shape (148, 128, 128, 3)
-        observation key gripper_states with shape (148, 2)
-        observation key joint_states with shape (148, 7)
-    key: rewards with shape (148,)
-    key: robot_states with shape (148, 9)
-    key: states with shape (148, 110)
+import openpi.models.model as _model
+import openpi.shared.array_typing as at
+import openpi.shared.nnx_utils as nnx_utils
+import openpi.training.checkpoints as _checkpoints
+import openpi.training.config as _config
+import openpi.training.data_loader as _data_loader
+import openpi.training.optimizer as _optimizer
+import openpi.training.sharding as sharding
+import openpi.training.utils as training_utils
+import openpi.training.weight_loaders as _weight_loaders
 
 
-                  # Get preprocessed image
-                    # IMPORTANT: rotate 180 degrees to match train preprocessing
-                    img = np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
-                    wrist_img = np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1, ::-1])
-                    img = image_tools.convert_to_uint8(
-                        image_tools.resize_with_pad(img, args.resize_size, args.resize_size)
-                    )
-                    wrist_img = image_tools.convert_to_uint8(
-                        image_tools.resize_with_pad(wrist_img, args.resize_size, args.resize_size)
-                    )
-
-                    # Img shapes: (128, 128, 3) TODO: check
-                    # Wrist img shapes: (128, 128, 3) TODO: check
-
-                    # Save preprocessed image for replay video
-                    replay_images.append(img)
-
-                    if not action_plan:
-                        # Finished executing previous action chunk -- compute new chunk
-                        # Prepare observations dict
-                        element = {
-                            "observation/image": img, # TODO: check shape (128x128x3)
-                            "observation/wrist_image": wrist_img, # TODO: same 128x128x3
-                            "observation/state": np.concatenate(
-                                (
-                                    obs["robot0_eef_pos"], # TODO: check shape (3,)
-                                    _quat2axisangle(obs["robot0_eef_quat"]), # TODO: check shape (3,)
-                                    obs["robot0_gripper_qpos"], # TODO: check shape (1,)
-                                )
-                            ),
-                            "prompt": str(task_description),
-                        }
-"""
-
-def main(task_id: int = 6):
+def main(task_id: int = 8, lr: float = 2.5e-5,
+use_base_model: bool = False, batch_size: int = 64):
     # Configuration
     task_suite_name = "libero_10"
     num_trials = 50
-    total_steps = 500
-    eval_interval = 100
+    total_steps = 200 # was 1000
+    eval_interval = 20 # was 100
     seed = 0  # Global seed for reproducibility
+
+    # IMPORTANT: checkpoint_path should ALWAYS point to pi05_libero for assets/norm stats
+    # This is used by create_policy for evaluation - it needs Libero-specific assets
     checkpoint_path = "/cluster/home/anmari/.cache/openpi/openpi-assets/checkpoints/pi05_libero"
 
+    # Choose which weights to load based on use_base_model flag
+    # NOTE: We ALWAYS use the pi05_libero config (model architecture, data config, etc.)
+    # We ONLY change which weights/checkpoint to load
+    if use_base_model:
+        # Load weights from base pi0.5 model (not fine-tuned on Libero)
+        checkpoint_gs_path = "gs://openpi-assets/checkpoints/pi05_base"
+        checkpoint_name = "pi05_base"
+        print("="*60)
+        print("Using BASE pi0.5 model weights (not pre-trained on Libero)")
+        print("Config: pi05_libero (same model architecture and data settings)")
+        print(f"Weights: {checkpoint_gs_path}")
+        print(f"Assets: pi05_libero (for Libero-specific normalization)")
+        print("="*60)
+    else:
+        # Load weights from pi0.5 model already fine-tuned on Libero
+        checkpoint_gs_path = "gs://openpi-assets/checkpoints/pi05_libero"
+        checkpoint_name = "pi05_libero"
+        print("="*60)
+        print("Using pi0.5 model weights PRE-TRAINED on Libero")
+        print("Config: pi05_libero")
+        print(f"Weights: {checkpoint_gs_path}")
+        print(f"Assets: pi05_libero")
+        print("="*60)
+
     # Create results directory
-    results_dir = Path("meta_libero/results")
+    model_suffix = "_base" if use_base_model else ""
+    results_dir = Path(f"meta_libero/results/lr_{lr}{model_suffix}_b{batch_size}")
     results_dir.mkdir(parents=True, exist_ok=True)
 
-    # {"task_index": 6, "task": "put both moka pots on the stove"}
-    print("Loading full model")
-    train_config = _config.get_config("pi05_libero")
-    checkpoint_dir = download.maybe_download("gs://openpi-assets/checkpoints/pi05_libero")
-    model = train_config.model.load(_model.restore_params(checkpoint_dir / "params", dtype=jnp.bfloat16))
-    print("Model loaded successfully!")
+
+    # Note: task_id for the dataset is different
+    dataset_task_id = 6
+
+    # IMPORTANT: Always use pi05_libero config for consistency
+    # This ensures we have the correct:
+    # - Model architecture (pi05=True, action_horizon=10, etc.)
+    # - Data configuration (prompt_from_task, frame sampling, etc.)
+    # - Normalization stats and assets for Libero
+    config = _config.get_config("pi05_libero")
+
+    # Download and load weights using the simple, working method
+    # This properly sets up JIT compilation (unlike the complex weight_loader approach)
+    print(f"Downloading checkpoint from {checkpoint_gs_path}...")
+    checkpoint_dir = download.maybe_download(checkpoint_gs_path)
+
+    print(f"Loading model with weights from {checkpoint_name}...")
+    t0 = time.perf_counter()
+    model = config.model.load(_model.restore_params(checkpoint_dir / "params", dtype=jnp.bfloat16))
+    t1 = time.perf_counter()
+
+    print(f"\n✓ Model loaded successfully with weights from {checkpoint_name}")
+    print(f"✓ Loading took {t1-t0:.2f} seconds")
 
 
 
@@ -160,21 +189,36 @@ def main(task_id: int = 6):
     print("="*60)
     # Note: this will create jax.random.key(0) internally
     # if we try to pass a seed here the code will crash
-    config = _config.get_config("pi05_libero")
-    policy = create_policy(model, config, checkpoint_path)
-    success_rate = run_evaluation(
-        policy=policy,
-        task_suite_name=task_suite_name,
-        task_id=task_id,
-        num_trials=num_trials,
-        save_video=False,
-        seed=seed,
-    )
-    eval_results.append((0, success_rate))
-    save_eval_result(0, success_rate, is_first=True)
+    skip_first_eval = False
+    if not skip_first_eval:
+        print("\n" + "="*60)
+        print(f"Evaluating before fine-tuning")
+        print("="*60)
+
+        # Note: change to True to save videos
+        save_videos = False
+        video_out_path = results_dir / f"videos"
+        video_out_path.mkdir(parents=True, exist_ok=True)
+
+        policy = create_policy(model, config, checkpoint_path)
+        success_rate = run_evaluation(
+            policy=policy,
+            task_suite_name=task_suite_name,
+            task_id=task_id,
+            num_trials=num_trials,
+            save_video=save_videos,
+            seed=seed,
+        )
+        eval_results.append((0, success_rate))
+        save_eval_result(0, success_rate, is_first=True)
 
 
-    with override_create_torch_dataset("example", task_index=task_id, load_in_memory=True):
+    with override_create_torch_dataset("example", task_index=dataset_task_id):
+        # Batch size configuration
+        config = dataclasses.replace(
+            config,
+            batch_size=batch_size # 64 # 32,  # Normal training with JIT (use 4 if profiling without JIT)
+        )
         data_loader = _data_loader.create_data_loader(
             config,
             sharding=None,
@@ -182,7 +226,7 @@ def main(task_id: int = 6):
         )
 
     dataset = data_loader._data_loader._data_loader.dataset
-    training_iterator = iter(data_loader)
+    # training_iterator = iter(data_loader)
 
     # Count batches for info
     print(f"Total samples: {len(dataset)}\n")
@@ -193,16 +237,18 @@ def main(task_id: int = 6):
     print(f"  Learning rate: 2.5e-5")
     print(f"  Total steps: {total_steps}")
     print(f"  Eval interval: {eval_interval}")
-    print(f"  Batch size: 64")
+    print(f"  Batch size: {batch_size}")
     print(f"  Warmup steps: 50")
+
 
     # First 100 steps
     trained_model, train_losses, train_state = train_model_on_fly(
         model=model,
-        training_data_loader=training_data_loader,
-        learning_rate=2.5e-5,
-        num_steps=100,
-        warmup_steps=50,
+        training_data_loader=data_loader,
+        config=config,
+        learning_rate=lr,
+        num_steps=eval_interval,
+        warmup_steps=1000,
         weight_decay=0.0,
         log_interval=50,
         seed=seed,
@@ -212,7 +258,7 @@ def main(task_id: int = 6):
     print("\n" + "="*60)
     print(f"Evaluating after step {eval_interval}")
     print("="*60)
-    policy = create_policy(trained_model, _config.get_config("pi05_libero"), checkpoint_path)
+    policy = create_policy(trained_model, config, checkpoint_path)
     success_rate = run_evaluation(
         policy=policy,
         task_suite_name=task_suite_name,
@@ -236,8 +282,9 @@ def main(task_id: int = 6):
         # Continue fine-tuning (optimizer state preserved from resume_train_state)
         trained_model, train_losses, train_state = train_model_on_fly(
             model=trained_model,  # ignored when resuming
-            training_data_loader=training_data_loader,
-            num_steps=100,
+            training_data_loader=data_loader,
+            config=config,
+            num_steps=eval_interval,
             log_interval=50,
             resume_train_state=train_state,
             resume_losses=train_losses,
@@ -248,7 +295,7 @@ def main(task_id: int = 6):
         print("\n" + "="*60)
         print(f"Evaluating after step {current_step}")
         print("="*60)
-        policy = create_policy(trained_model, _config.get_config("pi05_libero"), checkpoint_path)
+        policy = create_policy(trained_model, config, checkpoint_path)
         success_rate = run_evaluation(
             policy=policy,
             task_suite_name=task_suite_name,
@@ -286,6 +333,39 @@ def main(task_id: int = 6):
     plt.close()
     print(f"Saved losses plot")
 
+    # Plot and save evaluation accuracy vs gradient steps
+    acc_plot_filename = results_dir / f"{task_suite_name}_{task_id}_accuracy.pdf"
+    print(f"\nSaving accuracy plot to {acc_plot_filename}")
+
+    plt.figure(figsize=(10, 6))
+
+    # Extract steps and accuracies from eval_results
+    if eval_results:
+        steps, accuracies = zip(*eval_results)
+        accuracies_percent = [acc * 100 for acc in accuracies]  # Convert to percentage
+
+        # Plot with markers and line
+        plt.plot(steps, accuracies_percent, marker='o', linewidth=2, markersize=8,
+                 label=f'LR={lr}', color='#1f77b4')
+
+        # Add shaded confidence region (optional, just for visual appeal)
+        plt.fill_between(steps,
+                         [max(0, a-5) for a in accuracies_percent],
+                         [min(100, a+5) for a in accuracies_percent],
+                         alpha=0.2, color='#1f77b4')
+
+    plt.xlabel('# Gradient Steps', fontsize=12)
+    plt.ylabel('Success Rate', fontsize=12)
+    plt.title(f'Learning rate = {lr}', fontsize=14)
+    plt.grid(True, alpha=0.3)
+    plt.ylim(-5, 105)  # Set y-axis range from 0 to 100%
+    plt.legend(fontsize=10)
+
+    plt.tight_layout()
+    plt.savefig(acc_plot_filename, format='pdf', dpi=150)
+    plt.close()
+    print(f"Saved accuracy plot")
+
     # Print final summary
     print("\n" + "="*60)
     print("FINAL SUMMARY")
@@ -298,10 +378,14 @@ def main(task_id: int = 6):
     print(f"\nResults saved to: {results_dir}")
     print(f"  - {csv_filename.name}")
     print(f"  - {plot_filename.name}")
+    print(f"  - {acc_plot_filename.name}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Fine-tune model on a single LIBERO task")
-    parser.add_argument("--task_id", type=int, default=0, help="Task ID to fine-tune on (default: 0)")
+    parser.add_argument("--task_id", type=int, default=8, help="Task ID to fine-tune on (default: 8)")
+    parser.add_argument("--lr", type=float, default=2.5e-5, help="Learning rate (default: 2.5e-4)")
+    parser.add_argument("--base-model", action="store_true", help="Use base pi0.5 model instead of Libero pre-trained model")
+    parser.add_argument("--b", type=int, default=64, help="Batch size (default: 64)")
     args = parser.parse_args()
-    main(task_id=args.task_id)
+    main(task_id=args.task_id, lr=args.lr, use_base_model=args.base_model, batch_size=args.b)

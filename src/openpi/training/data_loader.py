@@ -175,7 +175,7 @@ def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip
     if data_config.repo_id != "fake" and not skip_norm_stats:
         if data_config.norm_stats is None:
             raise ValueError(
-                "Normalization stats not found. "
+                f"Normalization stats not found for repo {data_config.repo_id}. "
                 "Make sure to run `scripts/compute_norm_stats.py --config-name=<your-config>`."
             )
         norm_stats = data_config.norm_stats

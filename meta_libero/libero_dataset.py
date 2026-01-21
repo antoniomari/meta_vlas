@@ -92,6 +92,20 @@ class FilteredDataset(Dataset):
             task_indices = dataset.hf_dataset['task_index']
             self.indices = [i for i, ti in enumerate(task_indices) if ti == task_index]
             print(f"Filtered dataset (fast): {len(self.indices)} / {len(dataset)} samples")
+
+            # Verify filtering worked correctly by spot-checking
+            if len(self.indices) > 0:
+                print(f"  Verifying filter correctness...")
+                # Check first few samples
+                num_to_check = min(3, len(self.indices))
+                all_correct = True
+                for idx in self.indices[:num_to_check]:
+                    actual_ti = task_indices[idx]
+                    if actual_ti != task_index:
+                        print(f"  ⚠️  ERROR: Index {idx} has task_index={actual_ti}, expected {task_index}")
+                        all_correct = False
+                if all_correct:
+                    print(f"  ✓ First {num_to_check} samples verified correct")
         else:
             # Fallback: iterate through samples (slow)
             print("Warning: Falling back to slow filtering (no direct metadata access)")
