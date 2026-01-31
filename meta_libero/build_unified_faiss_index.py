@@ -139,8 +139,8 @@ def create_jit_embedding_functions(image_encoder, text_encoder):
     text_embedding_partial = functools.partial(_extract_text_embedding_core, encoder=text_encoder)
 
     # JIT compile the partial functions
-    image_embedding_jit = jax.jit(image_embedding_partial)
-    text_embedding_jit = jax.jit(text_embedding_partial)
+    image_embedding_jit = image_embedding_partial#jax.jit(image_embedding_partial)
+    text_embedding_jit = text_embedding_partial#jax.jit(text_embedding_partial)
 
     print("✓ Created JIT-compiled embedding functions")
 

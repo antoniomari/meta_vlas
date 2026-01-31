@@ -48,7 +48,7 @@ import matplotlib.pyplot as plt
 sys.path.append("./meta_libero")
 
 # To debug jax errors
-# jax.config.update('jax_disable_jit', True)
+# jax.config.update('jax_disable_   ', True)
 
 
 from utils import run_evaluation, create_policy

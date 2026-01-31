@@ -83,9 +83,11 @@ class Pi0Config(_model.BaseModelConfig):
         gemma_params_filter = nnx_utils.PathRegex(".*llm.*")
         action_expert_params_filter = nnx_utils.PathRegex(".*llm.*_1.*")
         if "lora" in self.paligemma_variant:
+            # Freezes all parameters
             filters.append(
                 gemma_params_filter,
             )
+            # If not action expert lora, then unfreeze all action expert params.
             if "lora" not in self.action_expert_variant:
                 # If only freeze gemma params, exclude action expert params.
                 filters.append(
@@ -106,3 +108,19 @@ class Pi0Config(_model.BaseModelConfig):
         if not filters:
             return nnx.Nothing
         return nnx.All(*filters)
+
+
+    def get_freeze_filter_action_expert(self) -> nnx.filterlib.Filter:
+        """Returns the freeze filter based on the model config."""
+
+        # Freeze only the gemma params, not action expert params.
+        gemma_params_filter = nnx_utils.PathRegex(".*llm.*")
+        image_params_filter = nnx_utils.PathRegex(".*img.*")
+        action_expert_params_filter = nnx_utils.PathRegex(".*llm.*_1.*")
+
+
+        # Match only gemma params which are not action expert params
+        gemma_params_filter = nnx.All(gemma_params_filter, nnx.Not(action_expert_params_filter))
+
+        # A parameter is frozen if it matches (gemma OR image) AND is NOT an action expert param
+        return nnx.Any(gemma_params_filter, image_params_filter)
