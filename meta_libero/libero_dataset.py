@@ -3,7 +3,7 @@ import contextlib
 import copy
 import dataclasses
 import functools
-from typing import Any, Iterator, SupportsIndex, Tuple, List, Dict
+from typing import Any, Iterator, SupportsIndex, Tuple, List, Dict, Optional
 import os
 import logging
 import etils.epath as epath
@@ -78,16 +78,21 @@ from torch.utils.data import Dataset
 class FilteredDataset(Dataset):
     """Wraps a dataset and filters samples by task_index."""
 
-    def __init__(self, dataset: Dataset, task_index: int):
+    def __init__(self, dataset: Dataset, task_index: int, episode_index: int = None):
         self.dataset = dataset
         self.task_index = task_index
+        self.episode_index = episode_index
 
         # Build index mapping: only samples with matching task_index
         self.indices = []
-        print(f"Filtering dataset for task_index={task_index}...")
+        print(f"Filtering dataset for task_index={task_index} and episode_index={episode_index}...")
 
         # Fast path: Access metadata directly from LeRobot dataset
         if hasattr(dataset, 'hf_dataset') and 'task_index' in dataset.hf_dataset.column_names:
+
+            print(dataset.hf_dataset.column_names)
+            raise ValueError("Stop here")
+
             # Direct access to HuggingFace dataset column (much faster!)
             task_indices = dataset.hf_dataset['task_index']
             self.indices = [i for i, ti in enumerate(task_indices) if ti == task_index]
@@ -123,7 +128,7 @@ class FilteredDataset(Dataset):
 
 
 @contextlib.contextmanager
-def override_create_torch_dataset(repo_id: str, task_index: int | None = None, load_in_memory: bool = False):
+def override_create_torch_dataset(repo_id: Optional[str] = None, task_index: int | None = None, load_in_memory: bool = False):
     """Context manager to temporarily override create_torch_dataset in data_loader module.
 
     Args:
@@ -137,10 +142,11 @@ def override_create_torch_dataset(repo_id: str, task_index: int | None = None, l
         data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
     ) -> Dataset:
 
-        repo_id = data_config.repo_id
-        dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+        repo = repo_id if repo_id is not None else data_config.repo_id
+
+        dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo)
         dataset = lerobot_dataset.LeRobotDataset(
-            repo_id,
+            repo,
             delta_timestamps={
                 key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
             },

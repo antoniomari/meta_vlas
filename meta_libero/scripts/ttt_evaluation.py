@@ -15,8 +15,11 @@ warnings.filterwarnings("ignore", category=DeprecationWarning, module="flax.core
 
 import os
 
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["HF_HOME"] = "/cluster/home/anmari/.cache/huggingface"
+os.environ["HF_LEROBOT_HOME"] = "/cluster/home/anmari/.cache/huggingface/lerobot"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.95"
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.99"
 os.environ["XLA_FLAGS"] = "--xla_gpu_deterministic_ops=true"
 os.environ["JAX_TRACEBACK_FILTERING"] = "off"
 
@@ -94,30 +97,57 @@ def _init_nn_fetcher(model: _model.BaseModel) -> NearestNeighborFetcher:
     return nn_fetcher
 
 
-def _ensure_results_paths(task_suite_name: str, task_id: int, action_expert_only: bool = False, use_lora: bool = False) -> tuple[Path, Path, Path]:
-    """Create results/ttt/<suite>_task_<id> directory and return CSV + PDF paths.
+def _hyperparams_subfolder(lr: float, ttt_frequency: int, ttt_num_steps: int, ttt_k: int, seed: int) -> str:
+    """Build a filesystem-safe subfolder name from TTT hyperparameters."""
+    lr_str = f"{lr:.2e}".replace("-0", "-").replace("+0", "")
+    return f"lr{lr_str}_freq{ttt_frequency}_steps{ttt_num_steps}_k{ttt_k}_seed{seed}"
+
+
+def _ensure_results_paths(
+    task_suite_name: str,
+    task_id: int,
+    lr: float,
+    ttt_frequency: int,
+    ttt_num_steps: int,
+    ttt_k: int,
+    seed: int,
+    action_expert_only: bool = False,
+    use_lora: bool = False,
+    use_base_model: bool = False,
+    reset_policy: bool = True,
+) -> tuple[Path, Path, Path, Path]:
+    """Create results/ttt/.../<suite>_task_<id>/<hyperparams>/ and return CSV + PDF + video paths.
 
     Args:
         task_suite_name: Name of the task suite
         task_id: Task ID within the suite
+        lr, ttt_frequency, ttt_num_steps, ttt_k, seed: Used to form the hyperparameter subfolder
         action_expert_only: If True, use 'ttt/action_only' instead of 'ttt'
         use_lora: If True, use 'ttt/lora' instead of 'ttt' (takes precedence over action_expert_only)
     """
-    # Determine base directory based on flags
+
+    main_dir = "ttt_base_model" if use_base_model else "ttt"
+
+    if not reset_policy:
+        main_dir += "_no_reset_policy"
+
     if use_lora:
-        base_dir = Path("meta_libero") / "results" / "ttt" / "lora"
+        base_dir = Path("meta_libero") / "results" / main_dir / "lora"
     elif action_expert_only:
-        base_dir = Path("meta_libero") / "results" / "ttt" / "action_only"
+        base_dir = Path("meta_libero") / "results" / main_dir / "action_only"
     else:
-        base_dir = Path("meta_libero") / "results" / "ttt"
+        base_dir = Path("meta_libero") / "results" / main_dir
 
     task_dir = base_dir / f"{task_suite_name}_task_{task_id}"
-    task_dir.mkdir(parents=True, exist_ok=True)
+    hyper_sub = _hyperparams_subfolder(lr, ttt_frequency, ttt_num_steps, ttt_k, seed)
+    run_dir = task_dir / hyper_sub
+    run_dir.mkdir(parents=True, exist_ok=True)
 
-    csv_path = task_dir / "results.csv"
-    losses_pdf = task_dir / "losses_grid.pdf"
-    actions_pdf = task_dir / "action_distances_grid.pdf"
-    return csv_path, losses_pdf, actions_pdf
+    csv_path = run_dir / "results.csv"
+    losses_pdf = run_dir / "losses_grid.pdf"
+    actions_pdf = run_dir / "action_distances_grid.pdf"
+    video_out_path = run_dir / "videos"
+    return csv_path, losses_pdf, actions_pdf, video_out_path
 
 
 def _append_csv_row(
@@ -129,8 +159,9 @@ def _append_csv_row(
     num_trials: int,
     ttt_num_steps: int,
     ttt_k: int,
+    reset_policy: bool = True,
 ) -> None:
-    header = ["lr", "ttt_frequency", "seed", "num_trials", "ttt_num_steps", "ttt_k", "success_rate"]
+    header = ["lr", "ttt_frequency", "seed", "num_trials", "ttt_num_steps", "ttt_k", "success_rate", "reset_policy"]
     file_exists = csv_path.exists()
     with csv_path.open("a", newline="") as f:
         writer = csv.writer(f)
@@ -145,6 +176,7 @@ def _append_csv_row(
                 ttt_num_steps,
                 ttt_k,
                 success_rate,
+                reset_policy,
             ]
         )
 
@@ -230,6 +262,7 @@ def main() -> None:
     parser.add_argument("--save-video", action="store_true", help="Save rollout videos")
     parser.add_argument("--action-expert-only", action="store_true", help="Only finetune action expert")
     parser.add_argument("--use-lora", action="store_true", help="Use LORA weights instead of base weights")
+    parser.add_argument("--no-reset-policy", action="store_true", help="Do not reset policy before evaluation")
 
     args = parser.parse_args()
 
@@ -246,7 +279,11 @@ def main() -> None:
     print(f"Seed: {args.seed}")
     print("=" * 70)
 
-    model, config = load_pi05_libero_model(use_lora=args.use_lora, action_expert_only=args.action_expert_only)
+    model, config = load_pi05_libero_model(
+        use_base_model=args.use_base_model,
+        use_lora=args.use_lora,
+        action_expert_only=args.action_expert_only,
+    )
 
     # Prepare dataset for TTT (same repo and task index convention as other scripts).
     dataset, config = _prepare_ttt_dataset(config, repo_id="physical-intelligence/libero", task_index=args.task_id)
@@ -264,6 +301,22 @@ def main() -> None:
         rng_seed=args.seed,
     )
 
+
+    # Prepare per-task outputs (plots and CSV under hyperparameter subfolder)
+    csv_path, losses_pdf, actions_pdf, video_out_path = _ensure_results_paths(
+        args.task_suite_name,
+        args.task_id,
+        lr=args.lr,
+        ttt_frequency=args.ttt_frequency,
+        ttt_num_steps=args.ttt_num_steps,
+        ttt_k=args.ttt_k,
+        seed=args.seed,
+        action_expert_only=args.action_expert_only,
+        use_lora=args.use_lora,
+        use_base_model=args.use_base_model,
+        reset_policy=not args.no_reset_policy,
+    )
+
     # Run TTT evaluation
     success_rate = run_evaluation_ttt(
         policy=policy_ttt,
@@ -274,23 +327,19 @@ def main() -> None:
         task_suite_name=args.task_suite_name,
         task_id=args.task_id,
         save_video=args.save_video,
+        video_out_path=str(video_out_path),
         seed=args.seed,
         ttt_num_steps=args.ttt_num_steps,
         ttt_frequency=args.ttt_frequency,
         learning_rate=args.lr,
         ttt_k=args.ttt_k,
         ttt_use_modalities=["image1", "image2", "text"],
+        reset_policy=not args.no_reset_policy,
     )
 
     print(f"\nSuccess rate: {success_rate * 100:.1f}%")
 
-    # Prepare per-task outputs
-    csv_path, losses_pdf, actions_pdf = _ensure_results_paths(
-        args.task_suite_name,
-        args.task_id,
-        action_expert_only=args.action_expert_only,
-        use_lora=args.use_lora
-    )
+
     _append_csv_row(
         csv_path,
         lr=args.lr,
@@ -300,6 +349,7 @@ def main() -> None:
         num_trials=args.num_trials,
         ttt_num_steps=args.ttt_num_steps,
         ttt_k=args.ttt_k,
+        reset_policy=not args.no_reset_policy,
     )
 
     # Extract per-episode metrics that run_evaluation_ttt stored on itself.

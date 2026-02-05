@@ -255,6 +255,8 @@ def build_unified_index(
             batch_size=batch_size,  # Process one sample at a time for embedding extraction
         )
 
+        # Change config to load the libero_90 dataset
+
         # First, create a temporary data loader to get the dataset size
         temp_data_loader = _data_loader.create_data_loader(
             config,
