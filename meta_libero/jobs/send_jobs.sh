@@ -5,7 +5,7 @@
 # Modify these arrays to change the hyperparameter search
 
 TASK_SUITE_NAME="libero_90"
-TASK_IDS=(2)                    # Task IDs to evaluate
+TASK_IDS=(3 4 5 6 7 8 9 10)                    # Task IDs to evaluate
 SEEDS=(4 5 6)                       # Seeds to iterate over
 LEARNING_RATES=(2.5e-05)            # Learning rates
 TTT_FREQUENCIES=(20)                # TTT frequency (every N steps)
@@ -23,7 +23,7 @@ USE_BASE_MODEL=""                   # Set to "--use-base-model" to enable
 # SLURM settings
 TIME="24:00:00"
 MEM="64G"
-GPU="a100-pcie-40gb:1"
+GPU="v100:1" # "a100-pcie-40gb:1"
 LOG_DIR="/cluster/home/anmari/meta_vlas/meta_libero/logs"
 
 # ============== JOB SUBMISSION ==============

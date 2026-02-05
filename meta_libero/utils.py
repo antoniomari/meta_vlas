@@ -73,6 +73,7 @@ import jax.numpy as jnp
 import jaxlib
 import numpy as np
 import optax
+import torch
 
 try:
     from tqdm.auto import tqdm  # Use auto for notebook compatibility
@@ -87,7 +88,7 @@ import openpi.training.data_loader as _data_loader
 import openpi.training.utils as training_utils
 import openpi.shared.download as download
 
-import torch
+from rendering import plot_observation_with_decoded_prompt, decode_tokenized_prompt, make_observation_from_simulator, _draw_step_on_frame
 # Ensures deterministic behavior in CUDNN
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
@@ -145,167 +146,6 @@ def print_memory_checkpoint(label: str, line_num: int = None):
         else:
             print(f"[MEMORY CHECKPOINT] {label}: {mem}")
 
-
-
-def decode_tokenized_prompt(
-    tokenized_prompt: np.ndarray | jnp.ndarray | None,
-    tokenized_prompt_mask: np.ndarray | jnp.ndarray | None = None,
-    max_token_len: int = 200,
-    fallback_text: str = "Task",
-) -> str:
-    """
-    Decode a tokenized prompt from an observation to human-readable text.
-
-    Args:
-        tokenized_prompt: Tokenized prompt array, shape (seq_len,) or (batch, seq_len).
-                          If None, returns fallback_text.
-        tokenized_prompt_mask: Optional mask array indicating valid tokens, same shape as tokenized_prompt.
-                               If provided, only tokens where mask is True are decoded.
-        max_token_len: Maximum token length for tokenizer initialization.
-        fallback_text: Text to return if decoding fails or tokenized_prompt is None.
-
-    Returns:
-        Decoded text string. Returns fallback_text if decoding fails or input is None.
-    """
-    if tokenized_prompt is None:
-        return fallback_text
-
-    try:
-        from openpi.models import tokenizer as _tokenizer
-
-        # Create tokenizer instance
-        tok = _tokenizer.PaligemmaTokenizer(max_len=max_token_len)
-
-        # Extract tokens (remove padding based on mask if available)
-        tokens = np.array(tokenized_prompt)
-
-        # Handle both 1D and 2D token arrays
-        if len(tokens.shape) > 1:
-            tokens = tokens.flatten()
-
-        # Extract valid tokens using mask if available
-        if tokenized_prompt_mask is not None:
-            mask = np.array(tokenized_prompt_mask)
-            # Handle both 1D and 2D mask arrays
-            if len(mask.shape) > 1:
-                mask = mask.flatten()
-            # Get only the valid tokens (where mask is True)
-            valid_tokens = tokens[mask].tolist()
-        else:
-            # Remove padding (zeros) manually
-            valid_tokens = [int(t) for t in tokens if int(t) != 0]
-
-        # Decode tokens to text
-        if not valid_tokens:
-            return fallback_text
-
-        decoded_text = tok._tokenizer.decode(valid_tokens)
-
-        # Clean up the decoded text
-        decoded_text = decoded_text.strip()
-        # Remove common prefixes/suffixes that might be added during tokenization
-        if decoded_text.startswith("<bos>"):
-            decoded_text = decoded_text[5:].strip()
-
-        return decoded_text
-
-    except Exception as e:
-        logging.warning(f"Failed to decode tokenized prompt: {e}")
-        return fallback_text
-
-
-def _observation_batch_size(observation: _model.Observation) -> int:
-    """Return batch size from observation (1 if single observation)."""
-    img = observation.images.get("base_0_rgb")
-    if img is None:
-        img = observation.images.get("left_wrist_0_rgb")
-    if img is None:
-        return 1
-    arr = np.array(img)
-    if arr.ndim >= 4 and arr.shape[0] > 1:
-        return int(arr.shape[0])
-    return 1
-
-
-def plot_observation_with_decoded_prompt(
-    observation: _model.Observation,
-    similarity_score: float | np.ndarray | jnp.ndarray | None = None,
-    current_task_description: str | None = None,
-    max_token_len: int = 200,
-    plot_title_prefix: str = "Observation",
-) -> None:
-    """
-    Plot observation(s) with decoded task description from tokenized prompt.
-
-    If observation is batched (tensors have leading batch dimension), plots a grid:
-    one row per observation, two columns (base camera, wrist camera). similarity_score
-    may be a scalar or an array of length batch_size.
-
-    Args:
-        observation: Observation (single or batched) with images and optional tokenized_prompt.
-        similarity_score: Optional score(s); scalar or array of length batch_size.
-        current_task_description: Fallback task description if decoding fails.
-        max_token_len: Maximum token length for tokenizer initialization.
-        plot_title_prefix: Prefix for the plot title.
-    """
-    batch_size = _observation_batch_size(observation)
-    scores = np.atleast_1d(similarity_score) if similarity_score is not None else np.full(batch_size, np.nan)
-    if scores.size == 1 and batch_size > 1:
-        scores = np.broadcast_to(scores, (batch_size,))
-    scores = np.asarray(scores).flat[:batch_size]
-
-    images1 = observation.images.get("base_0_rgb")
-    images2 = observation.images.get("left_wrist_0_rgb")
-    assert images1 is not None and images2 is not None
-
-    fig, axes = plt.subplots(batch_size, 2, figsize=(8, 4 * batch_size), squeeze=False)
-
-    for i in range(batch_size):
-        # Decode prompt
-        token_prompt = observation.tokenized_prompt
-        token_mask = observation.tokenized_prompt_mask
-        assert token_prompt is not None
-        tp = np.array(token_prompt)
-        tm = np.array(token_mask) if token_mask is not None else None
-        token_prompt_i = tp[i]
-        token_mask_i = tm[i] if tm is not None else None
-
-        decoded_task_description = decode_tokenized_prompt(
-            tokenized_prompt=token_prompt_i,
-            tokenized_prompt_mask=token_mask_i,
-            max_token_len=max_token_len,
-            fallback_text=current_task_description or "Task",
-        )
-
-        title_parts = [plot_title_prefix]
-        if i < len(scores) and not np.isnan(scores[i]):
-            title_parts.append(f"(similarity: {scores[i]:.4f})")
-        if batch_size > 1:
-            title_parts.append(f"[{i}]")
-        title_parts.append(f": {decoded_task_description}")
-        row_title = " ".join(title_parts)
-
-        # NOTE: need to rescale in the right range here
-        # they are in the range [-1, 1]
-        # need to rescale to [0, 1]
-        img1 = (images1[i] + 1.0) / 2.0 # render_image(images1[i])
-        img2 = (images2[i] + 1.0) / 2.0 # render_image(images2[i])
-
-        for col, (img, cam_name) in enumerate(
-            [(img1, "Base Camera"), (img2, "Wrist Camera")]
-        ):
-            ax = axes[i, col]
-            assert img is not None
-            ax.imshow(img)
-            ax.set_title(cam_name + decoded_task_description, fontsize=10)
-            ax.axis("off")
-
-        axes[i, 0].set_ylabel(row_title, fontsize=9, labelpad=4)
-
-    fig.suptitle(plot_title_prefix, fontsize=12, fontweight="bold")
-    plt.tight_layout()
-    plt.show()
-    plt.close(fig)
 
 
 def fetch_samples(dataset, idx, repeat=1) -> Tuple[_model.Observation, _model.Actions]:
@@ -841,6 +681,7 @@ def _get_libero_env(task, resolution, seed):
 
 def run_evaluation(
     policy: _policy.Policy,
+    train_config: _config.TrainConfig,
     num_trials: int = 10,
     task_suite_name: str = "libero_90",
     task_id: int = 0,
@@ -849,6 +690,7 @@ def run_evaluation(
     video_out_path: str = "data/libero/videos",
     task_description: str = "Task 0",
     seed: int = 0,
+    plot_observations: bool = False,
 ):
     """Run evaluation on a LIBERO task.
 
@@ -868,195 +710,23 @@ def run_evaluation(
     Returns:
         success_rate: Success rate across all evaluation episodes.
     """
-    LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
-    LIBERO_ENV_RESOLUTION = 256
-    RESIZE_SIZE = 224
-    REPLAN_STEPS = 5
-    VIDEO_OUT_PATH = video_out_path
-
-    # Seed all random number generators for reproducibility
-    # Note: Policy RNG must be set during policy creation via create_policy(rng_seed=seed)
-    np.random.seed(seed)
-    random.seed(seed)
-
-    # Start evaluation
-    task_episodes, task_successes = 0, 0
-    print(f"\nStarting evaluation: {num_trials} trials (seed={seed})...")
-
-    # Set the JAX compilation cache directory to avoid recompilation and speed up repeated runs.
-    jax.config.update(
-        "jax_compilation_cache_dir", str(epath.Path("~/.cache/jax").expanduser())
-    )
-
-    # Initialize LIBERO task suite
-    benchmark_dict = benchmark.get_benchmark_dict()
-    task_suite = benchmark_dict[task_suite_name]()
-    num_tasks_in_suite = task_suite.n_tasks
-
-    if task_id >= num_tasks_in_suite:
-        raise ValueError(
-            f"Task ID {task_id} is out of range. Task suite has {num_tasks_in_suite} tasks."
+    return run_evaluation_ttt(
+        policy=policy,
+        nn_fetcher=None,
+        train_config=train_config,
+        dataset=None,
+        num_trials=num_trials,
+        task_suite_name=task_suite_name,
+        task_id=task_id,
+        num_steps_wait=num_steps_wait,
+        save_video=save_video,
+        video_out_path=video_out_path,
+        seed=seed,
+        ttt_num_steps=0,
+        ttt_frequency=1000,
+        ttt_k=1,
+        plot_observations=plot_observations,
         )
-
-    print(f"Task suite: {task_suite_name}")
-    print(f"Evaluating task {task_id} of {num_tasks_in_suite}")
-
-    # Determine max steps
-    if task_suite_name == "libero_spatial":
-        max_steps = 220  # longest training demo has 193 steps
-    elif task_suite_name == "libero_object":
-        max_steps = 280  # longest training demo has 254 steps
-    elif task_suite_name == "libero_goal":
-        max_steps = 300  # longest training demo has 270 steps
-    elif task_suite_name == "libero_10":
-        max_steps = 520  # longest training demo has 505 steps
-    elif task_suite_name == "libero_90":
-        max_steps = 400  # longest training demo has 373 steps
-    else:
-        raise ValueError(f"Unknown task suite: {task_suite_name}")
-
-    if save_video:
-        pathlib.Path(VIDEO_OUT_PATH).mkdir(parents=True, exist_ok=True)
-
-    # Get task
-    task = task_suite.get_task(task_id)
-    initial_states = task_suite.get_task_init_states(task_id)
-
-    # Initialize environment
-    env, task_description = _get_libero_env(task, LIBERO_ENV_RESOLUTION, seed)
-    print(f"Task: {task_description}")
-
-    # Run evaluation episodes
-    for episode_idx in tqdm(range(num_trials), desc=f"Task {task_id}"):
-        print(f"Episode {episode_idx+1} of {num_trials}")
-
-        # Reset environment
-        env.reset()
-        env.seed(seed + episode_idx)  # Use episode_idx to ensure different but deterministic seeds per episode
-        action_plan = collections.deque()
-
-        # Set initial states
-        obs = env.set_init_state(initial_states[episode_idx])
-
-        # Setup
-        t = 0
-        replay_images = []
-
-        while t < max_steps + num_steps_wait:
-            try:
-                # Wait for objects to stabilize
-                if t < num_steps_wait:
-                    obs, reward, done, info = env.step(LIBERO_DUMMY_ACTION)
-                    t += 1
-                    continue
-
-                # Get preprocessed images (rotate 180 degrees to match train preprocessing)
-                img = np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
-                wrist_img = np.ascontiguousarray(
-                    obs["robot0_eye_in_hand_image"][::-1, ::-1]
-                )
-                img = image_tools.convert_to_uint8(
-                    image_tools.resize_with_pad(img, RESIZE_SIZE, RESIZE_SIZE)
-                )
-                wrist_img = image_tools.convert_to_uint8(
-                    image_tools.resize_with_pad(wrist_img, RESIZE_SIZE, RESIZE_SIZE)
-                )
-
-                # Save for replay video
-                replay_images.append(img)
-
-                if not action_plan:
-                    # Prepare observations dict
-                    curr_obs_dict = {
-                        "observation/image": img,
-                        "observation/wrist_image": wrist_img,
-                        "observation/state": np.concatenate(
-                            (
-                                obs["robot0_eef_pos"],
-                                _quat2axisangle(obs["robot0_eef_quat"]),
-                                obs["robot0_gripper_qpos"],
-                            )
-                        ),
-                        "prompt": str(task_description),
-                    }
-
-                    # Query model directly (no websocket)
-                    result = policy.infer(curr_obs_dict)
-                    action_chunk = result["actions"]
-                    assert (
-                        len(action_chunk) >= REPLAN_STEPS
-                    ), f"Policy only predicts {len(action_chunk)} steps, need {REPLAN_STEPS}"
-                    action_plan.extend(action_chunk[:REPLAN_STEPS])
-
-                action = action_plan.popleft()
-
-                # Execute action
-                obs, reward, done, info = env.step(action.tolist())
-                if done:
-                    task_successes += 1
-                    break
-                t += 1
-
-            except Exception as e:
-                print(f"Error in episode {episode_idx+1}: {e}")
-                break
-
-        task_episodes += 1
-
-        # Save replay video
-        suffix = "success" if done else "failure"
-        task_segment = task_description.replace(" ", "_")
-        if save_video:
-            video_filename = (
-                f"rollout_task{task_id}_{task_segment}_ep{episode_idx+1}_{suffix}.mp4"
-            )
-            imageio.mimwrite(
-                pathlib.Path(VIDEO_OUT_PATH) / video_filename,
-                [np.asarray(x) for x in replay_images],
-                fps=10,
-            )
-
-        # Log progress
-        if (episode_idx + 1) % 1 == 0:
-            print(
-                f"  Episodes: {task_episodes}, Successes: {task_successes} ({task_successes/task_episodes*100:.1f}%)"
-            )
-
-    # Final results
-    success_rate = task_successes / task_episodes if task_episodes > 0 else 0.0
-    print(f"\n{'='*60}")
-    print(f"Final Results for Task {task_id}:")
-    print(f"  Task: {task_description}")
-    print(f"  Episodes: {task_episodes}")
-    print(f"  Successes: {task_successes}")
-    print(f"  Success rate: {success_rate*100:.1f}%")
-    print(f"{'='*60}")
-
-    return success_rate
-
-
-def make_observation_from_simulator(
-    policy: _policy.Policy, curr_obs_dict: dict
-) -> _model.Observation:
-    # Create Observation object from the current obs_dict
-    inputs = jax.tree.map(lambda x: x, curr_obs_dict)
-    inputs = policy._input_transform(inputs)
-    if not policy._is_pytorch_model:
-        # Make a batch and convert to jax.Array.
-        inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
-        policy._rng, sample_rng_or_pytorch_device = jax.random.split(policy._rng)
-    else:
-        # Convert inputs to PyTorch tensors and move to correct device
-        inputs = jax.tree.map(
-            lambda x: torch.from_numpy(np.array(x)).to(policy._pytorch_device)[
-                None, ...
-            ],
-            inputs,
-        )
-        sample_rng_or_pytorch_device = policy._pytorch_device
-
-    observation = _model.Observation.from_dict(inputs)
-    return observation
 
 
 # Create a simple dataloader that returns the same batch every time
@@ -1109,47 +779,6 @@ def copy_model(model, train_config: _config.TrainConfig):
     # NOTE: No need to block here - nnx.merge() doesn't create new arrays, just combines already-materialized params
     return model_copy
 
-
-def _draw_step_on_frame(frame: np.ndarray, step: int) -> np.ndarray:
-    """Draw step number on top of a video frame (camera image). Returns a copy with text overlaid."""
-    out = np.asarray(frame).copy()
-    if out.ndim == 2:
-        out = np.stack([out] * 3, axis=-1)
-    pil = Image.fromarray(out)
-    draw = ImageDraw.Draw(pil)
-    font = ImageFont.load_default()
-    text = f"Step: {step}"
-    pad = 6
-    # Fixed-size background rectangle for readability (avoids textbbox on older Pillow)
-    try:
-        bbox = draw.textbbox((0, 0), text, font=font)
-        w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
-    except AttributeError:
-        w, h = max(60, len(text) * 10), 28
-    draw.rectangle(
-        [(0, 0), (w + 2 * pad, h + 2 * pad)],
-        fill=(0, 0, 0),
-        outline=(255, 255, 255),
-    )
-    draw.text((pad, pad), text, fill=(255, 255, 255), font=font)
-    return np.array(pil)
-
-
-
-def render_image(img: np.ndarray, resize_size: int = 224) -> np.ndarray:
-    """
-    Render an image from the environment. Rotate 180 degrees and resize to the given size, convert to uint8.
-    Args:
-        img: The image to render.
-        resize_size: The size to resize the image to.
-
-    Returns:
-        The rendered image.
-    """
-    img = np.ascontiguousarray(img[::-1, ::-1])
-    img_resized = image_tools.resize_with_pad(img, resize_size, resize_size)
-    img = image_tools.convert_to_uint8(img_resized)
-    return img
 
 def run_evaluation_ttt(
     policy: _policy.Policy,

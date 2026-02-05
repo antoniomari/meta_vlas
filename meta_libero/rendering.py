@@ -77,43 +77,6 @@ torch.serialization.add_safe_globals(
     ]
 )
 
-# Memory tracking utilities
-def get_gpu_memory_usage():
-    """Get current GPU memory usage in GB."""
-    try:
-        import jax
-
-        devices = jax.devices()
-        if not devices:
-            return None
-        # Get memory info from the first device
-        mem_info = devices[0].memory_stats()
-        allocated = mem_info.get("bytes_in_use", 0) / (1024**3)  # Convert to GB
-        reserved = mem_info.get("bytes_reserved", 0) / (1024**3)  # Convert to GB
-        return {
-            "allocated_gb": allocated,
-            "reserved_gb": reserved,
-            "total_gb": reserved,  # Total reserved is usually the peak
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-def print_memory_checkpoint(label: str, line_num: int = None):
-    """Print memory usage at a checkpoint."""
-    if PRINT_MEMORY_CHECKPOINT:
-        mem = get_gpu_memory_usage()
-        if mem and "error" not in mem:
-            line_info = f" (line {line_num})" if line_num else ""
-            print(
-                f"[MEMORY CHECKPOINT{line_info}] {label}: "
-                f"Allocated: {mem['allocated_gb']:.2f} GB, "
-                f"Reserved: {mem['reserved_gb']:.2f} GB"
-            )
-        else:
-            print(f"[MEMORY CHECKPOINT] {label}: {mem}")
-
-
 
 def decode_tokenized_prompt(
     tokenized_prompt: np.ndarray | jnp.ndarray | None,
@@ -265,7 +228,7 @@ def plot_observation_with_decoded_prompt(
             ax = axes[i, col]
             assert img is not None
             ax.imshow(img)
-            ax.set_title(cam_name + decoded_task_description, fontsize=10)
+            ax.set_title(decoded_task_description, fontsize=10)
             ax.axis("off")
 
         axes[i, 0].set_ylabel(row_title, fontsize=9, labelpad=4)
@@ -274,40 +237,6 @@ def plot_observation_with_decoded_prompt(
     plt.tight_layout()
     plt.show()
     plt.close(fig)
-
-
-def fetch_samples(dataset, idx, repeat=1) -> Tuple[_model.Observation, _model.Actions]:
-    examples = [dataset[int(i)] for i in idx]
-    examples = [example for _ in range(repeat) for example in examples]
-    batch = _data_loader._collate_fn(examples)
-
-    # Convert to JAX arrays (model expects JAX arrays, not numpy arrays)
-    def to_jax(x):
-        if isinstance(x, torch.Tensor):
-            return jnp.asarray(x)
-        elif isinstance(x, np.ndarray):
-            return jnp.asarray(x)
-        elif isinstance(x, jax.Array):
-            return x
-        else:
-            return jnp.asarray(x)
-
-    batch = jax.tree.map(to_jax, batch)
-    obs, actions = _model.Observation.from_dict(batch), batch["actions"]
-    return obs, actions
-
-
-
-def _quat2axisangle(quat):
-    """Convert quaternion to axis-angle representation."""
-    if quat[3] > 1.0:
-        quat[3] = 1.0
-    elif quat[3] < -1.0:
-        quat[3] = -1.0
-    den = np.sqrt(1.0 - quat[3] * quat[3])
-    if math.isclose(den, 0.0):
-        return np.zeros(3)
-    return (quat[:3] * 2.0 * math.acos(quat[3])) / den
 
 
 def make_observation_from_simulator(
@@ -989,92 +918,3 @@ def run_evaluation_ttt(
 
     return success_rate
 
-
-def new_policy_like(policy: _policy.Policy, model: _model.BaseModel):
-
-    return _policy.Policy(
-        model,
-        # rng=rng_key, NOTE: disabled, this is bugged in OpenPI
-        transforms=policy._input_transform.transforms,
-        output_transforms=policy._output_transform.transforms,
-        sample_kwargs=policy._sample_kwargs,
-        metadata=policy._metadata,
-        is_pytorch=policy._is_pytorch_model,
-        pytorch_device=policy._pytorch_device,
-    )
-
-
-def create_policy(
-    model: _model.BaseModel,
-    train_config: _config.TrainConfig,
-    checkpoint_dir: pathlib.Path | str,
-    *,
-    repack_transforms: transforms.Group | None = None,
-    sample_kwargs: dict[str, Any] | None = None,
-    default_prompt: str | None = None,
-    norm_stats: dict[str, transforms.NormStats] | None = None,
-    rng_seed: int | None = None,
-) -> _policy.Policy:
-    """Create a policy from a trained checkpoint.
-
-    Args:
-        train_config: The training config to use to create the model.
-        checkpoint_dir: The directory to load the model from.
-        repack_transforms: Optional transforms that will be applied before any other transforms.
-        sample_kwargs: The kwargs to pass to the `sample_actions` method. If not provided, the default
-            kwargs will be used.
-        default_prompt: The default prompt to use for the policy. Will inject the prompt into the input
-            data if it doesn't already exist.
-        norm_stats: The norm stats to use for the policy. If not provided, the norm stats will be loaded
-            from the checkpoint directory.
-        rng_seed: Random seed for JAX RNG key. If provided, ensures reproducible policy inference.
-                  If None, defaults to 0.
-        pytorch_device: Device to use for PyTorch models (e.g., "cpu", "cuda", "cuda:0").
-                      If None and is_pytorch=True, will use "cuda" if available, otherwise "cpu".
-
-    Note:
-        The function automatically detects whether the model is PyTorch-based by checking for the
-        presence of "model.safensors" in the checkpoint directory.
-    """
-    repack_transforms = repack_transforms or transforms.Group()
-    # TODO: check how to provide data_config here
-    data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
-
-    # TODO: check how to provide norm_stats for TTT
-    if norm_stats is None:
-        # We are loading the norm stats from the checkpoint instead of the config assets dir to make sure
-        # that the policy is using the same normalization stats as the original training process.
-        if data_config.asset_id is None:
-            raise ValueError("Asset id is required to load norm stats.")
-        norm_stats = _checkpoints.load_norm_stats(
-            pathlib.Path(checkpoint_dir) / "assets", data_config.asset_id
-        )
-
-    # Create RNG key if seed provided for reproducible sampling
-    rng_key = jax.random.PRNGKey(rng_seed) if rng_seed is not None else None
-
-    return _policy.Policy(
-        model,
-        # rng=rng_key, NOTE: disabled, this is bugged in OpenPI
-        transforms=[
-            *repack_transforms.inputs,
-            transforms.InjectDefaultPrompt(default_prompt),
-            *data_config.data_transforms.inputs,
-            transforms.Normalize(
-                norm_stats, use_quantiles=data_config.use_quantile_norm
-            ),
-            *data_config.model_transforms.inputs,
-        ],
-        output_transforms=[
-            *data_config.model_transforms.outputs,
-            transforms.Unnormalize(
-                norm_stats, use_quantiles=data_config.use_quantile_norm
-            ),
-            *data_config.data_transforms.outputs,
-            *repack_transforms.outputs,
-        ],
-        sample_kwargs=sample_kwargs,
-        metadata=train_config.policy_metadata,
-        is_pytorch=False,
-        pytorch_device=None,
-    )
