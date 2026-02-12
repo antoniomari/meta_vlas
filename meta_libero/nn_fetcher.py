@@ -65,10 +65,13 @@ class NearestNeighborFetcher:
             self.modalities = meta["modalities"]
             self.embedding_dims = meta["embedding_dims"]
             self.total_samples = meta["total_samples"]
+            # Load normalize_per_modality flag (default to False for backward compatibility)
+            self.normalize_per_modality = meta.get("normalize_per_modality", False)
 
         print(f"Loaded index with {self.index.ntotal} samples")
         print(f"Modalities: {self.modalities}")
         print(f"Embedding dimensions: {self.embedding_dims}")
+        print(f"Normalize per modality: {self.normalize_per_modality}")
         # Extract encoders
         self.image_encoder = model.PaliGemma.img
         self.text_encoder = model.PaliGemma.llm
@@ -231,6 +234,11 @@ class NearestNeighborFetcher:
             if modality == "image1":
                 if modality in use_modalities and image1 is not None:
                     emb = self._extract_image_embedding(image1)
+                    # Normalize per modality if index was built with per-modality normalization
+                    if self.normalize_per_modality:
+                        norm = np.linalg.norm(emb)
+                        if norm > 1e-8:
+                            emb = emb / norm
                 else:
                     emb = np.zeros(expected_dim, dtype=np.float32)
 
@@ -239,6 +247,11 @@ class NearestNeighborFetcher:
             elif modality == "image2":
                 if modality in use_modalities and image2 is not None:
                     emb = self._extract_image_embedding(image2)
+                    # Normalize per modality if index was built with per-modality normalization
+                    if self.normalize_per_modality:
+                        norm = np.linalg.norm(emb)
+                        if norm > 1e-8:
+                            emb = emb / norm
                 else:
                     emb = np.zeros(expected_dim, dtype=np.float32)
 
@@ -247,6 +260,11 @@ class NearestNeighborFetcher:
             elif modality == "text":
                 if modality in use_modalities and tokenized_text is not None:
                     emb = self._extract_text_embedding(tokenized_text)
+                    # Normalize per modality if index was built with per-modality normalization
+                    if self.normalize_per_modality:
+                        norm = np.linalg.norm(emb)
+                        if norm > 1e-8:
+                            emb = emb / norm
                 else:
                     emb = np.zeros(expected_dim, dtype=np.float32)
             else:
@@ -294,11 +312,12 @@ class NearestNeighborFetcher:
                 f"Individual embedding shapes: {[emb.shape for emb in embeddings_list]}"
             )
 
-        # Normalize for cosine similarity
+        # Normalize for cosine similarity (skip if per-modality normalization was used)
         query_embedding = query_embedding.astype(np.float32)
-        norm = np.linalg.norm(query_embedding)
-        if norm > 0:
-            query_embedding = query_embedding / norm
+        if not self.normalize_per_modality:
+            norm = np.linalg.norm(query_embedding)
+            if norm > 0:
+                query_embedding = query_embedding / norm
 
         return query_embedding
 
@@ -344,11 +363,95 @@ class NearestNeighborFetcher:
 
         return distances, indices, metadata_list
 
+    def search_text_then_images(
+        self,
+        query_embedding: np.ndarray,
+        k: int = 10,
+        text_similarity_threshold: float = 0.99,
+    ) -> Tuple[np.ndarray, np.ndarray, List[Dict]]:
+        """
+        Two-stage search: first filter by text similarity (~1.0), then rank by image similarity.
+
+        Requires per-modality normalization and that the index contains image1, image2, and text.
+        The concatenated vector is [image1_emb | image2_emb | text_emb], each individually normalized.
+        We reconstruct all index vectors, compute per-modality dot products, filter by text, rank by images.
+
+        Args:
+            query_embedding: Full query embedding (total_embed_dim,)
+            k: Number of nearest neighbors to return
+            text_similarity_threshold: Minimum text cosine similarity to keep (default 0.99)
+
+        Returns:
+            Tuple of (image_similarities, indices, metadata_list)
+            - image_similarities: Combined image1+image2 similarity scores (k,)
+            - indices: Indices of nearest neighbors (k,)
+            - metadata_list: List of metadata dicts for the neighbors
+        """
+        query_embedding = query_embedding.astype(np.float32)
+
+        # Compute modality slicing offsets
+        offsets = {}
+        offset = 0
+        for mod in self.modalities:
+            dim = self.embedding_dims[mod]
+            offsets[mod] = (offset, offset + dim)
+            offset += dim
+
+        if "text" not in offsets:
+            raise ValueError("text modality required for text_then_images search")
+
+        # Slice query into modality parts
+        text_start, text_end = offsets["text"]
+        query_text = query_embedding[text_start:text_end]
+
+        # Reconstruct all vectors from the index
+        n = self.index.ntotal
+        all_vectors = self.index.reconstruct_n(0, n)  # (n, total_dim)
+
+        # Compute text similarity for all vectors
+        all_text = all_vectors[:, text_start:text_end]  # (n, text_dim)
+        text_sims = all_text @ query_text  # (n,) — dot product of unit vectors = cosine sim
+
+        # Filter: keep only samples with text similarity >= threshold
+        mask = text_sims >= text_similarity_threshold
+        candidate_indices = np.where(mask)[0]
+
+        print(f"Found {len(candidate_indices)} candidates")
+
+        if len(candidate_indices) == 0:
+            # Fallback: relax threshold and take top candidates by text similarity
+            top_text = np.argsort(-text_sims)[:k]
+            candidate_indices = top_text
+
+        # Compute image similarities for candidates
+        candidate_vectors = all_vectors[candidate_indices]  # (num_candidates, total_dim)
+        image_sims = np.zeros(len(candidate_indices), dtype=np.float32)
+
+        for mod in self.modalities:
+            if mod == "text":
+                continue
+            mod_start, mod_end = offsets[mod]
+            query_mod = query_embedding[mod_start:mod_end]
+            candidate_mod = candidate_vectors[:, mod_start:mod_end]
+            image_sims += candidate_mod @ query_mod  # Add per-modality cosine sim
+
+        # Rank by combined image similarity (descending)
+        top_k = min(k, len(candidate_indices))
+        best = np.argsort(-image_sims)[:top_k]
+
+        result_indices = candidate_indices[best]
+        result_sims = image_sims[best]
+        metadata_list = [self.metadata[idx] for idx in result_indices]
+
+        return result_sims, result_indices, metadata_list
+
     def fetch_neighbors(
         self,
         observation,
         use_modalities: Optional[List[str]] = None,
         k: int = 10,
+        filter_text_first: bool = False,
+        text_similarity_threshold: float = 0.999999,
     ) -> Tuple[np.ndarray, np.ndarray, List[Dict]]:
         """
         Fetch top-k nearest neighbors for a query observation.
@@ -357,6 +460,9 @@ class NearestNeighborFetcher:
             observation: Observation object/dict with images and text
             use_modalities: List of modalities to use. If None, uses all available.
             k: Number of nearest neighbors to retrieve
+            filter_text_first: If True, first filter by text similarity (~1.0),
+                               then rank remaining by image similarity only.
+            text_similarity_threshold: Min text cosine similarity when filter_text_first=True.
 
         Returns:
             Tuple of (distances, indices, metadata_list)
@@ -365,6 +471,11 @@ class NearestNeighborFetcher:
             observation=observation,
             use_modalities=use_modalities,
         )
+
+        if filter_text_first:
+            return self.search_text_then_images(
+                query_emb, k=k, text_similarity_threshold=text_similarity_threshold,
+            )
 
         return self.search(query_emb, k=k)
 

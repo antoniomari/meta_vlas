@@ -14,7 +14,10 @@ import copy
 import traceback
 import dataclasses
 import functools
-from typing import Any, Iterator, SupportsIndex, Tuple, Optional, List
+from typing import Any, Iterator, SupportsIndex, Tuple, Optional, List, Callable
+from collections import defaultdict
+
+from meta_libero.nn_fetcher import NearestNeighborFetcher
 import os
 import logging
 
@@ -88,7 +91,7 @@ import openpi.training.data_loader as _data_loader
 import openpi.training.utils as training_utils
 import openpi.shared.download as download
 
-from rendering import plot_observation_with_decoded_prompt, decode_tokenized_prompt, make_observation_from_simulator, _draw_step_on_frame
+from rendering import plot_observation_with_decoded_prompt, decode_tokenized_prompt, make_observation_from_simulator, _draw_step_on_frame, render_image
 # Ensures deterministic behavior in CUDNN
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
@@ -793,6 +796,7 @@ def run_evaluation_ttt(
     video_out_path: str = "data/libero/videos",
     seed: int = 0,
     ttt_num_steps: int = 10,
+    max_ttt_step: int = 1000, # No further TTT after this step
     ttt_frequency: int = 50,
     learning_rate: float = 2.5e-5,
     ttt_k: int = 50,
@@ -800,6 +804,110 @@ def run_evaluation_ttt(
     plot_observations: bool = False,
     repeat_batch: int = 1,
     reset_policy: bool = True,
+    use_test_task: bool = False,
+    random_neighbors: bool = False,
+    cfg_weight: float = 1.0,
+):
+
+
+    return run_evaluation_with_adaptation(
+        adaptation_fn=adapt_fn_ttt,
+        policy=policy,
+        nn_fetcher=nn_fetcher,
+        train_config=train_config,
+        dataset=dataset,
+        num_trials=num_trials,
+        task_suite_name=task_suite_name,
+        task_id=task_id,
+        num_steps_wait=num_steps_wait,
+        save_video=save_video,
+        video_out_path=video_out_path,
+        seed=seed,
+        ttt_num_steps=ttt_num_steps,
+        max_ttt_step=max_ttt_step,
+        ttt_frequency=ttt_frequency,
+        learning_rate=learning_rate,
+        ttt_k=ttt_k,
+        ttt_use_modalities=ttt_use_modalities,
+        plot_observations=plot_observations,
+        repeat_batch=repeat_batch,
+        reset_policy=reset_policy,
+        use_test_task=use_test_task,
+        random_neighbors=random_neighbors,
+        cfg_weight=cfg_weight,
+        adapt_kwargs={},
+    )
+
+
+def run_evaluation_noise(
+    policy: _policy.Policy,
+    nn_fetcher: Any,
+    train_config: _config.TrainConfig,
+    dataset: Any,
+    num_trials: int = 10,
+    task_suite_name: str = "libero_90",
+    task_id: int = 0,
+    num_steps_wait: int = 10,
+    save_video: bool = True,
+    video_out_path: str = "data/libero/videos",
+    seed: int = 0,
+    max_noise_step: int = 150, # No further noise after this step
+    noise_frequency: int = 50,
+    noise_sigma: float = 0.01,
+    plot_observations: bool = False,
+    reset_policy: bool = True,
+):
+
+    return run_evaluation_with_adaptation(
+        adaptation_fn=adapt_fn_gaussian_perturbation,
+        policy=policy,
+        nn_fetcher=nn_fetcher,
+        train_config=train_config,
+        dataset=dataset,
+        num_trials=num_trials,
+        task_suite_name=task_suite_name,
+        task_id=task_id,
+        num_steps_wait=num_steps_wait,
+        save_video=save_video,
+        video_out_path=video_out_path,
+        seed=seed,
+        ttt_num_steps=0,
+        max_ttt_step=max_noise_step,
+        ttt_frequency=noise_frequency,
+        ttt_k=1,
+        plot_observations=plot_observations,
+        repeat_batch=1,
+        reset_policy=reset_policy,
+        adapt_kwargs=dict(noise_std=noise_sigma),
+    )
+
+
+def run_evaluation_with_adaptation(
+    policy: _policy.Policy,
+    nn_fetcher: Any,
+    train_config: _config.TrainConfig,
+    dataset: Any,
+    adaptation_fn: Callable,
+    num_trials: int = 10,
+    task_suite_name: str = "libero_90",
+    task_id: int = 0,
+    num_steps_wait: int = 10,
+    save_video: bool = True,
+    video_out_path: str = "data/libero/videos",
+    seed: int = 0,
+    ttt_num_steps: int = 10,
+    max_ttt_step: int = 1000, # No further TTT after this step
+    ttt_frequency: int = 50,
+    learning_rate: float = 2.5e-5,
+    ttt_k: int = 50,
+    ttt_use_modalities: Optional[List[str]] = None,
+    plot_observations: bool = False,
+    repeat_batch: int = 1,
+    reset_policy: bool = True,
+    use_test_task: bool = False,
+    random_neighbors: bool = False,
+    cfg_weight: float = 1.0,
+    adapt_kwargs: dict[str, Any] = {},
 ):
     """
     Run evaluation with test-time training (TTT).
@@ -828,7 +936,7 @@ def run_evaluation_ttt(
         success_rate: Success rate across all evaluation episodes
     """
     LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
-    LIBERO_ENV_RESOLUTION = 256
+    LIBERO_ENV_RESOLUTION = 224 if task_suite_name == "libero_90" else 256
     RESIZE_SIZE = 224
     REPLAN_STEPS = 5
     NUM_STEPS_WAIT = 10
@@ -935,9 +1043,15 @@ def run_evaluation_ttt(
         replay_images = []
         distances_actions = []
         similarities = []
+        stats = defaultdict(list)
         episode_losses: list[list[float]] = []
-        # Reset policy model to original model at the beginning of each episode
-        policy._model = original_model
+
+        ################################################################################
+        # At the beginning of the episode, the policy is reset to the original model.
+        ################################################################################
+        new_policy_original = new_policy_like(policy, original_model)
+        del policy
+        policy = new_policy_original
 
         while t < max_steps + num_steps_wait:
             # Wait for objects to stabilize
@@ -962,6 +1076,7 @@ def run_evaluation_ttt(
                     f"[ENV CHECK] Raw env images (t={t}) - base: sum={raw_img_sum:.10f}, mean={raw_img_mean:.10f}, "
                     f"wrist: sum={raw_wrist_img_sum:.10f}, mean={raw_wrist_img_mean:.10f}"
                 )
+
 
             img = np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
             wrist_img = np.ascontiguousarray(
@@ -1005,7 +1120,18 @@ def run_evaluation_ttt(
                 }
 
                 # Query model directly (no websocket)
-                action_chunk = policy.infer(curr_obs_dict)["actions"]
+                policy._rng, rng = jax.random.split(policy._rng)
+                noise = jax.random.normal(rng, (1, original_model.action_horizon, original_model.action_dim))
+                action_chunk = policy.infer(curr_obs_dict, noise=noise)["actions"]
+
+                # check alignment ratio
+                # NOTE: override action_chunk with cfg action chunk, the default weight is 1.0 so no change
+                alignment_ratio, action_chunk_cfg = compute_alignment_ratio(policy, action_chunk, curr_obs_dict, noise=noise, cfg_weight=cfg_weight)
+                if t <= max_ttt_step:
+                    action_chunk = action_chunk_cfg
+
+                pbar.write(f"[TTT] Alignment ratio: {alignment_ratio:.4f}")
+                stats["alignment_ratio"].append((t, alignment_ratio))
 
                 # Check action_chunk before TTT for determinism
                 if check_determinism and is_ttt_step:
@@ -1027,7 +1153,27 @@ def run_evaluation_ttt(
                 ), f"Policy only predicts {len(action_chunk)} steps, need {REPLAN_STEPS}"
 
                 # Perform TTT if at the right frequency
-                if (t - num_steps_wait) % ttt_frequency == 0:
+                if (t - num_steps_wait) % ttt_frequency == 0 and t > max_ttt_step:
+
+                    # Create Observation object from the current observation
+                    observation = make_observation_from_simulator(
+                        policy, curr_obs_dict
+                    )
+
+                    ### NN lookup
+                    obs, actions_fetched, distances = nn_lookup(
+                        observation=observation,
+                        nn_fetcher=nn_fetcher,
+                        dataset=dataset,
+                        use_modalities=ttt_use_modalities,
+                        k=ttt_k,
+                        repeat_batch=repeat_batch,
+                        plot_observations=plot_observations,
+                        use_test_task=use_test_task,
+                        pbar=pbar,
+                    )
+
+                if (t - num_steps_wait) % ttt_frequency == 0 and t <= max_ttt_step:
                     ttt_count += 1
                     pbar.write(f"[TTT {ttt_count}] Starting TTT update")
 
@@ -1055,156 +1201,35 @@ def run_evaluation_ttt(
                         policy, curr_obs_dict
                     )
 
-                    # Check observation hash for determinism (before fetching neighbors)
-                    if check_determinism:
-
-                        # 'base_0_rgb' and 'left_wrist_0_rgb'
-
-                        # Compute a hash of the observation to check if it's the same across runs
-                        obs_image_sum = float(jax.device_get(jnp.sum(observation.images["base_0_rgb"])))
-                        obs_image2_sum = float(jax.device_get(jnp.sum(observation.images["left_wrist_0_rgb"])))
-                        obs_state_sum = float(jax.device_get(jnp.sum(observation.state)))
-                        pbar.write(
-                            f"[TTT {ttt_count}] Observation checksum - image1_sum: {obs_image_sum:.6f}, "
-                            f"image2_sum: {obs_image2_sum:.6f}, state_sum: {obs_state_sum:.6f}"
-                        )
-
-                    # Fetch nearest neighbor inxdices based on current observation
-                    distances, indices, metadata = nn_fetcher.fetch_neighbors(
+                    ### NN lookup
+                    obs, actions_fetched, distances = nn_lookup(
                         observation=observation,
+                        nn_fetcher=nn_fetcher,
+                        dataset=dataset,
                         use_modalities=ttt_use_modalities,
                         k=ttt_k,
-                    )
-                    end_time = time.time()
-                    pbar.write(
-                        f"[TTT {ttt_count}] ({end_time - start_time:.2f}s) Retrieved neighbors with similarities: {distances[:min(5, len(distances))]}"
-                    )
-
-                    # Check if fetched indices are deterministic
-                    if check_determinism:
-                        indices_str = str(list(indices[:min(10, len(indices))]))
-                        distances_str = str([float(d) for d in distances[:min(5, len(distances))]])
-                        # Check raw distance values with high precision to detect floating-point differences
-                        distances_precise = [f"{float(d):.15f}" for d in distances[:min(5, len(distances))]]
-                        pbar.write(
-                            f"[TTT {ttt_count}] Fetched indices (first 10): {indices_str}, "
-                            f"distances (first 5): {distances_str}, "
-                            f"distances (precise): {distances_precise}"
-                        )
-
-                    obs, actions_fetched = fetch_samples(dataset, indices, repeat=repeat_batch)
-                    fetched_observation = obs
-
-                    # Check fetched data for determinism
-                    if check_determinism:
-                        # Check a sample of the fetched actions
-                        if isinstance(actions_fetched, jax.Array):
-                            actions_sum = float(jax.device_get(jnp.sum(actions_fetched)))
-                            actions_mean = float(jax.device_get(jnp.mean(actions_fetched)))
-                        else:
-                            actions_sum = float(np.sum(actions_fetched))
-                            actions_mean = float(np.mean(actions_fetched))
-                        pbar.write(
-                            f"[TTT {ttt_count}] Fetched actions checksum - sum: {actions_sum:.6f}, mean: {actions_mean:.6f}"
-                        )
-
-                    # Plot current observation
-                    if plot_observations:
-                        plot_observation_with_decoded_prompt(
-                            observation=observation,
-                            similarity_score=None,
-                            plot_title_prefix=f"[TTT {ttt_count}] Current Observation",
-                        )
-
-                        # Plot fetched observation (first/best neighbor)
-                        # Note: obs might be a batch, but we'll plot the first one which is the best match
-                        if len(indices) > 0 and len(distances) > 0:
-                            # Extract first observation from batch if needed
-                            # If obs is a batch, plot_observation_images should handle extracting the first element
-
-                            plot_observation_with_decoded_prompt(
-                                observation=fetched_observation,
-                                similarity_score=distances,
-                                plot_title_prefix=f"[TTT {ttt_count}] Fetched Observation (Best Match)",
-                            )
-
-                    # Prepare dataloader for TTT
-                    start_time = time.time()
-
-                    ttt_data_loader = SingleBatchDataLoader(
-                        obs, actions_fetched, ttt_data_config
-                    )
-                    end_time = time.time()
-                    pbar.write(
-                        f"[TTT {ttt_count}] ({end_time - start_time:.2f}s) Prepared dataloader"
+                        repeat_batch=repeat_batch,
+                        plot_observations=plot_observations,
+                        use_test_task=use_test_task,
+                        pbar=pbar,
+                        random_neighbors=random_neighbors
                     )
 
-                    # Debug: Check if train_config object is the same between TTT calls
-
-                    # Restore original model before TTT so each TTT starts from the same baseline
-                    print_memory_checkpoint(
-                        f"[TTT {ttt_count}] Before copying original model", 1288
-                    )
-                    time_start = time.time()
-                    model_copy = copy_model(policy._model, train_config)
-                    time_end = time.time()
-                    pbar.write(
-                        f"[TTT {ttt_count}] ({time_end - time_start:.2f}s) Copied original model"
-                    )
-                    print_memory_checkpoint(
-                        f"[TTT {ttt_count}] After copying original model", 1290
-                    )
-                    # NOTE: here we go 6.25 GB -> 12.58 GB as the model is copied
-
-                    # Check model parameters before TTT for determinism
-                    if check_determinism:
-                        model_params = nnx.state(model_copy)
-                        # Get a sample parameter to check
-                        sample_param = next(iter(jax.tree.leaves(model_params.filter(nnx.Param))))
-                        if hasattr(sample_param, "value"):
-                            param_val = float(jax.device_get(sample_param.value.flatten()[0]))
-                            param_norm = float(jax.device_get(jnp.linalg.norm(sample_param.value)))
-                        else:
-                            param_val = float(jax.device_get(sample_param.flatten()[0]))
-                            param_norm = float(jax.device_get(jnp.linalg.norm(sample_param)))
-                        pbar.write(
-                            f"[TTT {ttt_count}] Model param before TTT - first_val: {param_val:.10f}, norm: {param_norm:.6f}"
-                        )
-
-                    # Perform fine-tuning on the copy (with donation enabled to save memory)
-                    # Each TTT should start fresh - don't resume from previous TTT state to avoid memory accumulation
-                    # Use donation=True to save memory - the copy will be modified, original is preserved
-                    trained_model, losses, train_state = train_model_on_fly(
-                        model=model_copy,  # Pass copy, original model is preserved
-                        training_data_loader=ttt_data_loader,
-                        config=train_config,
+                    trained_model, losses = adaptation_fn(
+                        policy=policy,
+                        train_config=train_config,
+                        ttt_data_config=ttt_data_config,
+                        train_obs=obs,
+                        train_actions=actions_fetched,
                         learning_rate=learning_rate,
                         num_steps=ttt_num_steps,
                         warmup_steps=0,
                         weight_decay=0.0,
                         log_interval=max(1, ttt_num_steps // 2),
-                        seed=seed + ttt_count,  # Different seed for each TTT
-                        resume_train_state=None,  # Each TTT starts fresh - don't accumulate optimizer state
-                        resume_losses=None,  # Don't carry over losses
-                        donate_buffers=True,  # Enable donation to save memory (copy is modified, original preserved)
+                        seed=seed + ttt_count,
+                        pbar=pbar,
+                        **adapt_kwargs,
                     )
-                    # Print losses
-                    # Store a copy of the losses for this TTT update so external
-                    # consumers can visualize them later.
-                    episode_losses.append(list(losses))
-
-                    # Check first and last loss for determinism
-                    if check_determinism and len(losses) > 0:
-                        first_loss = losses[0]
-                        last_loss = losses[-1]
-                        pbar.write(
-                            f"[TTT {ttt_count}] Loss values - first: {first_loss:.10f}, last: {last_loss:.10f}, "
-                            f"all: {[f'{l:.6f}' for l in losses]}"
-                        )
-                    # Use fine-tuned model to generate new action plan
-                    # NOTE: No need to block - trained_model was already returned from train_model_on_fly
-                    # which handled all necessary blocking during the copy/merge process
-                    trained_model.eval()
 
                     # Update the policy's model temporarily
                     # Use deterministic seed for TTT policy to ensure reproducibility
@@ -1215,7 +1240,7 @@ def run_evaluation_ttt(
                     #)
                     # Generate new action_chunk with fine-tuned model
                     # ttt_action_chunk = ttt_policy.infer(curr_obs_dict)["actions"]
-                    ttt_action_chunk = ttt_policy.infer(curr_obs_dict)["actions"]
+                    ttt_action_chunk = ttt_policy.infer(curr_obs_dict, noise=noise)["actions"]
 
                     # Compare action_chunk with ttt_action_chunk
                     # Compute distance on GPU using JAX to avoid expensive GPU->CPU transfer
@@ -1231,22 +1256,6 @@ def run_evaluation_ttt(
                         else jnp.array(ttt_action_chunk)
                     )
 
-                    # Check action chunks for determinism before computing distance
-                    if check_determinism:
-                        action_chunk_sum = float(jax.device_get(jnp.sum(action_chunk_jax)))
-                        action_chunk_mean = float(jax.device_get(jnp.mean(action_chunk_jax)))
-                        action_chunk_norm = float(jax.device_get(jnp.linalg.norm(action_chunk_jax)))
-                        ttt_action_chunk_sum = float(jax.device_get(jnp.sum(ttt_action_chunk_jax)))
-                        ttt_action_chunk_mean = float(jax.device_get(jnp.mean(ttt_action_chunk_jax)))
-                        ttt_action_chunk_norm = float(jax.device_get(jnp.linalg.norm(ttt_action_chunk_jax)))
-                        diff_sum = float(jax.device_get(jnp.sum(action_chunk_jax - ttt_action_chunk_jax)))
-                        pbar.write(
-                            f"[TTT {ttt_count}] Action chunks checksum - "
-                            f"action_chunk: sum={action_chunk_sum:.10f}, mean={action_chunk_mean:.10f}, norm={action_chunk_norm:.10f}, "
-                            f"ttt_action_chunk: sum={ttt_action_chunk_sum:.10f}, mean={ttt_action_chunk_mean:.10f}, norm={ttt_action_chunk_norm:.10f}, "
-                            f"diff_sum={diff_sum:.10f}"
-                        )
-
                     # Compute distance on GPU
                     action_distance_jax = jnp.linalg.norm(
                         action_chunk_jax - ttt_action_chunk_jax
@@ -1255,19 +1264,17 @@ def run_evaluation_ttt(
                     action_distance = float(jax.device_get(action_distance_jax))
                     distances_actions.append((t, action_distance))
                     similarities.append((t, distances[0]))
-                    if check_determinism:
-                        pbar.write(
-                            f"[TTT {ttt_count}] Distance between action_chunk and actions_fetched: {action_distance:.10f} (precise)"
-                        )
-                    else:
-                        pbar.write(
-                            f"[TTT {ttt_count}] Distance between action_chunk and actions_fetched: {action_distance:.4f}"
-                        )
+                    episode_losses.append(list(losses))
+
+
+                    pbar.write(
+                        f"[TTT {ttt_count}] Distance between action_chunk and actions_fetched: {action_distance:.4f}"
+                    )
 
                     # Optionally plot current loss and action distances at end of each TTT step
                     if plot_observations:
                         fig, (ax_loss, ax_dist) = plt.subplots(1, 2, figsize=(10, 4))
-                        if losses:
+                        if losses and len(losses) > 0:
                             ax_loss.plot(range(len(losses)), losses, "b-o", markersize=3)
                         ax_loss.set_title(f"[TTT {ttt_count}] Loss (this update)")
                         ax_loss.set_xlabel("Gradient step")
@@ -1290,21 +1297,12 @@ def run_evaluation_ttt(
                     if reset_policy:
                         del trained_model
                     else:
-                        # NOTE: for now, it will not restore the right original model at the beginning of the next episode
-                        # The original model now becomes the TTT model
-                        del original_model
-                        original_model = trained_model
-                        new_policy = new_policy_like(policy, original_model)
+                        new_policy = new_policy_like(policy, trained_model)
                         del policy
                         policy = new_policy
 
-                    del model_copy, train_state, losses, ttt_data_loader, obs, actions_fetched
+                    del losses, obs, actions_fetched
                     print_memory_checkpoint(f"[TTT {ttt_count}] At the end of the TTT update deleting objects", 1300)
-
-                    # Force garbage collection and clear JAX caches
-                    # import gc
-                    # gc.collect()
-                    # jax.clear_caches()
 
                 action_plan.extend(action_chunk[:REPLAN_STEPS])
 
@@ -1316,7 +1314,6 @@ def run_evaluation_ttt(
                 task_successes += 1
                 break
             t += 1
-
 
         task_episodes += 1
 
@@ -1332,11 +1329,28 @@ def run_evaluation_ttt(
                 "distances_actions": list(distances_actions),
                 "similarities": list(similarities),
                 "losses": episode_losses,
+                "num_steps": t,
             }
         )
 
+        # Plot alignment ratio
+        if stats["alignment_ratio"]:
+            steps, ratios = zip(*stats["alignment_ratio"])
+            fig, ax = plt.subplots(figsize=(10, 4))
+            ax.plot(steps, ratios, "b-o", markersize=3)
+            # Add horizontal lines at 0.05 (red) and 0.2 (yellow)
+            ax.axhline(0.05, color="red", linestyle="--", linewidth=1.5, label="0.05")
+            ax.axhline(0.2, color="gold", linestyle="--", linewidth=1.5, label="0.2")
+            ax.set_title("Alignment ratio")
+            ax.set_xlabel("Step")
+            ax.set_ylabel("Alignment ratio")
+            ax.legend(loc="upper right")
+            plt.tight_layout()
+            plt.show()
+            plt.close(fig)
+
         # Save per-episode losses plot (sequence of losses for each TTT step)
-        if episode_losses:
+        if episode_losses and ttt_num_steps > 1:
             n_ttt = len(episode_losses)
             n_cols = min(3, n_ttt)
             n_rows = (n_ttt + n_cols - 1) // n_cols
@@ -1354,7 +1368,8 @@ def run_evaluation_ttt(
                 axes_flat[j].set_visible(False)
             plt.suptitle(f"Episode {episode_idx+1} – {'success' if done else 'failure'}")
             plt.tight_layout()
-            losses_plot_path = pathlib.Path(VIDEO_OUT_PATH).parent / f"losses_ep_{episode_idx+1}.pdf"
+            os.makedirs(pathlib.Path(VIDEO_OUT_PATH).parent / "plots_losses", exist_ok=True)
+            losses_plot_path = pathlib.Path(VIDEO_OUT_PATH).parent / "plots_losses" / f"losses_ep_{episode_idx+1}.pdf"
             plt.savefig(losses_plot_path, bbox_inches="tight")
             plt.close(fig)
 
@@ -1393,7 +1408,7 @@ def run_evaluation_ttt(
     print(f"  Total TTT updates: {ttt_count}")
     print(f"{'='*60}")
 
-    return success_rate
+    return success_rate, all_episode_metrics
 
 
 def new_policy_like(policy: _policy.Policy, model: _model.BaseModel):
@@ -1484,3 +1499,250 @@ def create_policy(
         is_pytorch=False,
         pytorch_device=None,
     )
+
+
+
+def nn_lookup(
+    observation: _model.Observation,
+    nn_fetcher: NearestNeighborFetcher,
+    dataset: Any,
+    pbar: tqdm,
+    use_modalities: Optional[List[str]],
+    k: int,
+    repeat_batch: int,
+    plot_observations: bool,
+    use_test_task: bool = False,
+    random_neighbors: bool = False,
+):
+    start_time = time.time()
+
+    # For libero90 nn_fetcher, we need to mirror horizontally the images
+    if nn_fetcher.normalize_per_modality: # True for libero90, False for libero10
+        observation.images["base_0_rgb"] = observation.images["base_0_rgb"][:, :, ::-1, :]
+        observation.images["left_wrist_0_rgb"] = observation.images["left_wrist_0_rgb"][:, :, ::-1, :]
+
+    print(f"Using modalities: {use_modalities}")
+
+    distances, indices, metadata = nn_fetcher.fetch_neighbors(
+        observation=observation,
+        use_modalities=use_modalities,
+        filter_text_first=True,
+        k=k,
+    )
+    end_time = time.time()
+    pbar.write(
+        f"\t({end_time - start_time:.2f}s) Retrieved neighbors with similarities: {distances[:min(5, len(distances))]}"
+    )
+
+    if random_neighbors:
+        indices = np.random.choice(len(dataset), size=k, replace=False)
+
+    nn_observations, nn_actions = fetch_samples(dataset, indices, repeat=repeat_batch)
+
+    # Copy and repeat the tokenized prompt fields from query observation
+    if use_test_task:
+        nn_observations = dataclasses.replace(
+            nn_observations,
+            tokenized_prompt=jnp.repeat(observation.tokenized_prompt, k, axis=0),
+            tokenized_prompt_mask=jnp.repeat(observation.tokenized_prompt_mask, k, axis=0),
+            token_ar_mask=jnp.repeat(observation.token_ar_mask, k, axis=0) if observation.token_ar_mask is not None else None,
+            token_loss_mask=jnp.repeat(observation.token_loss_mask, k, axis=0) if observation.token_loss_mask is not None else None,
+        )
+
+    # Plot current observation
+    if plot_observations:
+        plot_observation_with_decoded_prompt(
+            observation=observation,
+            similarity_score=None,
+            plot_title_prefix=f"\tCurrent Observation",
+        )
+
+        # Plot fetched observation (first/best neighbor)
+        # Note: obs might be a batch, but we'll plot the first one which is the best match
+        if len(indices) > 0 and len(distances) > 0:
+            # Extract first observation from batch if needed
+            # If obs is a batch, plot_observation_images should handle extracting the first element
+            plot_observation_with_decoded_prompt(
+                observation=nn_observations,
+                similarity_score=distances,
+                plot_title_prefix=f"\tFetched Observation (Best Match)",
+            )
+
+    return nn_observations, nn_actions, distances
+
+
+def adapt_fn_ttt(
+    policy: _policy.Policy,
+    train_config: _config.TrainConfig,
+    ttt_data_config: _config.DataConfig,
+    train_obs: _model.Observation,
+    train_actions: _model.Actions,
+    learning_rate: float,
+    num_steps: int,
+    warmup_steps: int,
+    weight_decay: float,
+    log_interval: int,
+    seed: int,
+    pbar: tqdm,
+    **kwargs,
+):
+    # Prepare dataloader for TTT
+    start_time = time.time()
+
+    ttt_data_loader = SingleBatchDataLoader(
+        train_obs, train_actions, ttt_data_config
+    )
+    end_time = time.time()
+    pbar.write(
+        f"\t({end_time - start_time:.2f}s) Prepared dataloader"
+    )
+
+    # Debug: Check if train_config object is the same between TTT calls
+
+    # Restore original model before TTT so each TTT starts from the same baseline
+    print_memory_checkpoint(
+        f"\tBefore copying original model", 1288
+    )
+    time_start = time.time()
+    model_copy = copy_model(policy._model, train_config)
+    time_end = time.time()
+    pbar.write(
+        f"\t({time_end - time_start:.2f}s) Copied original model"
+    )
+    print_memory_checkpoint(
+        f"\tAfter copying original model", 1290
+    )
+    # NOTE: here we go 6.25 GB -> 12.58 GB as the model is copied
+
+    # Perform fine-tuning on the copy (with donation enabled to save memory)
+    # Each TTT should start fresh - don't resume from previous TTT state to avoid memory accumulation
+    # Use donation=True to save memory - the copy will be modified, original is preserved
+    trained_model, losses, train_state = train_model_on_fly(
+        model=model_copy,  # Pass copy, original model is preserved
+        training_data_loader=ttt_data_loader,
+        config=train_config,
+        learning_rate=learning_rate,
+        num_steps=num_steps,
+        warmup_steps=0,
+        weight_decay=0.0,
+        log_interval=max(1, num_steps // 2),
+        seed=seed,
+        resume_train_state=None,  # Each TTT starts fresh - don't accumulate optimizer state
+        resume_losses=None,  # Don't carry over losses
+        donate_buffers=True,  # Enable donation to save memory (copy is modified, original preserved)
+    )
+
+    # Use fine-tuned model to generate new action plan
+    # NOTE: No need to block - trained_model was already returned from train_model_on_fly
+    # which handled all necessary blocking during the copy/merge process
+    trained_model.eval()
+
+    del train_state, ttt_data_loader
+
+    return trained_model, losses
+
+
+def adapt_fn_gaussian_perturbation(
+    policy: _policy.Policy,
+    train_config: _config.TrainConfig,
+    pbar: tqdm,
+    noise_std: float = 0.01,
+    seed: int = 0,
+    **kwargs
+):
+    """
+    Adapt the model by adding Gaussian noise to all trainable parameters.
+
+    This is a simple baseline adaptation method that perturbs trainable parameters
+    with Gaussian noise instea[float]d of performing gradient-based optimization.
+
+    Args:
+        policy: The policy containing the model to adapt
+        train_config: Training configuration with trainable_filter
+        ttt_data_config: Data configuration (unused, kept for API consistency)
+        train_obs: Training observation (unused, kept for API consistency)
+        train_actions: Training actions (unused, kept for API consistency)
+        fetched_observation: Fetched observation (unused, kept for API consistency)
+        actions_fetched: Fetched actions (unused, kept for API consistency)
+        learning_rate: Learning rate (unused, kept for API consistency)
+        num_steps: Number of steps (unused, kept for API consistency)
+        noise_std: Standard deviation of Gaussian noise to add to parameters
+        seed: Random seed for reproducibility
+
+    Returns:
+        Tuple of (perturbed_model, empty_losses_list)
+    """
+    # Copy the model
+    model_copy = copy_model(policy._model, train_config)
+
+    # Get current parameters
+    params = nnx.state(model_copy)
+
+    # Create RNG key for noise generation
+    rng = jax.random.key(seed)
+
+    # Get trainable parameters to count them
+    trainable_filter = train_config.trainable_filter
+    trainable_params = params.filter(trainable_filter)
+
+    # Generate enough keys for all trainable parameters
+    num_params = len(jax.tree_util.tree_leaves(trainable_params))
+    keys = list(jax.random.split(rng, num_params))
+
+    # Use a mutable counter to track which key to use
+    key_idx = [0]
+
+    def add_noise_to_param(param):
+        """Add Gaussian noise to a single parameter."""
+        if key_idx[0] >= len(keys):
+            return param
+        key = keys[key_idx[0]]
+        key_idx[0] += 1
+
+        if hasattr(param, "value"):
+            # Handle nnx.Variable/Param types
+            noise = jax.random.normal(key, param.value.shape, dtype=param.value.dtype) * noise_std
+            return param.replace(param.value + noise)
+        else:
+            # Handle raw arrays
+            noise = jax.random.normal(key, param.shape, dtype=param.dtype) * noise_std
+            return param + noise
+
+    # Apply noise to trainable parameters using state_map
+    noisy_params = nnx_utils.state_map(
+        params,
+        trainable_filter,
+        add_noise_to_param,
+    )
+
+    # Update the model with noisy parameters
+    nnx.update(model_copy, noisy_params)
+
+    pbar.write(f"[Gaussian Perturbation] Added noise (std={noise_std}) to {key_idx[0]} trainable parameters")
+
+    # Return the perturbed model with empty losses (no training was performed)
+    return model_copy, []
+
+
+def compute_alignment_ratio(
+    policy: _policy.Policy,
+    action_chunk: _model.Actions,
+    curr_obs_dict: dict[str, Any],
+    noise: np.ndarray | jnp.ndarray | None = None,
+    cfg_weight: float = 1.0
+) -> float:
+    """
+    Calculate the alignment ratio of the model.
+    """
+
+    original_prompt = curr_obs_dict["prompt"]
+    # Use empty prompt
+    curr_obs_dict["prompt"] = ""
+    action_chunk_empty = policy.infer(curr_obs_dict, noise=noise)["actions"]
+    curr_obs_dict["prompt"] = original_prompt
+
+
+    alignment_ratio = jnp.linalg.norm(action_chunk[:,:5] - action_chunk_empty[:,:5]) / jnp.linalg.norm(action_chunk_empty[:,:5])
+    cfg_actions = action_chunk_empty + cfg_weight * (action_chunk - action_chunk_empty)
+
+    return alignment_ratio, cfg_actions

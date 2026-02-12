@@ -1,391 +1,438 @@
-## Fine-tune Model on First Task from libero_90
+## Fine-tune and evaluate a pi0.5 model on a single LIBERO task
+#
+# Structured to mirror meta_libero/scripts/ttt_evaluation.py:
+#   - same warning / env-var / logging setup
+#   - model loaded via load_pi05_libero_model()
+#   - dataset prepared via _prepare_dataset()
+#   - evaluation done with run_evaluation_ttt(ttt_num_steps=0)
+#
+# Supports two ways of specifying hyperparameters:
+#   1.  YAML config file:   python finetune_single_task.py --config experiments/ft.yaml
+#   2.  CLI flags:          python finetune_single_task.py --lr 1e-4 --batch_size 32
+#   3.  Both (CLI overrides YAML): python finetune_single_task.py --config ft.yaml --seed 42
 
-# CRITICAL: Suppress warnings BEFORE any other imports (even os!)
 import sys
 import logging
 import warnings
-warnings.filterwarnings("ignore")  # Suppress ALL warnings
-# Specifically suppress the JAX shape deprecation warning from Flax
+
+# Suppress warnings BEFORE any other imports (even os!)
+warnings.filterwarnings("ignore")
 warnings.filterwarnings("ignore", message=".*shape requires ndarray or scalar arguments.*")
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="flax.core.scope")
 
-# Now set environment variables
 import os
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Suppress TF warnings if any
-os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.95'
-os.environ['XLA_FLAGS'] = '--xla_gpu_deterministic_ops=true'
-os.environ['JAX_TRACEBACK_FILTERING'] = 'off'  # Cleaner error messages
 
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["HF_HOME"] = "/cluster/home/anmari/.cache/huggingface"
+os.environ["HF_LEROBOT_HOME"] = "/cluster/home/anmari/.cache/huggingface/lerobot"
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.99"
+os.environ["XLA_FLAGS"] = "--xla_gpu_deterministic_ops=true"
+os.environ["JAX_TRACEBACK_FILTERING"] = "off"
+
+from pathlib import Path
+from typing import Any
+import argparse
+import csv
 import dataclasses
 
-class VersionWarningFilter(logging.Filter):
-    def filter(self, record):
-        # avoid lerobot warning
-        return "is in 2.0 format" not in record.getMessage()
-logging.getLogger().addFilter(VersionWarningFilter())
+import matplotlib
 
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
-
-import logging
-logging.getLogger('absl').setLevel(logging.ERROR)
-logging.getLogger('jax').setLevel(logging.ERROR)
-logging.getLogger('OpenGL').setLevel(logging.ERROR)
-
-import h5py
 import numpy as np
-from pathlib import Path
-from typing import Iterator, Tuple
 import jax.numpy as jnp
 import jax
-import sys
-import csv
-import argparse
-import time
-import matplotlib
-matplotlib.use('Agg')  # Use non-interactive backend for saving plots
-import matplotlib.pyplot as plt
 
 sys.path.append("./meta_libero")
 
-# To debug jax errors
-# jax.config.update('jax_disable_   ', True)
+from nn_fetcher import NearestNeighborFetcher  # type: ignore
+from libero_dataset import override_create_torch_dataset  # type: ignore
+from openpi.training import data_loader as _data_loader  # type: ignore
+import openpi.models.model as _model  # type: ignore
+import openpi.training.config as _config  # type: ignore
+import openpi.shared.download as download  # type: ignore
+
+from utils import (  # type: ignore
+    create_policy,
+    load_pi05_libero_model,
+    run_evaluation_ttt,
+    train_model_on_fly,
+)
+from configs import (  # type: ignore
+    ExperimentConfig,
+    FinetuneConfig,
+    EvalConfig,
+    ModelConfig,
+    add_common_args,
+    build_experiment_config,
+    save_experiment,
+)
 
 
-from utils import run_evaluation, create_policy
-from openpi.shared import image_tools
-from openpi.models.model import IMAGE_RESOLUTION
-from utils import train_model_on_fly
-from libero_dataset import prepare_task_dataset, override_create_torch_dataset
-from openpi.training import config as _config
-from openpi.training import data_loader as _data_loader
-from openpi.training import weight_loaders as _weight_loaders
-from openpi.models import model as _model
-import openpi.shared.download as download
-import openpi.shared.array_typing as at
-import openpi.shared.nnx_utils as nnx_utils
-from libero_dataset import override_create_torch_dataset
-import flax.nnx as nnx
-import flax.traverse_util as traverse_util
+# ---------------------------------------------------------------------------
+# Helpers (mirrors ttt_evaluation.py)
+# ---------------------------------------------------------------------------
+
+def _setup_logging() -> None:
+    class VersionWarningFilter(logging.Filter):
+        def filter(self, record: logging.LogRecord) -> bool:
+            return "is in 2.0 format" not in record.getMessage()
+
+    logging.getLogger().addFilter(VersionWarningFilter())
+    logging.getLogger("absl").setLevel(logging.ERROR)
+    logging.getLogger("jax").setLevel(logging.ERROR)
+    logging.getLogger("OpenGL").setLevel(logging.ERROR)
 
 
-
-import dataclasses
-import functools
-import logging
-import platform
-from typing import Any
-
-import etils.epath as epath
-import flax.nnx as nnx
-from flax.training import common_utils
-import flax.traverse_util as traverse_util
-import jax
-import jax.experimental
-import jax.numpy as jnp
-import numpy as np
-import optax
-import tqdm_loggable.auto as tqdm
-import wandb
-
-import openpi.models.model as _model
-import openpi.shared.array_typing as at
-import openpi.shared.nnx_utils as nnx_utils
-import openpi.training.checkpoints as _checkpoints
-import openpi.training.config as _config
-import openpi.training.data_loader as _data_loader
-import openpi.training.optimizer as _optimizer
-import openpi.training.sharding as sharding
-import openpi.training.utils as training_utils
-import openpi.training.weight_loaders as _weight_loaders
-
-
-def main(task_id: int = 8, lr: float = 2.5e-5,
-use_base_model: bool = False, batch_size: int = 64):
-    # Configuration
-    task_suite_name = "libero_10"
-    num_trials = 50
-    total_steps = 200 # was 1000
-    eval_interval = 20 # was 100
-    seed = 0  # Global seed for reproducibility
-
-    # IMPORTANT: checkpoint_path should ALWAYS point to pi05_libero for assets/norm stats
-    # This is used by create_policy for evaluation - it needs Libero-specific assets
-    checkpoint_path = "/cluster/home/anmari/.cache/openpi/openpi-assets/checkpoints/pi05_libero"
-
-    # Choose which weights to load based on use_base_model flag
-    # NOTE: We ALWAYS use the pi05_libero config (model architecture, data config, etc.)
-    # We ONLY change which weights/checkpoint to load
-    if use_base_model:
-        # Load weights from base pi0.5 model (not fine-tuned on Libero)
-        checkpoint_gs_path = "gs://openpi-assets/checkpoints/pi05_base"
-        checkpoint_name = "pi05_base"
-        print("="*60)
-        print("Using BASE pi0.5 model weights (not pre-trained on Libero)")
-        print("Config: pi05_libero (same model architecture and data settings)")
-        print(f"Weights: {checkpoint_gs_path}")
-        print(f"Assets: pi05_libero (for Libero-specific normalization)")
-        print("="*60)
+def _prepare_dataset(
+    config: _config.TrainConfig,
+    dataset_to_use: str = "libero_10",
+) -> tuple[Any, _config.TrainConfig]:
+    """Create the full LIBERO dataset (same as _prepare_ttt_dataset in ttt_evaluation.py)."""
+    if dataset_to_use == "libero_10":
+        repo_id = "physical-intelligence/libero"
     else:
-        # Load weights from pi0.5 model already fine-tuned on Libero
-        checkpoint_gs_path = "gs://openpi-assets/checkpoints/pi05_libero"
-        checkpoint_name = "pi05_libero"
-        print("="*60)
-        print("Using pi0.5 model weights PRE-TRAINED on Libero")
-        print("Config: pi05_libero")
-        print(f"Weights: {checkpoint_gs_path}")
-        print(f"Assets: pi05_libero")
-        print("="*60)
+        assert dataset_to_use == "libero_90"
+        repo_id = "physical-intelligence/libero_90"
 
-    # Create results directory
-    model_suffix = "_base" if use_base_model else ""
-    results_dir = Path(f"meta_libero/results/lr_{lr}{model_suffix}_b{batch_size}")
+    with override_create_torch_dataset(repo_id=repo_id):
+        dataloader = _data_loader.create_data_loader(
+            config, sharding=None, shuffle=False,
+        )
+        dataset = dataloader._data_loader._data_loader.dataset  # type: ignore[attr-defined]
+    return dataset, config
+
+
+def _init_nn_fetcher(model: _model.BaseModel, dataset_to_use: str = "libero_10") -> NearestNeighborFetcher:
+    """Initialise FAISS nearest-neighbour fetcher (same as ttt_evaluation.py)."""
+    if dataset_to_use == "libero_10":
+        cache_dir = Path.home() / ".cache" / "libero_unified_faiss"
+    else:
+        assert dataset_to_use == "libero_90"
+        cache_dir = Path.home() / ".cache" / "libero_90_norm"
+
+    modality_str = "_".join(sorted(["image1", "image2", "text"]))
+    index_path = cache_dir / f"libero_unified_faiss_index_{modality_str}.index"
+    metadata_path = cache_dir / f"libero_unified_faiss_metadata_{modality_str}.pkl"
+
+    if not index_path.exists() or not metadata_path.exists():
+        raise FileNotFoundError(
+            f"FAISS index or metadata not found at {index_path} / {metadata_path}. "
+            "Please run build_unified_faiss_index.py first."
+        )
+
+    return NearestNeighborFetcher(
+        index_path=str(index_path),
+        metadata_path=str(metadata_path),
+        model=model,
+    )
+
+
+def _ensure_finetune_results(
+    eval_cfg: EvalConfig,
+    ft_cfg: FinetuneConfig,
+    model_cfg: ModelConfig,
+) -> tuple[Path, Path]:
+    """Create results directory and return (csv_path, results_dir)."""
+    model_suffix = "_base" if model_cfg.use_base_model else ""
+    results_dir = (
+        Path("meta_libero") / "results"
+        / f"full_finetuning_{eval_cfg.task_suite_name}"
+        / f"lr_{ft_cfg.learning_rate}{model_suffix}_b{ft_cfg.batch_size}"
+    )
     results_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = results_dir / f"{eval_cfg.task_suite_name}_{eval_cfg.task_id}.csv"
+    return csv_path, results_dir
 
 
-    # Note: task_id for the dataset is different
-    dataset_task_id = 6
-
-    # IMPORTANT: Always use pi05_libero config for consistency
-    # This ensures we have the correct:
-    # - Model architecture (pi05=True, action_horizon=10, etc.)
-    # - Data configuration (prompt_from_task, frame sampling, etc.)
-    # - Normalization stats and assets for Libero
-    config = _config.get_config("pi05_libero")
-
-    # Download and load weights using the simple, working method
-    # This properly sets up JIT compilation (unlike the complex weight_loader approach)
-    print(f"Downloading checkpoint from {checkpoint_gs_path}...")
-    checkpoint_dir = download.maybe_download(checkpoint_gs_path)
-
-    print(f"Loading model with weights from {checkpoint_name}...")
-    t0 = time.perf_counter()
-    model = config.model.load(_model.restore_params(checkpoint_dir / "params", dtype=jnp.bfloat16))
-    t1 = time.perf_counter()
-
-    print(f"\n✓ Model loaded successfully with weights from {checkpoint_name}")
-    print(f"✓ Loading took {t1-t0:.2f} seconds")
+def _append_csv_row(
+    csv_path: Path,
+    step: int,
+    success_rate: float,
+    is_first: bool = False,
+) -> None:
+    """Append one evaluation result row to CSV."""
+    header = ["train_step", "mean_accuracy"]
+    mode = "w" if is_first else "a"
+    with csv_path.open(mode, newline="") as f:
+        writer = csv.writer(f)
+        if is_first:
+            writer.writerow(header)
+        writer.writerow([step, success_rate])
+    print(f"  -> Saved to {csv_path.name}")
 
 
+# ---------------------------------------------------------------------------
+# Evaluation helper (wraps run_evaluation_ttt with ttt_num_steps=0)
+# ---------------------------------------------------------------------------
 
-    # Track evaluation results: list of (step, success_rate)
-    eval_results = []
+def _evaluate(
+    model: _model.BaseModel,
+    config: _config.TrainConfig,
+    checkpoint_dir: str,
+    nn_fetcher: NearestNeighborFetcher,
+    dataset: Any,
+    eval_cfg: EvalConfig,
+) -> float:
+    """Create a fresh policy from *model* and evaluate with no TTT (ttt_num_steps=0)."""
+    policy = create_policy(model, config, checkpoint_dir, rng_seed=eval_cfg.seed)
+    success_rate, _episode_metrics = run_evaluation_ttt(
+        policy=policy,
+        nn_fetcher=nn_fetcher,
+        train_config=config,
+        dataset=dataset,
+        num_trials=eval_cfg.num_trials,
+        task_suite_name=eval_cfg.task_suite_name,
+        task_id=eval_cfg.task_id,
+        save_video=eval_cfg.save_video,
+        video_out_path=eval_cfg.video_out_path,
+        seed=eval_cfg.seed,
+        ttt_num_steps=0,       # <-- no TTT, pure evaluation
+        ttt_frequency=9999,    # effectively disabled
+        learning_rate=0.0,
+        ttt_k=1,
+        reset_policy=True,
+    )
+    return success_rate
 
-    # CSV file for incremental saving
-    csv_filename = results_dir / f"{task_suite_name}_{task_id}.csv"
 
-    # Helper function to append result to CSV
-    def save_eval_result(step: int, acc: float, is_first: bool = False):
-        mode = 'w' if is_first else 'a'
-        with open(csv_filename, mode, newline='') as f:
-            writer = csv.writer(f)
-            if is_first:
-                writer.writerow(['train_step', 'mean_accuracy'])
-            writer.writerow([step, acc])
-        print(f"  -> Saved to {csv_filename.name}")
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
-    # Evaluate policy before fine-tuning (step 0)
-    print("\n" + "="*60)
-    print("Evaluating BEFORE fine-tuning (step 0)")
-    print("="*60)
-    # Note: this will create jax.random.key(0) internally
-    # if we try to pass a seed here the code will crash
-    skip_first_eval = False
-    if not skip_first_eval:
-        print("\n" + "="*60)
-        print(f"Evaluating before fine-tuning")
-        print("="*60)
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Fine-tune model on a single LIBERO task")
 
-        # Note: change to True to save videos
-        save_videos = False
-        video_out_path = results_dir / f"videos"
-        video_out_path.mkdir(parents=True, exist_ok=True)
+    # Shared flags (--config, model flags, eval flags)
+    add_common_args(parser)
 
-        policy = create_policy(model, config, checkpoint_path)
-        success_rate = run_evaluation(
-            policy=policy,
-            task_suite_name=task_suite_name,
-            task_id=task_id,
-            num_trials=num_trials,
-            save_video=save_videos,
-            seed=seed,
+    # Finetune-specific CLI flags
+    parser.add_argument("--lr", type=float, default=None, help="Learning rate")
+    parser.add_argument("--batch_size", type=int, default=None, help="Batch size")
+    parser.add_argument("--total_steps", type=int, default=None, help="Total gradient steps")
+    parser.add_argument("--eval_interval", type=int, default=None, help="Evaluate every N steps")
+    parser.add_argument("--warmup_steps", type=int, default=None, help="LR warmup steps")
+    parser.add_argument("--skip-first-eval", action="store_true", default=None, help="Skip evaluation before fine-tuning")
+
+    args = parser.parse_args()
+
+    # ---- Build experiment config from YAML + CLI overrides ----------------
+    exp = build_experiment_config(args)
+    ft_cfg = exp.finetune
+    eval_cfg = exp.eval
+    model_cfg = exp.model
+
+    _setup_logging()
+    CHECKPOINT_DIR = "/cluster/home/anmari/.cache/openpi/openpi-assets/checkpoints/pi05_libero"
+
+    print("=" * 70)
+    print("Fine-tune Single Task")
+    print("=" * 70)
+    print(f"Task suite : {eval_cfg.task_suite_name}")
+    print(f"Task ID    : {eval_cfg.task_id}")
+    print(f"Num trials : {eval_cfg.num_trials}")
+    print(f"LR         : {ft_cfg.learning_rate}")
+    print(f"Batch size : {ft_cfg.batch_size}")
+    print(f"Total steps: {ft_cfg.num_steps}")
+    print(f"Eval every : {ft_cfg.eval_interval}")
+    print(f"Warmup     : {ft_cfg.warmup_steps}")
+    print(f"Seed       : {eval_cfg.seed}")
+    if args.config:
+        print(f"Config     : {args.config}")
+    print("=" * 70)
+
+    # ---- Load model -------------------------------------------------------
+    model, config = load_pi05_libero_model(
+        use_base_model=model_cfg.use_base_model,
+        use_lora=model_cfg.use_lora,
+        action_expert_only=model_cfg.action_expert_only,
+    )
+
+    dataset_to_use = model_cfg.dataset_to_use
+
+    # ---- Prepare dataset (for run_evaluation_ttt) -------------------------
+    dataset, config = _prepare_dataset(config, dataset_to_use=dataset_to_use)
+    print(f"Dataset size: {len(dataset)} samples")
+
+    # ---- Init NN fetcher (required by run_evaluation_ttt) -----------------
+    nn_fetcher = _init_nn_fetcher(model, dataset_to_use=dataset_to_use)
+    print("NearestNeighborFetcher initialized")
+
+    # ---- Results paths ----------------------------------------------------
+    csv_path, results_dir = _ensure_finetune_results(eval_cfg, ft_cfg, model_cfg)
+    video_out_path = results_dir / "videos"
+    video_out_path.mkdir(parents=True, exist_ok=True)
+
+    # Point eval_cfg.video_out_path at the actual output directory
+    eval_cfg = dataclasses.replace(eval_cfg, video_out_path=str(video_out_path))
+
+    # ---- Save the resolved config for reproducibility ---------------------
+    save_experiment(exp, results_dir / "experiment_config.yaml")
+
+    eval_results: list[tuple[int, float]] = []
+
+    # ---- Evaluate before fine-tuning (step 0) -----------------------------
+    if not ft_cfg.skip_first_eval:
+        print("\n" + "=" * 60)
+        print("Evaluating BEFORE fine-tuning (step 0)")
+        print("=" * 60)
+        success_rate = _evaluate(
+            model=model,
+            config=config,
+            checkpoint_dir=CHECKPOINT_DIR,
+            nn_fetcher=nn_fetcher,
+            dataset=dataset,
+            eval_cfg=eval_cfg,
         )
         eval_results.append((0, success_rate))
-        save_eval_result(0, success_rate, is_first=True)
+        _append_csv_row(csv_path, step=0, success_rate=success_rate, is_first=True)
 
+    # ---- Create training data loader --------------------------------------
+    config = dataclasses.replace(config, batch_size=ft_cfg.batch_size)
 
-    with override_create_torch_dataset("example", task_index=dataset_task_id):
-        # Batch size configuration
-        config = dataclasses.replace(
-            config,
-            batch_size=batch_size # 64 # 32,  # Normal training with JIT (use 4 if profiling without JIT)
-        )
+    if dataset_to_use == "libero_10":
+        repo_id = "physical-intelligence/libero"
+    else:
+        repo_id = "physical-intelligence/libero_90"
+
+    with override_create_torch_dataset(repo_id=repo_id, task_id=eval_cfg.task_id):
         data_loader = _data_loader.create_data_loader(
-            config,
-            sharding=None,
-            shuffle=True,
+            config, sharding=None, shuffle=True,
         )
 
-    dataset = data_loader._data_loader._data_loader.dataset
-    # training_iterator = iter(data_loader)
+    print(f"\nStarting fine-tuning...")
+    print(f"Training hyperparameters:")
+    print(f"  Learning rate : {ft_cfg.learning_rate}")
+    print(f"  Total steps   : {ft_cfg.num_steps}")
+    print(f"  Eval interval : {ft_cfg.eval_interval}")
+    print(f"  Batch size    : {ft_cfg.batch_size}")
+    print(f"  Warmup steps  : {ft_cfg.warmup_steps}")
 
-    # Count batches for info
-    print(f"Total samples: {len(dataset)}\n")
+    # ---- Training + evaluation loop ---------------------------------------
+    trained_model = model
+    train_state = None
+    train_losses: list[float] = []
+    num_chunks = ft_cfg.num_steps // ft_cfg.eval_interval
 
-    # Fine-tune the model
-    print("\nStarting fine-tuning...")
-    print("Training hyperparameters:")
-    print(f"  Learning rate: 2.5e-5")
-    print(f"  Total steps: {total_steps}")
-    print(f"  Eval interval: {eval_interval}")
-    print(f"  Batch size: {batch_size}")
-    print(f"  Warmup steps: 50")
+    for chunk_idx in range(num_chunks):
+        current_step = (chunk_idx + 1) * ft_cfg.eval_interval
 
+        print("\n" + "=" * 60)
+        print(f"Training steps {current_step - ft_cfg.eval_interval} to {current_step}")
+        print("=" * 60)
 
-    # First 100 steps
-    trained_model, train_losses, train_state = train_model_on_fly(
-        model=model,
-        training_data_loader=data_loader,
-        config=config,
-        learning_rate=lr,
-        num_steps=eval_interval,
-        warmup_steps=1000,
-        weight_decay=0.0,
-        log_interval=50,
-        seed=seed,
-    )
-
-    # Evaluate after first 100 steps
-    print("\n" + "="*60)
-    print(f"Evaluating after step {eval_interval}")
-    print("="*60)
-    policy = create_policy(trained_model, config, checkpoint_path)
-    success_rate = run_evaluation(
-        policy=policy,
-        task_suite_name=task_suite_name,
-        task_id=task_id,
-        num_trials=num_trials,
-        save_video=False,
-        seed=seed,
-    )
-    eval_results.append((eval_interval, success_rate))
-    save_eval_result(eval_interval, success_rate)
-
-    # Continue fine-tuning for remaining steps (400 more steps in 4 chunks of 100)
-    num_remaining_chunks = (total_steps - eval_interval) // eval_interval
-    for i in range(num_remaining_chunks):
-        current_step = (i + 2) * eval_interval  # 200, 300, 400, 500
-
-        print("\n" + "="*60)
-        print(f"Training steps {current_step - eval_interval} to {current_step}")
-        print("="*60)
-
-        # Continue fine-tuning (optimizer state preserved from resume_train_state)
-        trained_model, train_losses, train_state = train_model_on_fly(
-            model=trained_model,  # ignored when resuming
+        train_kwargs: dict[str, Any] = dict(
+            model=trained_model,
             training_data_loader=data_loader,
             config=config,
-            num_steps=eval_interval,
-            log_interval=50,
-            resume_train_state=train_state,
-            resume_losses=train_losses,
-            seed=seed,
+            num_steps=ft_cfg.eval_interval,
+            log_interval=ft_cfg.log_interval,
+            seed=ft_cfg.seed,
         )
+        if train_state is None:
+            # First chunk: full init
+            train_kwargs.update(
+                learning_rate=ft_cfg.learning_rate,
+                warmup_steps=ft_cfg.warmup_steps,
+                weight_decay=ft_cfg.weight_decay,
+            )
+        else:
+            # Subsequent chunks: resume from previous optimizer state
+            train_kwargs.update(
+                resume_train_state=train_state,
+                resume_losses=train_losses,
+            )
+
+        trained_model, train_losses, train_state = train_model_on_fly(**train_kwargs)
 
         # Evaluate
-        print("\n" + "="*60)
+        print("\n" + "=" * 60)
         print(f"Evaluating after step {current_step}")
-        print("="*60)
-        policy = create_policy(trained_model, config, checkpoint_path)
-        success_rate = run_evaluation(
-            policy=policy,
-            task_suite_name=task_suite_name,
-            task_id=task_id,
-            num_trials=num_trials,
-            save_video=False,
-            seed=seed,
+        print("=" * 60)
+        success_rate = _evaluate(
+            model=trained_model,
+            config=config,
+            checkpoint_dir=CHECKPOINT_DIR,
+            nn_fetcher=nn_fetcher,
+            dataset=dataset,
+            eval_cfg=eval_cfg,
         )
         eval_results.append((current_step, success_rate))
-        save_eval_result(current_step, success_rate)
+        is_first = len(eval_results) == 1 and not csv_path.exists()
+        _append_csv_row(csv_path, step=current_step, success_rate=success_rate, is_first=is_first)
 
-    # CSV already saved incrementally
-    print(f"\nEvaluation results saved incrementally to {csv_filename}")
+    # ---- Plot losses ------------------------------------------------------
+    if train_losses:
+        plot_filename = results_dir / f"{eval_cfg.task_suite_name}_{eval_cfg.task_id}_losses.pdf"
+        print(f"\nSaving losses plot to {plot_filename}")
 
-    # Plot and save losses
-    plot_filename = results_dir / f"{task_suite_name}_{task_id}_losses.pdf"
-    print(f"\nSaving losses plot to {plot_filename}")
+        plt.figure(figsize=(10, 6))
+        plt.plot(range(len(train_losses)), train_losses, linewidth=0.5, alpha=0.7)
+        plt.xlabel("Training Step")
+        plt.ylabel("Loss")
+        plt.title(f"Training Loss - {eval_cfg.task_suite_name} Task {eval_cfg.task_id}")
+        plt.grid(True, alpha=0.3)
 
-    plt.figure(figsize=(10, 6))
-    plt.plot(range(len(train_losses)), train_losses, linewidth=0.5, alpha=0.7)
-    plt.xlabel('Training Step')
-    plt.ylabel('Loss')
-    plt.title(f'Training Loss - {task_suite_name} Task {task_id}')
-    plt.grid(True, alpha=0.3)
+        window_size = min(50, len(train_losses) // 10) if len(train_losses) > 10 else 1
+        if window_size > 1:
+            smoothed = np.convolve(train_losses, np.ones(window_size) / window_size, mode="valid")
+            plt.plot(
+                range(window_size - 1, len(train_losses)),
+                smoothed, "r-", linewidth=2,
+                label=f"Smoothed (window={window_size})",
+            )
+            plt.legend()
 
-    # Add smoothed line
-    window_size = min(50, len(train_losses) // 10) if len(train_losses) > 10 else 1
-    if window_size > 1:
-        smoothed = np.convolve(train_losses, np.ones(window_size)/window_size, mode='valid')
-        plt.plot(range(window_size-1, len(train_losses)), smoothed, 'r-', linewidth=2, label=f'Smoothed (window={window_size})')
-        plt.legend()
+        plt.tight_layout()
+        plt.savefig(plot_filename, format="pdf", dpi=150)
+        plt.close()
+        print(f"Saved losses plot")
 
-    plt.tight_layout()
-    plt.savefig(plot_filename, format='pdf', dpi=150)
-    plt.close()
-    print(f"Saved losses plot")
-
-    # Plot and save evaluation accuracy vs gradient steps
-    acc_plot_filename = results_dir / f"{task_suite_name}_{task_id}_accuracy.pdf"
-    print(f"\nSaving accuracy plot to {acc_plot_filename}")
-
-    plt.figure(figsize=(10, 6))
-
-    # Extract steps and accuracies from eval_results
+    # ---- Plot accuracy vs gradient steps ----------------------------------
     if eval_results:
+        acc_plot_filename = results_dir / f"{eval_cfg.task_suite_name}_{eval_cfg.task_id}_accuracy.pdf"
+        print(f"\nSaving accuracy plot to {acc_plot_filename}")
+
+        plt.figure(figsize=(10, 6))
         steps, accuracies = zip(*eval_results)
-        accuracies_percent = [acc * 100 for acc in accuracies]  # Convert to percentage
+        accuracies_percent = [acc * 100 for acc in accuracies]
 
-        # Plot with markers and line
-        plt.plot(steps, accuracies_percent, marker='o', linewidth=2, markersize=8,
-                 label=f'LR={lr}', color='#1f77b4')
+        plt.plot(
+            steps, accuracies_percent, marker="o", linewidth=2, markersize=8,
+            label=f"LR={ft_cfg.learning_rate}", color="#1f77b4",
+        )
+        plt.fill_between(
+            steps,
+            [max(0, a - 5) for a in accuracies_percent],
+            [min(100, a + 5) for a in accuracies_percent],
+            alpha=0.2, color="#1f77b4",
+        )
 
-        # Add shaded confidence region (optional, just for visual appeal)
-        plt.fill_between(steps,
-                         [max(0, a-5) for a in accuracies_percent],
-                         [min(100, a+5) for a in accuracies_percent],
-                         alpha=0.2, color='#1f77b4')
+        plt.xlabel("# Gradient Steps", fontsize=12)
+        plt.ylabel("Success Rate", fontsize=12)
+        plt.title(f"Learning rate = {ft_cfg.learning_rate}", fontsize=14)
+        plt.grid(True, alpha=0.3)
+        plt.ylim(-5, 105)
+        plt.legend(fontsize=10)
 
-    plt.xlabel('# Gradient Steps', fontsize=12)
-    plt.ylabel('Success Rate', fontsize=12)
-    plt.title(f'Learning rate = {lr}', fontsize=14)
-    plt.grid(True, alpha=0.3)
-    plt.ylim(-5, 105)  # Set y-axis range from 0 to 100%
-    plt.legend(fontsize=10)
+        plt.tight_layout()
+        plt.savefig(acc_plot_filename, format="pdf", dpi=150)
+        plt.close()
+        print(f"Saved accuracy plot")
 
-    plt.tight_layout()
-    plt.savefig(acc_plot_filename, format='pdf', dpi=150)
-    plt.close()
-    print(f"Saved accuracy plot")
-
-    # Print final summary
-    print("\n" + "="*60)
+    # ---- Summary ----------------------------------------------------------
+    print("\n" + "=" * 60)
     print("FINAL SUMMARY")
-    print("="*60)
-    print(f"Task: {task_suite_name} task {task_id}")
-    print(f"Total training steps: {total_steps}")
+    print("=" * 60)
+    print(f"Task: {eval_cfg.task_suite_name} task {eval_cfg.task_id}")
+    print(f"Total training steps: {ft_cfg.num_steps}")
     print(f"\nEvaluation Results:")
     for step, acc in eval_results:
-        print(f"  Step {step:4d}: {acc*100:.1f}% success rate")
+        print(f"  Step {step:4d}: {acc * 100:.1f}% success rate")
     print(f"\nResults saved to: {results_dir}")
-    print(f"  - {csv_filename.name}")
-    print(f"  - {plot_filename.name}")
-    print(f"  - {acc_plot_filename.name}")
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Fine-tune model on a single LIBERO task")
-    parser.add_argument("--task_id", type=int, default=8, help="Task ID to fine-tune on (default: 8)")
-    parser.add_argument("--lr", type=float, default=2.5e-5, help="Learning rate (default: 2.5e-4)")
-    parser.add_argument("--base-model", action="store_true", help="Use base pi0.5 model instead of Libero pre-trained model")
-    parser.add_argument("--b", type=int, default=64, help="Batch size (default: 64)")
-    args = parser.parse_args()
-    main(task_id=args.task_id, lr=args.lr, use_base_model=args.base_model, batch_size=args.b)
+if __name__ == "__main__":  # pragma: no cover
+    main()

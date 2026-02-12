@@ -1,8 +1,9 @@
 ## TTT Evaluation Script
-
-# NOTE: This script is intentionally structured similarly to
-# meta_libero/scripts/finetune_single_task.py but runs only test-time
-# training (TTT) evaluation via utils.run_evaluation_ttt.
+#
+# Supports two ways of specifying hyperparameters:
+#   1.  YAML config file:   python ttt_evaluation.py --config experiments/my_run.yaml
+#   2.  CLI flags:          python ttt_evaluation.py --lr 1e-4 --ttt_k 20
+#   3.  Both (CLI overrides YAML): python ttt_evaluation.py --config exp.yaml --seed 42
 
 import sys
 import logging
@@ -48,8 +49,24 @@ import openpi.models.model as _model  # type: ignore
 import openpi.training.config as _config  # type: ignore
 import openpi.shared.download as download  # type: ignore
 
-from utils import create_policy, run_evaluation_ttt, load_pi05_libero_model  # type: ignore
+from utils import create_policy, run_evaluation_ttt, run_evaluation_noise, load_pi05_libero_model  # type: ignore
+from configs import (  # type: ignore
+    ExperimentConfig,
+    TTTConfig,
+    EvalConfig,
+    ModelConfig,
+    NoiseConfig,
+    add_common_args,
+    build_experiment_config,
+    save_experiment,
+)
 
+from libero_dataset import override_create_torch_dataset  # local import to avoid cycles
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _setup_logging() -> None:
     class VersionWarningFilter(logging.Filter):
@@ -62,23 +79,35 @@ def _setup_logging() -> None:
     logging.getLogger("OpenGL").setLevel(logging.ERROR)
 
 
-def _prepare_ttt_dataset(config: _config.TrainConfig, repo_id: str = "physical-intelligence/libero", task_index: int | None = None) -> tuple[Any, _config.TrainConfig]:
-    """Create a small dataloader and extract the underlying dataset for TTT."""
-    from libero_dataset import override_create_torch_dataset  # local import to avoid cycles
+def _prepare_ttt_dataset(
+    config: _config.TrainConfig,
+    dataset_to_use: str = "libero_10"
+) -> tuple[Any, _config.TrainConfig]:
 
-    cfg = dataclasses.replace(config, batch_size=1)
-    data_loader = _data_loader.create_data_loader(
-        cfg,
-        sharding=None,
-        shuffle=False,
-    )
-    dataset = data_loader._data_loader._data_loader.dataset  # type: ignore[attr-defined]
-    return dataset, cfg
+    if dataset_to_use == "libero_10":
+        repo_id = "physical-intelligence/libero"
+    else:
+        assert dataset_to_use == "libero_90"
+        repo_id = "physical-intelligence/libero_90"
+
+    with override_create_torch_dataset(repo_id=repo_id):
+        dataloader = _data_loader.create_data_loader(
+            config,
+            sharding=None,
+            shuffle=False,
+        )
+        dataset = dataloader._data_loader._data_loader.dataset  # type: ignore[attr-defined]
+    return dataset, config
 
 
-def _init_nn_fetcher(model: _model.BaseModel) -> NearestNeighborFetcher:
-    """Initialize NearestNeighborFetcher using the unified FAISS index."""
-    cache_dir = Path.home() / ".cache" / "libero_unified_faiss"
+def _init_nn_fetcher(model: _model.BaseModel, dataset_to_use: str = "libero_10") -> NearestNeighborFetcher:
+
+    if dataset_to_use == "libero_10":
+        cache_dir = Path.home() / ".cache" / "libero_unified_faiss"
+    else:
+        assert dataset_to_use == "libero_90"
+        cache_dir = Path.home() / ".cache" / "libero_90_norm"
+
     modality_str = "_".join(sorted(["image1", "image2", "text"]))
     index_path = cache_dir / f"libero_unified_faiss_index_{modality_str}.index"
     metadata_path = cache_dir / f"libero_unified_faiss_metadata_{modality_str}.pkl"
@@ -97,49 +126,41 @@ def _init_nn_fetcher(model: _model.BaseModel) -> NearestNeighborFetcher:
     return nn_fetcher
 
 
-def _hyperparams_subfolder(lr: float, ttt_frequency: int, ttt_num_steps: int, ttt_k: int, seed: int) -> str:
+def _hyperparams_subfolder(ttt_cfg: TTTConfig, eval_cfg: EvalConfig) -> str:
     """Build a filesystem-safe subfolder name from TTT hyperparameters."""
-    lr_str = f"{lr:.2e}".replace("-0", "-").replace("+0", "")
-    return f"lr{lr_str}_freq{ttt_frequency}_steps{ttt_num_steps}_k{ttt_k}_seed{seed}"
+    lr_str = f"{ttt_cfg.learning_rate:.2e}".replace("-0", "-").replace("+0", "")
+
+    if ttt_cfg.noise_ttt:
+        return f"noise{lr_str}_freq{ttt_cfg.ttt_frequency}_steps{ttt_cfg.ttt_num_steps}_seed{eval_cfg.seed}"
+    else:
+        return f"lr{lr_str}_freq{ttt_cfg.ttt_frequency}_steps{ttt_cfg.ttt_num_steps}_k{ttt_cfg.k}_seed{eval_cfg.seed}"
 
 
 def _ensure_results_paths(
-    task_suite_name: str,
-    task_id: int,
-    lr: float,
-    ttt_frequency: int,
-    ttt_num_steps: int,
-    ttt_k: int,
-    seed: int,
-    action_expert_only: bool = False,
-    use_lora: bool = False,
-    use_base_model: bool = False,
-    reset_policy: bool = True,
+    eval_cfg: EvalConfig,
+    ttt_cfg: TTTConfig,
+    model_cfg: ModelConfig,
 ) -> tuple[Path, Path, Path, Path]:
-    """Create results/ttt/.../<suite>_task_<id>/<hyperparams>/ and return CSV + PDF + video paths.
+    """Create results directory tree and return (csv, losses_pdf, actions_pdf, video_dir)."""
+    main_dir = "ttt_base_model" if model_cfg.use_base_model else "ttt"
 
-    Args:
-        task_suite_name: Name of the task suite
-        task_id: Task ID within the suite
-        lr, ttt_frequency, ttt_num_steps, ttt_k, seed: Used to form the hyperparameter subfolder
-        action_expert_only: If True, use 'ttt/action_only' instead of 'ttt'
-        use_lora: If True, use 'ttt/lora' instead of 'ttt' (takes precedence over action_expert_only)
-    """
+    if model_cfg.dataset_to_use == "libero_90":
+        main_dir += "/dataset_libero_90"
+    else:
+        main_dir += "/dataset_libero_10"
 
-    main_dir = "ttt_base_model" if use_base_model else "ttt"
-
-    if not reset_policy:
+    if not ttt_cfg.reset_policy:
         main_dir += "_no_reset_policy"
 
-    if use_lora:
+    if model_cfg.use_lora:
         base_dir = Path("meta_libero") / "results" / main_dir / "lora"
-    elif action_expert_only:
+    elif model_cfg.action_expert_only:
         base_dir = Path("meta_libero") / "results" / main_dir / "action_only"
     else:
         base_dir = Path("meta_libero") / "results" / main_dir
 
-    task_dir = base_dir / f"{task_suite_name}_task_{task_id}"
-    hyper_sub = _hyperparams_subfolder(lr, ttt_frequency, ttt_num_steps, ttt_k, seed)
+    task_dir = base_dir / f"{eval_cfg.task_suite_name}_task_{eval_cfg.task_id}"
+    hyper_sub = _hyperparams_subfolder(ttt_cfg, eval_cfg)
     run_dir = task_dir / hyper_sub
     run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -152,14 +173,9 @@ def _ensure_results_paths(
 
 def _append_csv_row(
     csv_path: Path,
-    lr: float,
-    ttt_frequency: int,
-    seed: int,
+    ttt_cfg: TTTConfig,
+    eval_cfg: EvalConfig,
     success_rate: float,
-    num_trials: int,
-    ttt_num_steps: int,
-    ttt_k: int,
-    reset_policy: bool = True,
 ) -> None:
     header = ["lr", "ttt_frequency", "seed", "num_trials", "ttt_num_steps", "ttt_k", "success_rate", "reset_policy"]
     file_exists = csv_path.exists()
@@ -167,18 +183,16 @@ def _append_csv_row(
         writer = csv.writer(f)
         if not file_exists:
             writer.writerow(header)
-        writer.writerow(
-            [
-                lr,
-                ttt_frequency,
-                seed,
-                num_trials,
-                ttt_num_steps,
-                ttt_k,
-                success_rate,
-                reset_policy,
-            ]
-        )
+        writer.writerow([
+            ttt_cfg.learning_rate,
+            ttt_cfg.ttt_frequency,
+            eval_cfg.seed,
+            eval_cfg.num_trials,
+            ttt_cfg.ttt_num_steps,
+            ttt_cfg.k,
+            success_rate,
+            ttt_cfg.reset_policy,
+        ])
 
 
 def _plot_grid_losses(episode_metrics: list[dict[str, Any]], pdf_path: Path, max_rows: int = 5, max_cols: int = 10) -> None:
@@ -197,13 +211,11 @@ def _plot_grid_losses(episode_metrics: list[dict[str, Any]], pdf_path: Path, max
 
         m = episode_metrics[idx]
         losses_per_ttt: list[list[float]] = m.get("losses", [])
-        # Flatten all TTT updates within this episode.
         losses_flat = [val for sub in losses_per_ttt for val in sub]
 
         if losses_flat:
             ax.plot(range(len(losses_flat)), losses_flat, linewidth=0.8)
 
-        # Add success/failure status to title
         success = m.get("success", False)
         status = "Success" if success else "Failure"
         ep_num = m.get("episode_idx", idx) + 1
@@ -236,7 +248,6 @@ def _plot_grid_action_distances(episode_metrics: list[dict[str, Any]], pdf_path:
             ys = [x[1] for x in distances_actions]
             ax.plot(xs, ys, linewidth=0.8)
 
-        # Add success/failure status to title
         success = m.get("success", False)
         status = "Success" if success else "Failure"
         ep_num = m.get("episode_idx", idx) + 1
@@ -248,23 +259,32 @@ def _plot_grid_action_distances(episode_metrics: list[dict[str, Any]], pdf_path:
     plt.close(fig)
 
 
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run TTT evaluation on a single LIBERO task")
-    parser.add_argument("--task_suite_name", type=str, default="libero_10", help="Task suite name (e.g., libero_10, libero_90)")
-    parser.add_argument("--task_id", type=int, default=8, help="Task ID within the suite")
-    parser.add_argument("--num_trials", type=int, default=50, help="Number of evaluation episodes")
-    parser.add_argument("--lr", type=float, default=2.5e-5, help="Learning rate for TTT")
-    parser.add_argument("--ttt_frequency", type=int, default=50, help="Perform TTT every N steps during rollout")
-    parser.add_argument("--ttt_num_steps", type=int, default=1, help="Number of gradient steps per TTT update")
-    parser.add_argument("--ttt_k", type=int, default=1, help="Number of nearest neighbors to retrieve")
-    parser.add_argument("--seed", type=int, default=0, help="Random seed")
-    parser.add_argument("--use-base-model", action="store_true", help="Use base pi0.5 weights instead of Libero-pretrained")
-    parser.add_argument("--save-video", action="store_true", help="Save rollout videos")
-    parser.add_argument("--action-expert-only", action="store_true", help="Only finetune action expert")
-    parser.add_argument("--use-lora", action="store_true", help="Use LORA weights instead of base weights")
-    parser.add_argument("--no-reset-policy", action="store_true", help="Do not reset policy before evaluation")
+
+    # Shared flags (--config, model flags, eval flags)
+    add_common_args(parser)
+
+    # TTT-specific CLI flags
+    parser.add_argument("--lr", type=float, default=None, help="Learning rate for TTT")
+    parser.add_argument("--ttt_frequency", type=int, default=None, help="Perform TTT every N steps during rollout")
+    parser.add_argument("--ttt_num_steps", type=int, default=None, help="Number of gradient steps per TTT update")
+    parser.add_argument("--ttt_k", type=int, default=None, help="Number of nearest neighbors to retrieve")
+    parser.add_argument("--max_ttt_step", type=int, default=None, help="Maximum step to perform TTT")
+    parser.add_argument("--no-reset-policy", action="store_true", default=None, help="Do not reset policy between episodes")
+    parser.add_argument("--noise-ttt", action="store_true", default=None, help="Perform TTT with noise perturbation")
 
     args = parser.parse_args()
+
+    # ---- Build experiment config from YAML + CLI overrides ----------------
+    exp = build_experiment_config(args)
+    ttt_cfg = exp.ttt
+    eval_cfg = exp.eval
+    model_cfg = exp.model
 
     _setup_logging()
     CHECKPOINT_DIR = "/cluster/home/anmari/.cache/openpi/openpi-assets/checkpoints/pi05_libero"
@@ -272,87 +292,90 @@ def main() -> None:
     print("=" * 70)
     print("TTT Evaluation")
     print("=" * 70)
-    print(f"Task suite: {args.task_suite_name}")
-    print(f"Task ID: {args.task_id}")
-    print(f"Num trials: {args.num_trials}")
-    print(f"LR: {args.lr}, TTT frequency: {args.ttt_frequency}, TTT steps: {args.ttt_num_steps}, k: {args.ttt_k}")
-    print(f"Seed: {args.seed}")
+    print(f"Task suite : {eval_cfg.task_suite_name}")
+    print(f"Task ID    : {eval_cfg.task_id}")
+    print(f"Num trials : {eval_cfg.num_trials}")
+    print(f"LR: {ttt_cfg.learning_rate}, TTT frequency: {ttt_cfg.ttt_frequency}, "
+          f"TTT steps: {ttt_cfg.ttt_num_steps}, k: {ttt_cfg.k}")
+    print(f"Seed       : {eval_cfg.seed}")
+    if args.config:
+        print(f"Config     : {args.config}")
     print("=" * 70)
 
+    # ---- Load model -------------------------------------------------------
     model, config = load_pi05_libero_model(
-        use_base_model=args.use_base_model,
-        use_lora=args.use_lora,
-        action_expert_only=args.action_expert_only,
+        use_base_model=model_cfg.use_base_model,
+        use_lora=model_cfg.use_lora,
+        action_expert_only=model_cfg.action_expert_only,
     )
 
-    # Prepare dataset for TTT (same repo and task index convention as other scripts).
-    dataset, config = _prepare_ttt_dataset(config, repo_id="physical-intelligence/libero", task_index=args.task_id)
+    dataset_to_use = model_cfg.dataset_to_use
+
+    # ---- Prepare dataset + NN fetcher -------------------------------------
+    dataset, config = _prepare_ttt_dataset(config, dataset_to_use=dataset_to_use)
     print(f"TTT dataset size: {len(dataset)} samples")
 
-    # Initialize FAISS nearest-neighbor fetcher.
-    nn_fetcher = _init_nn_fetcher(model)
-    print("✓ NearestNeighborFetcher initialized")
+    nn_fetcher = _init_nn_fetcher(model, dataset_to_use=dataset_to_use)
+    print("NearestNeighborFetcher initialized")
 
-    # Create policy compatible with libero env.
+    # ---- Create policy ----------------------------------------------------
     policy_ttt = create_policy(
-        model,
-        config,
-        CHECKPOINT_DIR,
-        rng_seed=args.seed,
+        model, config, CHECKPOINT_DIR, rng_seed=eval_cfg.seed,
     )
 
-
-    # Prepare per-task outputs (plots and CSV under hyperparameter subfolder)
+    # ---- Results paths ----------------------------------------------------
     csv_path, losses_pdf, actions_pdf, video_out_path = _ensure_results_paths(
-        args.task_suite_name,
-        args.task_id,
-        lr=args.lr,
-        ttt_frequency=args.ttt_frequency,
-        ttt_num_steps=args.ttt_num_steps,
-        ttt_k=args.ttt_k,
-        seed=args.seed,
-        action_expert_only=args.action_expert_only,
-        use_lora=args.use_lora,
-        use_base_model=args.use_base_model,
-        reset_policy=not args.no_reset_policy,
+        eval_cfg, ttt_cfg, model_cfg,
     )
 
-    # Run TTT evaluation
-    success_rate = run_evaluation_ttt(
-        policy=policy_ttt,
-        nn_fetcher=nn_fetcher,
-        train_config=config,
-        dataset=dataset,
-        num_trials=args.num_trials,
-        task_suite_name=args.task_suite_name,
-        task_id=args.task_id,
-        save_video=args.save_video,
-        video_out_path=str(video_out_path),
-        seed=args.seed,
-        ttt_num_steps=args.ttt_num_steps,
-        ttt_frequency=args.ttt_frequency,
-        learning_rate=args.lr,
-        ttt_k=args.ttt_k,
-        ttt_use_modalities=["image1", "image2", "text"],
-        reset_policy=not args.no_reset_policy,
-    )
+    # ---- Save the resolved config for reproducibility ---------------------
+    run_dir = csv_path.parent
+    save_experiment(exp, run_dir / "experiment_config.yaml")
+
+    # ---- Run evaluation ---------------------------------------------------
+    if ttt_cfg.noise_ttt:
+        success_rate, all_episode_metrics = run_evaluation_noise(
+            policy=policy_ttt,
+            nn_fetcher=nn_fetcher,
+            train_config=config,
+            dataset=dataset,
+            num_trials=eval_cfg.num_trials,
+            task_suite_name=eval_cfg.task_suite_name,
+            task_id=eval_cfg.task_id,
+            save_video=eval_cfg.save_video,
+            video_out_path=str(video_out_path),
+            seed=eval_cfg.seed,
+            noise_frequency=ttt_cfg.ttt_frequency,
+            noise_sigma=ttt_cfg.learning_rate,
+            max_noise_step=ttt_cfg.ttt_max_step,
+        )
+    else:
+        success_rate, all_episode_metrics = run_evaluation_ttt(
+            policy=policy_ttt,
+            nn_fetcher=nn_fetcher,
+            train_config=config,
+            dataset=dataset,
+            num_trials=eval_cfg.num_trials,
+            task_suite_name=eval_cfg.task_suite_name,
+            task_id=eval_cfg.task_id,
+            save_video=eval_cfg.save_video,
+            video_out_path=str(video_out_path),
+            seed=eval_cfg.seed,
+            ttt_num_steps=ttt_cfg.ttt_num_steps,
+            ttt_frequency=ttt_cfg.ttt_frequency,
+            learning_rate=ttt_cfg.learning_rate,
+            ttt_k=ttt_cfg.k,
+            ttt_use_modalities=ttt_cfg.use_modalities or ["image1", "image2", "text"],
+            reset_policy=ttt_cfg.reset_policy,
+            max_ttt_step=ttt_cfg.ttt_max_step,
+        )
 
     print(f"\nSuccess rate: {success_rate * 100:.1f}%")
+    print(f"All episode metrics: {all_episode_metrics}")
 
+    # ---- Persist results --------------------------------------------------
+    _append_csv_row(csv_path, ttt_cfg, eval_cfg, success_rate)
 
-    _append_csv_row(
-        csv_path,
-        lr=args.lr,
-        ttt_frequency=args.ttt_frequency,
-        seed=args.seed,
-        success_rate=success_rate,
-        num_trials=args.num_trials,
-        ttt_num_steps=args.ttt_num_steps,
-        ttt_k=args.ttt_k,
-        reset_policy=not args.no_reset_policy,
-    )
-
-    # Extract per-episode metrics that run_evaluation_ttt stored on itself.
     episode_metrics = getattr(run_evaluation_ttt, "last_episode_metrics", None)
     if isinstance(episode_metrics, list):
         _plot_grid_losses(episode_metrics, losses_pdf)
@@ -365,4 +388,3 @@ def main() -> None:
 
 if __name__ == "__main__":  # pragma: no cover
     main()
-

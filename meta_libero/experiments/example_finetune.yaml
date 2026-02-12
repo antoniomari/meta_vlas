@@ -1,0 +1,43 @@
+# ============================================================
+#  Example experiment config for offline fine-tuning
+# ============================================================
+#
+# Run with:
+#   python scripts/finetune_single_task.py --config experiments/example_finetune.yaml
+#
+# Override individual fields from CLI:
+#   python scripts/finetune_single_task.py --config experiments/example_finetune.yaml --lr 1e-4
+
+meta:
+  name: finetune_libero10_task8
+  description: >
+    Fine-tune pi0.5 on task 8 of LIBERO-10 for 200 steps,
+    evaluating every 20 steps.
+  tags: [finetune, libero_10]
+
+# -- Model / checkpoint selection ---------------------------------
+model:
+  use_base_model: false
+  use_lora: false
+  action_expert_only: false
+  libero_90_dataset: false
+
+# -- Fine-tuning hyperparameters ----------------------------------
+finetune:
+  learning_rate: 2.5e-5
+  num_steps: 200
+  eval_interval: 20
+  batch_size: 64
+  warmup_steps: 1000
+  weight_decay: 0.0
+  log_interval: 50
+  seed: 42
+  skip_first_eval: false
+
+# -- Evaluation settings ------------------------------------------
+eval:
+  num_trials: 50
+  task_suite_name: libero_10
+  task_id: 8
+  save_video: false
+  seed: 0

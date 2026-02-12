@@ -5,25 +5,33 @@
 # Modify these arrays to change the hyperparameter search
 
 TASK_SUITE_NAME="libero_90"
-TASK_IDS=(3 4 5 6 7 8 9 10)                    # Task IDs to evaluate
-SEEDS=(4 5 6)                       # Seeds to iterate over
+TASK_IDS=(0 1 2 3 4 5 6 7)                    # Task IDs to evaluate
+SEEDS=(1 2 3)                       # Seeds to iterate over
 LEARNING_RATES=(2.5e-05)            # Learning rates
-TTT_FREQUENCIES=(20)                # TTT frequency (every N steps)
-TTT_NUM_STEPS_LIST=(0)           # Number of gradient steps per TTT update
+TTT_FREQUENCIES=(5)                # TTT frequency (every N steps)
+TTT_NUM_STEPS_LIST=(5)           # Number of gradient steps per TTT update
 TTT_K_VALUES=(6)                    # Number of nearest neighbors
+MAX_TTT_STEPS=(1000)
 
 # Fixed parameters
 NUM_TRIALS=50
-USE_LORA="--use-lora"               # Set to "" to disable
+USE_LORA=""               # Set to "" to disable
 SAVE_VIDEO="--save-video"           # Set to "" to disable
-ACTION_EXPERT_ONLY=""               # Set to "--action-expert-only" to enable
+ACTION_EXPERT_ONLY="--action-expert-only"               # Set to "--action-expert-only" to enable
 NO_RESET_POLICY=""                  # Set to "--no-reset-policy" to enable
 USE_BASE_MODEL=""                   # Set to "--use-base-model" to enable
+
+# ! Important: Use noise injection instead of TTT
+NOISE_TTT=""             # Set to "" to disable
+# ! Important: Use libero_90 dataset instead of libero_10 dataset for the TTT dataset
+DATASET_TO_USE="--libero-90-dataset"  # Set to "--libero_90_dataset" to use libero_90 dataset
 
 # SLURM settings
 TIME="24:00:00"
 MEM="64G"
-GPU="v100:1" # "a100-pcie-40gb:1"
+
+# GPUs available: v100:1, a100-pcie-40gb:1
+GPU="a100-pcie-40gb:1"
 LOG_DIR="/cluster/home/anmari/meta_vlas/meta_libero/logs"
 
 # ============== JOB SUBMISSION ==============
@@ -64,11 +72,14 @@ python meta_libero/scripts/ttt_evaluation.py \
     --ttt_num_steps ${TTT_STEPS} \
     --ttt_k ${TTT_K} \
     --seed ${SEED} \
+    --max_ttt_step ${MAX_TTT_STEPS} \
     ${USE_LORA} \
     ${SAVE_VIDEO} \
     ${ACTION_EXPERT_ONLY} \
     ${NO_RESET_POLICY} \
-    ${USE_BASE_MODEL}
+    ${USE_BASE_MODEL} \
+    ${NOISE_TTT} \
+    ${DATASET_TO_USE}
 EOF
 
                         job_count=$((job_count + 1))

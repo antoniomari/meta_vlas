@@ -38,6 +38,9 @@ from openpi.models.tokenizer import PaligemmaTokenizer
 import openpi.shared.download as download
 from openpi.training import data_loader as _data_loader
 
+sys.path.append("./meta_libero")
+from libero_dataset import override_create_torch_dataset
+
 
 def clear_jax_cache():
     """Clear JAX memory cache to free GPU memory."""
@@ -199,6 +202,8 @@ def build_unified_index(
     modalities=["image1", "image2", "text"],
     resume=False,
     rebuild_only=False,
+    normalize_per_modality=False,
+    task_suite_name="libero_10",
 ):
     """
     Build a unified FAISS index from all tasks in a dataset.
@@ -209,9 +214,20 @@ def build_unified_index(
         modalities: List of modalities to include
         resume: Resume from checkpoint if available
         rebuild_only: If True, only rebuild index from checkpoint, skip all processing
+        normalize_per_modality: If True, normalize each modality embedding before concatenation
+                                instead of normalizing the full concatenated vector.
+                                This allows proper partial cosine similarity when masking modalities.
+        task_suite_name: Task suite name (default: libero_10)
     """
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
+
+    # Path to FAISS index (adjust if needed)
+    if task_suite_name == "libero_10":
+        REPO_ID = "physical-intelligence/libero"
+    else:
+        assert task_suite_name == "libero_90"
+        REPO_ID = "physical-intelligence/libero_90"
 
     # Determine dataset name from repo
     modality_str = "_".join(sorted(modalities))
@@ -258,12 +274,13 @@ def build_unified_index(
         # Change config to load the libero_90 dataset
 
         # First, create a temporary data loader to get the dataset size
-        temp_data_loader = _data_loader.create_data_loader(
-            config,
-            sharding=None,
-            shuffle=False,
-            num_batches=1,  # Just to get the dataset
-        )
+        with override_create_torch_dataset(repo_id=REPO_ID):
+            temp_data_loader = _data_loader.create_data_loader(
+                config,
+                sharding=None,
+                shuffle=False,
+                num_batches=1,  # Just to get the dataset
+            )
         # Get the underlying dataset
         dataset = temp_data_loader._data_loader._data_loader.dataset
         total_dataset_samples = len(dataset)
@@ -282,12 +299,13 @@ def build_unified_index(
             fix_checkpoint(checkpoint_path, total_dataset_samples, batch_size)
 
         # Create data loader with num_batches to prevent infinite repetition
-        data_loader = _data_loader.create_data_loader(
-            config,
-            sharding=None,
-            shuffle=False,  # Don't shuffle for consistent indexing
-            num_batches=expected_batches,  # This prevents the dataloader from repeating!
-        )
+        with override_create_torch_dataset(repo_id=REPO_ID):
+            data_loader = _data_loader.create_data_loader(
+                config,
+                sharding=None,
+                shuffle=False,  # Don't shuffle for consistent indexing
+                num_batches=expected_batches,  # This prevents the dataloader from repeating!
+            )
         print("Data loader created successfully!")
     else:
         # For rebuild_only, we don't need these
@@ -484,6 +502,13 @@ def build_unified_index(
             # Extract embeddings for each modality
             embeddings_list = []
 
+            # Helper function to normalize each row (sample) of a batch
+            def normalize_batch(emb_batch):
+                """Normalize each row of the batch to unit norm."""
+                norms = np.linalg.norm(emb_batch, axis=-1, keepdims=True)
+                norms = np.maximum(norms, 1e-8)  # Avoid division by zero
+                return emb_batch / norms
+
             # Image1 (agentview/base camera) embeddings
             if "image1" in modalities:
                 # Observation.images is a dict with key "base_0_rgb"
@@ -494,6 +519,11 @@ def build_unified_index(
 
                     # Extract embeddings for the batch
                     img1_emb = extract_image_embedding(img1_batch, image_embedding_fn)  # (batch_size, embed_dim)
+
+                    # Normalize per modality if requested
+                    if normalize_per_modality:
+                        img1_emb = normalize_batch(img1_emb)
+
                     embeddings_list.append(img1_emb)
 
                     if img1_dim == 0:
@@ -510,6 +540,11 @@ def build_unified_index(
 
                     # Extract embeddings for the batch
                     img2_emb = extract_image_embedding(img2_batch, image_embedding_fn)  # (batch_size, embed_dim)
+
+                    # Normalize per modality if requested
+                    if normalize_per_modality:
+                        img2_emb = normalize_batch(img2_emb)
+
                     embeddings_list.append(img2_emb)
 
                     if img2_dim == 0:
@@ -529,6 +564,10 @@ def build_unified_index(
                         observation.tokenized_prompt,  # Already tokenized: (batch_size, seq_len)
                         text_embedding_fn  # JIT-compiled function
                     )  # (batch_size, embed_dim)
+
+                    # Normalize per modality if requested
+                    if normalize_per_modality:
+                        text_emb_batch = normalize_batch(text_emb_batch)
 
                     embeddings_list.append(text_emb_batch)
 
@@ -598,9 +637,12 @@ def build_unified_index(
     embeddings_array = np.array(all_embeddings).astype(np.float32)
     print(f"Embeddings array shape: {embeddings_array.shape}")
 
-    # Normalize for cosine similarity
-    print("Normalizing embeddings...")
-    faiss.normalize_L2(embeddings_array)
+    # Normalize for cosine similarity (skip if already normalized per modality)
+    if normalize_per_modality:
+        print("Skipping full-vector normalization (per-modality normalization was applied)")
+    else:
+        print("Normalizing embeddings (full vector)...")
+        faiss.normalize_L2(embeddings_array)
 
     # Create FAISS index
     print("Creating FAISS index...")
@@ -630,6 +672,7 @@ def build_unified_index(
             "embedding_dims": embedding_dims_dict,
             "total_samples": len(all_embeddings),
             "num_batches": batch_count,
+            "normalize_per_modality": normalize_per_modality,
         }, f)
 
     print(f"\nEmbedding dimensions metadata:")
@@ -683,6 +726,12 @@ Examples:
         help="Cache directory for saving index (default: ~/.cache/libero_unified_faiss)"
     )
     parser.add_argument(
+        "--task-suite-name",
+        type=str,
+        default="libero_10",
+        help="Task suite name (default: libero_10)"
+    )
+    parser.add_argument(
         "--batch-size",
         type=int,
         default=128,
@@ -692,7 +741,7 @@ Examples:
         "--modalities",
         nargs="+",
         choices=["image1", "image2", "text"],
-        default=["image1", "image2", "text"],
+        default=  ["image1", "image2", "text"],
         help="Modalities to include in embeddings (default: all)"
     )
     parser.add_argument(
@@ -705,18 +754,27 @@ Examples:
         action="store_true",
         help="Rebuild index and metadata from existing checkpoint or index file (skip all processing)"
     )
+    parser.add_argument(
+        "--normalize-per-modality",
+        action="store_true",
+        help="Normalize each modality embedding before concatenation instead of normalizing the full vector. "
+             "This allows proper partial cosine similarity when masking modalities at query time."
+    )
 
     args = parser.parse_args()
 
     if args.cache_dir is None:
         args.cache_dir = str(Path.home() / ".cache" / "libero_unified_faiss")
 
+
     build_unified_index(
+        task_suite_name=args.task_suite_name,
         cache_dir=args.cache_dir,
         batch_size=args.batch_size,
         modalities=args.modalities,
         resume=args.resume,
         rebuild_only=args.rebuild_only,
+        normalize_per_modality=args.normalize_per_modality,
     )
 
 

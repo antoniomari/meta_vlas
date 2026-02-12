@@ -1,0 +1,46 @@
+# ============================================================
+#  Example experiment config for TTT evaluation on LIBERO-10
+# ============================================================
+#
+# Load with:
+#   python scripts/ttt_evaluation.py --config experiments/example_ttt.yaml
+#
+# Override individual fields from CLI:
+#   python scripts/ttt_evaluation.py --config experiments/example_ttt.yaml --seed 42 --ttt_k 30
+#
+# Only override the fields you care about -- everything else
+# keeps its default from the dataclass definition in configs.py.
+
+meta:
+  name: ttt_libero10_k20_lr1e-4
+  description: >
+    TTT with 20 nearest neighbours, aggressive learning rate,
+    evaluated on task 3 of LIBERO-10 for 50 episodes.
+  tags: [ttt, libero_10, sweep]
+
+# -- Model / checkpoint selection ---------------------------------
+model:
+  use_base_model: false
+  use_lora: false
+  action_expert_only: false
+  libero_90_dataset: false
+
+# -- Test-time training hyperparameters ---------------------------
+ttt:
+  learning_rate: 1.0e-4
+  ttt_num_steps: 5
+  ttt_frequency: 25
+  k: 20
+  ttt_max_step: 500
+  use_modalities: [image1, image2, text]
+  reset_policy: true
+  noise_ttt: false
+
+# -- Evaluation settings ------------------------------------------
+eval:
+  num_trials: 50
+  task_suite_name: libero_10
+  task_id: 3
+  save_video: true
+  video_out_path: meta_libero/results/ttt/videos
+  seed: 0
