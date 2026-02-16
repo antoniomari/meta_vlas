@@ -140,11 +140,12 @@ def _ensure_results_paths(
     eval_cfg: EvalConfig,
     ttt_cfg: TTTConfig,
     model_cfg: ModelConfig,
+    dataset_to_use: str,
 ) -> tuple[Path, Path, Path, Path]:
     """Create results directory tree and return (csv, losses_pdf, actions_pdf, video_dir)."""
     main_dir = "ttt_base_model" if model_cfg.use_base_model else "ttt"
 
-    if model_cfg.dataset_to_use == "libero_90":
+    if dataset_to_use == "libero_90":
         main_dir += "/dataset_libero_90"
     else:
         main_dir += "/dataset_libero_10"
@@ -277,6 +278,7 @@ def main() -> None:
     parser.add_argument("--max_ttt_step", type=int, default=None, help="Maximum step to perform TTT")
     parser.add_argument("--no-reset-policy", action="store_true", default=None, help="Do not reset policy between episodes")
     parser.add_argument("--noise-ttt", action="store_true", default=None, help="Perform TTT with noise perturbation")
+    parser.add_argument("--libero-90-dataset", action="store_true", default=None, help="Use LIBERO 90 dataset")
 
     args = parser.parse_args()
 
@@ -309,7 +311,8 @@ def main() -> None:
         action_expert_only=model_cfg.action_expert_only,
     )
 
-    dataset_to_use = model_cfg.dataset_to_use
+    dataset_to_use = "libero_90" if args.libero_90_dataset else "libero_10"
+
 
     # ---- Prepare dataset + NN fetcher -------------------------------------
     dataset, config = _prepare_ttt_dataset(config, dataset_to_use=dataset_to_use)
@@ -325,7 +328,7 @@ def main() -> None:
 
     # ---- Results paths ----------------------------------------------------
     csv_path, losses_pdf, actions_pdf, video_out_path = _ensure_results_paths(
-        eval_cfg, ttt_cfg, model_cfg,
+        eval_cfg, ttt_cfg, model_cfg, dataset_to_use,
     )
 
     # ---- Save the resolved config for reproducibility ---------------------

@@ -27,7 +27,7 @@ TIME="24:00:00"
 MEM="64G"
 
 # GPUs available: v100:1, a100-pcie-40gb:1
-GPU="a100-pcie-40gb:1"
+GPU="a100_80gb:1"
 LOG_DIR="/cluster/home/anmari/meta_vlas/meta_libero/logs"
 
 # ============== JOB SUBMISSION ==============

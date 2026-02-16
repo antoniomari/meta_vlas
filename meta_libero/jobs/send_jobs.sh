@@ -18,7 +18,7 @@ NUM_TRIALS=50
 USE_LORA=""               # Set to "" to disable
 SAVE_VIDEO="--save-video"           # Set to "" to disable
 ACTION_EXPERT_ONLY="--action-expert-only"               # Set to "--action-expert-only" to enable
-NO_RESET_POLICY=""                  # Set to "--no-reset-policy" to enable
+NO_RESET_POLICY="--no-reset-policy"                  # Set to "--no-reset-policy" to enable
 USE_BASE_MODEL=""                   # Set to "--use-base-model" to enable
 
 # ! Important: Use noise injection instead of TTT
@@ -31,7 +31,7 @@ TIME="24:00:00"
 MEM="64G"
 
 # GPUs available: v100:1, a100-pcie-40gb:1
-GPU="a100-pcie-40gb:1"
+GPU="a100_80gb:1"
 LOG_DIR="/cluster/home/anmari/meta_vlas/meta_libero/logs"
 
 # ============== JOB SUBMISSION ==============

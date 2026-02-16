@@ -90,9 +90,6 @@ class FilteredDataset(Dataset):
         # Fast path: Access metadata directly from LeRobot dataset
         if hasattr(dataset, 'hf_dataset') and 'task_index' in dataset.hf_dataset.column_names:
 
-            print(dataset.hf_dataset.column_names)
-            raise ValueError("Stop here")
-
             # Direct access to HuggingFace dataset column (much faster!)
             task_indices = dataset.hf_dataset['task_index']
             self.indices = [i for i, ti in enumerate(task_indices) if ti == task_index]

@@ -215,6 +215,7 @@ def main() -> None:
     parser.add_argument("--eval_interval", type=int, default=None, help="Evaluate every N steps")
     parser.add_argument("--warmup_steps", type=int, default=None, help="LR warmup steps")
     parser.add_argument("--skip-first-eval", action="store_true", default=None, help="Skip evaluation before fine-tuning")
+    parser.add_argument("--libero-90-dataset", action="store_true", default=None, help="Use LIBERO 90 dataset")
 
     args = parser.parse_args()
 
@@ -250,7 +251,10 @@ def main() -> None:
         action_expert_only=model_cfg.action_expert_only,
     )
 
-    dataset_to_use = model_cfg.dataset_to_use
+    if args.libero_90_dataset:
+        dataset_to_use = "libero_90"
+    else:
+        dataset_to_use = "libero_10"
 
     # ---- Prepare dataset (for run_evaluation_ttt) -------------------------
     dataset, config = _prepare_dataset(config, dataset_to_use=dataset_to_use)
