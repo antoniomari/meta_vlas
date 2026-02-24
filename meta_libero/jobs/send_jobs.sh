@@ -7,7 +7,7 @@
 TASK_SUITE_NAME="libero_90"
 TASK_IDS=(0 1 2 3 4 5 6 7)                    # Task IDs to evaluate
 SEEDS=(1 2 3)                       # Seeds to iterate over
-LEARNING_RATES=(2.5e-05)            # Learning rates
+LEARNING_RATES=(2.5e-04)            # Learning rates
 TTT_FREQUENCIES=(5)                # TTT frequency (every N steps)
 TTT_NUM_STEPS_LIST=(5)           # Number of gradient steps per TTT update
 TTT_K_VALUES=(6)                    # Number of nearest neighbors
@@ -15,10 +15,10 @@ MAX_TTT_STEPS=(1000)
 
 # Fixed parameters
 NUM_TRIALS=50
-USE_LORA=""               # Set to "" to disable
+USE_LORA="--use-lora"               # Set to "" to disable
 SAVE_VIDEO="--save-video"           # Set to "" to disable
-ACTION_EXPERT_ONLY="--action-expert-only"               # Set to "--action-expert-only" to enable
-NO_RESET_POLICY="--no-reset-policy"                  # Set to "--no-reset-policy" to enable
+ACTION_EXPERT_ONLY=""               # Set to "--action-expert-only" to enable
+NO_RESET_POLICY=""                  # Set to "--no-reset-policy" to enable
 USE_BASE_MODEL=""                   # Set to "--use-base-model" to enable
 
 # ! Important: Use noise injection instead of TTT
@@ -31,7 +31,7 @@ TIME="24:00:00"
 MEM="64G"
 
 # GPUs available: v100:1, a100-pcie-40gb:1
-GPU="a100_80gb:1"
+GPU="a100-pcie-40gb:1"
 LOG_DIR="/cluster/home/anmari/meta_vlas/meta_libero/logs"
 
 # ============== JOB SUBMISSION ==============
