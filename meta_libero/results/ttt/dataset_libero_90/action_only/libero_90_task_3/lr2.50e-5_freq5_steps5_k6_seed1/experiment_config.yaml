@@ -1,0 +1,42 @@
+model:
+  use_base_model: false
+  use_lora: false
+  action_expert_only: true
+  libero_90_dataset: true
+ttt:
+  learning_rate: 2.5e-05
+  ttt_num_steps: 5
+  ttt_frequency: 5
+  k: 6
+  ttt_max_step: 1000
+  use_modalities: null
+  repeat_batch: 1
+  reset_policy: true
+  random_neighbors: false
+  cfg_weight: 1.0
+  noise_ttt: false
+eval:
+  num_trials: 50
+  task_suite_name: libero_90
+  task_id: 3
+  num_steps_wait: 10
+  save_video: true
+  video_out_path: data/libero/videos
+  seed: 1
+  plot_observations: false
+  use_test_task: false
+finetune:
+  learning_rate: 2.5e-05
+  num_steps: 1000
+  eval_interval: 100
+  batch_size: 64
+  warmup_steps: 100
+  weight_decay: 0.0
+  log_interval: 100
+  seed: 1
+  donate_buffers: true
+  skip_first_eval: false
+noise:
+  sigma: 0.01
+  frequency: 50
+  max_step: 150

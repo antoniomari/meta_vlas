@@ -1,0 +1,2 @@
+lr,ttt_frequency,seed,num_trials,ttt_num_steps,ttt_k,success_rate,reset_policy
+0.00025,20,3,50,5,6,0.16,False

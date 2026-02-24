@@ -1,0 +1,4 @@
+train_step,mean_accuracy
+0,0.58
+20,0.52
+40,0.48

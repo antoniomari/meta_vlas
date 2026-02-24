@@ -1,0 +1,2 @@
+lr,ttt_frequency,seed,num_trials,ttt_num_steps,ttt_k,success_rate
+2.5e-05,10,3,50,1,4,0.4
