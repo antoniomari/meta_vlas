@@ -1,10 +1,16 @@
 #!/bin/bash
+set -euo pipefail
+
+PROJECT_ROOT="${PROJECT_ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}"
+LOG_DIR="${META_LIBERO_LOG_DIR:-${PROJECT_ROOT}/meta_libero/logs}"
+VENV_PATH="${META_VENV_PATH:-${PROJECT_ROOT}/.venv}"
+
 #SBATCH --job-name=ttt_libero
 #SBATCH --time=24:00:00
 #SBATCH --mem-per-cpu=64G
 #SBATCH --gpus=a100-pcie-40gb:1
-#SBATCH --output=/cluster/home/anmari/meta_vlas/meta_libero/logs/ttt_%j.out
-#SBATCH --error=/cluster/home/anmari/meta_vlas/meta_libero/logs/ttt_%j.err
+#SBATCH --output=meta_libero/logs/ttt_%j.out
+#SBATCH --error=meta_libero/logs/ttt_%j.err
 
 
 # Note: seed 0 has train=True in compute_loss (preprocessing observation)
@@ -13,8 +19,8 @@
 
 # Alternative gpu: a100-pcie-40gb:1
 # Or a100_80gb:1
-cd /cluster/home/anmari/meta_vlas
-source .venv/bin/activate
+cd "${PROJECT_ROOT}"
+source "${VENV_PATH}/bin/activate"
 
 # TTT Evaluation Parameters
 TASK_SUITE_NAME="libero_90"

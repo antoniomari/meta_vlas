@@ -1,11 +1,16 @@
 #!/bin/bash
 # Script to submit multiple fine-tuning jobs with different hyperparameters
+set -euo pipefail
+
+PROJECT_ROOT="${PROJECT_ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}"
+LOG_DIR="${META_LIBERO_LOG_DIR:-${PROJECT_ROOT}/meta_libero/logs}"
+VENV_PATH="${META_VENV_PATH:-${PROJECT_ROOT}/.venv}"
 
 # ============== HYPERPARAMETER GRID ==============
 # Modify these arrays to change the hyperparameter search
 
 TASK_SUITE_NAME="libero_90"
-TASK_IDS=(0 1 2 3 4 5 6 7)                        # Task IDs to fine-tune on
+TASK_IDS=(0 1 2 3 4 5 6 7)               # Task IDs to fine-tune on
 SEEDS=(1 2 3)                           # Seeds to iterate over
 LEARNING_RATES=(2.5e-05)            # Learning rates
 BATCH_SIZES=(32)                    # Batch sizes
@@ -28,7 +33,6 @@ MEM="64G"
 
 # GPUs available: v100:1, a100-pcie-40gb:1
 GPU="a100_80gb:1"
-LOG_DIR="/cluster/home/anmari/meta_vlas/meta_libero/logs"
 
 # ============== JOB SUBMISSION ==============
 echo "Submitting fine-tuning jobs..."
@@ -57,8 +61,8 @@ for TASK_ID in "${TASK_IDS[@]}"; do
 #SBATCH --output=${LOG_DIR}/ft_%j.out
 #SBATCH --error=${LOG_DIR}/ft_%j.err
 
-cd /cluster/home/anmari/meta_vlas
-source .venv/bin/activate
+cd "${PROJECT_ROOT}"
+source "${VENV_PATH}/bin/activate"
 
 python meta_libero/scripts/finetune_single_task.py \
     --task_suite_name "${TASK_SUITE_NAME}" \

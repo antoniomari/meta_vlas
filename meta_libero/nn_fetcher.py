@@ -62,8 +62,8 @@ class NearestNeighborFetcher:
         with open(self.metadata_path, "rb") as f:
             meta = pickle.load(f)
             self.metadata = meta["metadata"]
-            self.modalities = meta["modalities"]
-            self.embedding_dims = meta["embedding_dims"]
+            self.modalities = list(meta["modalities"])
+            self.embedding_dims = dict(meta["embedding_dims"])
             self.total_samples = meta["total_samples"]
             # Load normalize_per_modality flag (default to False for backward compatibility)
             self.normalize_per_modality = meta.get("normalize_per_modality", False)
@@ -72,6 +72,15 @@ class NearestNeighborFetcher:
         print(f"Modalities: {self.modalities}")
         print(f"Embedding dimensions: {self.embedding_dims}")
         print(f"Normalize per modality: {self.normalize_per_modality}")
+        self._modality_offsets = self._build_modality_offsets()
+        self._expected_dim = sum(self.embedding_dims[mod] for mod in self.modalities)
+        self._zero_embeddings = {
+            mod: np.zeros(self.embedding_dims[mod], dtype=np.float32) for mod in self.modalities
+        }
+        self._all_vectors_cache: Optional[np.ndarray] = None
+        self._all_text_cache: Optional[np.ndarray] = None
+        self._all_non_text_cache: Dict[str, np.ndarray] = {}
+
         # Extract encoders
         self.image_encoder = model.PaliGemma.img
         self.text_encoder = model.PaliGemma.llm
@@ -84,6 +93,94 @@ class NearestNeighborFetcher:
         )
 
         print("✓ NearestNeighborFetcher initialized successfully")
+
+    def _build_modality_offsets(self) -> Dict[str, Tuple[int, int]]:
+        offsets: Dict[str, Tuple[int, int]] = {}
+        offset = 0
+        for mod in self.modalities:
+            dim = self.embedding_dims[mod]
+            offsets[mod] = (offset, offset + dim)
+            offset += dim
+        return offsets
+
+    @staticmethod
+    def _normalize_if_needed(emb: np.ndarray) -> np.ndarray:
+        norm = np.linalg.norm(emb)
+        if norm > 1e-8:
+            emb = emb / norm
+        return emb.astype(np.float32, copy=False)
+
+    def _ensure_all_vectors_cache(self) -> np.ndarray:
+        """Lazily cache reconstructed index vectors for repeated text-first queries."""
+        if self._all_vectors_cache is None:
+            n = self.index.ntotal
+            all_vectors = self.index.reconstruct_n(0, n).astype(np.float32, copy=False)
+            self._all_vectors_cache = all_vectors
+            if "text" in self._modality_offsets:
+                s, e = self._modality_offsets["text"]
+                self._all_text_cache = all_vectors[:, s:e]
+            self._all_non_text_cache = {
+                mod: all_vectors[:, s:e]
+                for mod, (s, e) in self._modality_offsets.items()
+                if mod != "text"
+            }
+        assert self._all_vectors_cache is not None
+        return self._all_vectors_cache
+
+    def _extract_query_inputs(self, observation) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
+        image1 = None
+        image2 = None
+        tokenized_text = None
+
+        if hasattr(observation, "images"):
+            if "base_0_rgb" in observation.images:
+                img = np.asarray(observation.images["base_0_rgb"])
+                if img.ndim == 4:
+                    if img.shape[0] > 1:
+                        raise ValueError(
+                            f"Image1 has batch size {img.shape[0]}, expected single image (batch size 1 or no batch dimension)"
+                        )
+                    img = img[0]
+                image1 = img
+            if "left_wrist_0_rgb" in observation.images:
+                img = np.asarray(observation.images["left_wrist_0_rgb"])
+                if img.ndim == 4:
+                    if img.shape[0] > 1:
+                        raise ValueError(
+                            f"Image2 has batch size {img.shape[0]}, expected single image (batch size 1 or no batch dimension)"
+                        )
+                    img = img[0]
+                image2 = img
+            if hasattr(observation, "tokenized_prompt") and observation.tokenized_prompt is not None:
+                txt = np.asarray(observation.tokenized_prompt)
+                if txt.ndim == 2:
+                    if txt.shape[0] > 1:
+                        raise ValueError(
+                            f"Tokenized text has batch size {txt.shape[0]}, expected single text (batch size 1 or no batch dimension)"
+                        )
+                    txt = txt[0]
+                tokenized_text = txt
+        elif isinstance(observation, dict):
+            if "observation/image" in observation:
+                img = np.asarray(observation["observation/image"])
+                if img.ndim == 4:
+                    if img.shape[0] > 1:
+                        raise ValueError(
+                            f"Image1 has batch size {img.shape[0]}, expected single image (batch size 1 or no batch dimension)"
+                        )
+                    img = img[0]
+                image1 = img
+            if "observation/wrist_image" in observation:
+                img = np.asarray(observation["observation/wrist_image"])
+                if img.ndim == 4:
+                    if img.shape[0] > 1:
+                        raise ValueError(
+                            f"Image2 has batch size {img.shape[0]}, expected single image (batch size 1 or no batch dimension)"
+                        )
+                    img = img[0]
+                image2 = img
+
+        return image1, image2, tokenized_text
 
     def _extract_image_embedding(self, images: np.ndarray) -> np.ndarray:
         """
@@ -105,7 +202,7 @@ class NearestNeighborFetcher:
         # Convert to JAX and call JIT function
         images_jax = jnp.asarray(images)
         embeddings_jax = self.image_embedding_fn(images_jax)
-        embeddings = np.array(embeddings_jax)
+        embeddings = np.asarray(embeddings_jax, dtype=np.float32)
 
         # Remove batch dimension if single image
         if single_image:
@@ -131,14 +228,15 @@ class NearestNeighborFetcher:
             single_text = False
 
         # Convert to JAX array
-        if isinstance(tokenized_text, np.ndarray):
-            tokenized_text_jax = jnp.asarray(tokenized_text.astype(np.int32))
-        else:
-            tokenized_text_jax = tokenized_text
+        tokenized_text_jax = (
+            jnp.asarray(tokenized_text.astype(np.int32))
+            if isinstance(tokenized_text, np.ndarray)
+            else tokenized_text
+        )
 
         # Call JIT function directly
         embedding_jax = self.text_embedding_fn(tokenized_text_jax)
-        embedding = np.array(embedding_jax)
+        embedding = np.asarray(embedding_jax, dtype=np.float32)
 
         # Remove batch dimension if single text
         if single_text:
@@ -165,64 +263,14 @@ class NearestNeighborFetcher:
         """
         if use_modalities is None:
             use_modalities = self.modalities
+        use_modalities_set = set(use_modalities)
 
         # Validate modalities
         for mod in use_modalities:
             if mod not in self.modalities:
                 raise ValueError(f"Modality '{mod}' not available in index. Available: {self.modalities}")
 
-        # Extract data from observation
-        image1 = None
-        image2 = None
-        tokenized_text = None
-
-        if hasattr(observation, 'images'):
-            # It's an Observation object
-            if "base_0_rgb" in observation.images:
-                img = np.array(observation.images["base_0_rgb"])
-                # Check for batch dimension
-                if img.ndim == 4:
-                    if img.shape[0] > 1:
-                        raise ValueError(f"Image1 has batch size {img.shape[0]}, expected single image (batch size 1 or no batch dimension)")
-                    image1 = img[0]  # Take first element if batch dimension exists
-                else:
-                    image1 = img
-            if "left_wrist_0_rgb" in observation.images:
-                img = np.array(observation.images["left_wrist_0_rgb"])
-                # Check for batch dimension
-                if img.ndim == 4:
-                    if img.shape[0] > 1:
-                        raise ValueError(f"Image2 has batch size {img.shape[0]}, expected single image (batch size 1 or no batch dimension)")
-                    image2 = img[0]  # Take first element if batch dimension exists
-                else:
-                    image2 = img
-            if hasattr(observation, 'tokenized_prompt') and observation.tokenized_prompt is not None:
-                txt = np.array(observation.tokenized_prompt)
-                # Check for batch dimension
-                if txt.ndim == 2:
-                    if txt.shape[0] > 1:
-                        raise ValueError(f"Tokenized text has batch size {txt.shape[0]}, expected single text (batch size 1 or no batch dimension)")
-                    tokenized_text = txt[0]  # Take first element if batch dimension exists
-                else:
-                    tokenized_text = txt
-        elif isinstance(observation, dict):
-            # It's a dict (e.g., from policy)
-            if "observation/image" in observation:
-                img = np.array(observation["observation/image"])
-                if img.ndim == 4:
-                    if img.shape[0] > 1:
-                        raise ValueError(f"Image1 has batch size {img.shape[0]}, expected single image (batch size 1 or no batch dimension)")
-                    image1 = img[0]
-                else:
-                    image1 = img
-            if "observation/wrist_image" in observation:
-                img = np.array(observation["observation/wrist_image"])
-                if img.ndim == 4:
-                    if img.shape[0] > 1:
-                        raise ValueError(f"Image2 has batch size {img.shape[0]}, expected single image (batch size 1 or no batch dimension)")
-                    image2 = img[0]
-                else:
-                    image2 = img
+        image1, image2, tokenized_text = self._extract_query_inputs(observation)
 
         # Build embedding parts in order matching the index
         # Simple logic: for each modality, if it's in use_modalities and data is available, extract it; otherwise use zeros
@@ -232,41 +280,32 @@ class NearestNeighborFetcher:
             expected_dim = self.embedding_dims[modality]
 
             if modality == "image1":
-                if modality in use_modalities and image1 is not None:
+                if modality in use_modalities_set and image1 is not None:
                     emb = self._extract_image_embedding(image1)
-                    # Normalize per modality if index was built with per-modality normalization
                     if self.normalize_per_modality:
-                        norm = np.linalg.norm(emb)
-                        if norm > 1e-8:
-                            emb = emb / norm
+                        emb = self._normalize_if_needed(emb)
                 else:
-                    emb = np.zeros(expected_dim, dtype=np.float32)
+                    emb = self._zero_embeddings["image1"]
 
                 assert emb.shape[0] == expected_dim, f"Image1 embedding shape {emb.shape} does not match expected dimension {expected_dim}"
 
             elif modality == "image2":
-                if modality in use_modalities and image2 is not None:
+                if modality in use_modalities_set and image2 is not None:
                     emb = self._extract_image_embedding(image2)
-                    # Normalize per modality if index was built with per-modality normalization
                     if self.normalize_per_modality:
-                        norm = np.linalg.norm(emb)
-                        if norm > 1e-8:
-                            emb = emb / norm
+                        emb = self._normalize_if_needed(emb)
                 else:
-                    emb = np.zeros(expected_dim, dtype=np.float32)
+                    emb = self._zero_embeddings["image2"]
 
                 assert emb.shape[0] == expected_dim, f"Image2 embedding shape {emb.shape} does not match expected dimension {expected_dim}"
 
             elif modality == "text":
-                if modality in use_modalities and tokenized_text is not None:
+                if modality in use_modalities_set and tokenized_text is not None:
                     emb = self._extract_text_embedding(tokenized_text)
-                    # Normalize per modality if index was built with per-modality normalization
                     if self.normalize_per_modality:
-                        norm = np.linalg.norm(emb)
-                        if norm > 1e-8:
-                            emb = emb / norm
+                        emb = self._normalize_if_needed(emb)
                 else:
-                    emb = np.zeros(expected_dim, dtype=np.float32)
+                    emb = self._zero_embeddings["text"]
             else:
                 raise ValueError(f"Modality '{modality}' not available in index. Available: {self.modalities}")
 
@@ -301,11 +340,10 @@ class NearestNeighborFetcher:
         query_embedding = np.concatenate(embeddings_list, axis=0)  # Use axis=0 for 1D arrays
 
         # Verify dimension matches index
-        expected_dim = sum(self.embedding_dims[mod] for mod in self.modalities)
-        if query_embedding.shape[0] != expected_dim:
+        if query_embedding.shape[0] != self._expected_dim:
             raise ValueError(
                 f"Query embedding dimension mismatch: got {query_embedding.shape[0]}, "
-                f"expected {expected_dim}. "
+                f"expected {self._expected_dim}. "
                 f"Modalities: {self.modalities}, "
                 f"Embedding dims: {self.embedding_dims}, "
                 f"Use modalities: {use_modalities}, "
@@ -313,7 +351,7 @@ class NearestNeighborFetcher:
             )
 
         # Normalize for cosine similarity (skip if per-modality normalization was used)
-        query_embedding = query_embedding.astype(np.float32)
+        query_embedding = query_embedding.astype(np.float32, copy=False)
         if not self.normalize_per_modality:
             norm = np.linalg.norm(query_embedding)
             if norm > 0:
@@ -387,30 +425,21 @@ class NearestNeighborFetcher:
             - indices: Indices of nearest neighbors (k,)
             - metadata_list: List of metadata dicts for the neighbors
         """
-        query_embedding = query_embedding.astype(np.float32)
+        query_embedding = query_embedding.astype(np.float32, copy=False)
 
-        # Compute modality slicing offsets
-        offsets = {}
-        offset = 0
-        for mod in self.modalities:
-            dim = self.embedding_dims[mod]
-            offsets[mod] = (offset, offset + dim)
-            offset += dim
-
-        if "text" not in offsets:
+        if "text" not in self._modality_offsets:
             raise ValueError("text modality required for text_then_images search")
 
         # Slice query into modality parts
-        text_start, text_end = offsets["text"]
+        text_start, text_end = self._modality_offsets["text"]
         query_text = query_embedding[text_start:text_end]
 
-        # Reconstruct all vectors from the index
-        n = self.index.ntotal
-        all_vectors = self.index.reconstruct_n(0, n)  # (n, total_dim)
+        # Reconstruct all vectors from the index (cached).
+        self._ensure_all_vectors_cache()
 
         # Compute text similarity for all vectors
-        all_text = all_vectors[:, text_start:text_end]  # (n, text_dim)
-        text_sims = all_text @ query_text  # (n,) — dot product of unit vectors = cosine sim
+        assert self._all_text_cache is not None
+        text_sims = self._all_text_cache @ query_text  # (n,) — cosine similarity for normalized vectors
 
         # Filter: keep only samples with text similarity >= threshold
         mask = text_sims >= text_similarity_threshold
@@ -423,16 +452,14 @@ class NearestNeighborFetcher:
             top_text = np.argsort(-text_sims)[:k]
             candidate_indices = top_text
 
-        # Compute image similarities for candidates
-        candidate_vectors = all_vectors[candidate_indices]  # (num_candidates, total_dim)
         image_sims = np.zeros(len(candidate_indices), dtype=np.float32)
 
         for mod in self.modalities:
             if mod == "text":
                 continue
-            mod_start, mod_end = offsets[mod]
+            mod_start, mod_end = self._modality_offsets[mod]
             query_mod = query_embedding[mod_start:mod_end]
-            candidate_mod = candidate_vectors[:, mod_start:mod_end]
+            candidate_mod = self._all_non_text_cache[mod][candidate_indices]
             image_sims += candidate_mod @ query_mod  # Add per-modality cosine sim
 
         # Rank by combined image similarity (descending)

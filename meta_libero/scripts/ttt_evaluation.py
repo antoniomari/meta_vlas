@@ -15,16 +15,24 @@ warnings.filterwarnings("ignore", message=".*shape requires ndarray or scalar ar
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="flax.core.scope")
 
 import os
+from pathlib import Path
 
-os.environ["HF_HUB_OFFLINE"] = "1"
-os.environ["HF_HOME"] = "/cluster/home/anmari/.cache/huggingface"
-os.environ["HF_LEROBOT_HOME"] = "/cluster/home/anmari/.cache/huggingface/lerobot"
+# Make script runnable without manual PYTHONPATH exports.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+for _path in (_REPO_ROOT, _REPO_ROOT / "src", _REPO_ROOT / "meta_libero"):
+    _path_str = str(_path)
+    if _path_str not in sys.path:
+        sys.path.insert(0, _path_str)
+
+# os.environ["HF_HUB_OFFLINE"] = "1"
+DEFAULT_HF_HOME = str(Path.home() / ".cache" / "huggingface")
+os.environ.setdefault("HF_HOME", DEFAULT_HF_HOME)
+os.environ.setdefault("HF_LEROBOT_HOME", str(Path(os.environ["HF_HOME"]) / "lerobot"))
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.99"
 os.environ["XLA_FLAGS"] = "--xla_gpu_deterministic_ops=true"
 os.environ["JAX_TRACEBACK_FILTERING"] = "off"
 
-from pathlib import Path
 from typing import Any
 import argparse
 import csv
@@ -40,17 +48,22 @@ import numpy as np
 import jax.numpy as jnp
 import jax
 
-sys.path.append("./meta_libero")
-
-from nn_fetcher import NearestNeighborFetcher  # type: ignore
-from libero_dataset import override_create_torch_dataset  # type: ignore
 from openpi.training import data_loader as _data_loader  # type: ignore
 import openpi.models.model as _model  # type: ignore
 import openpi.training.config as _config  # type: ignore
 import openpi.shared.download as download  # type: ignore
+from huggingface_hub import HfApi  # type: ignore
 
-from utils import create_policy, run_evaluation_ttt, run_evaluation_noise, load_pi05_libero_model  # type: ignore
-from configs import (  # type: ignore
+from meta_libero.src.nn_fetcher import NearestNeighborFetcher  # type: ignore
+from meta_libero.src.dataset import override_create_torch_dataset  # type: ignore
+from meta_libero.src.ttt import (  # type: ignore
+    create_policy,
+    run_evaluation_ttt,
+    run_evaluation,
+    run_evaluation_noise,
+    load_pi05_libero_model,
+)
+from meta_libero.configs import (  # type: ignore
     ExperimentConfig,
     TTTConfig,
     EvalConfig,
@@ -61,12 +74,20 @@ from configs import (  # type: ignore
     save_experiment,
 )
 
-from libero_dataset import override_create_torch_dataset  # local import to avoid cycles
-
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+def _results_root() -> Path:
+    return Path(os.getenv("META_LIBERO_RESULTS_DIR", "meta_libero/results"))
+
+
+def _checkpoint_dir() -> str:
+    return os.getenv(
+        "OPENPI_CHECKPOINT_DIR",
+        str(Path.home() / ".cache" / "openpi" / "openpi-assets" / "checkpoints" / "pi05_libero"),
+    )
+
 
 def _setup_logging() -> None:
     class VersionWarningFilter(logging.Filter):
@@ -85,10 +106,10 @@ def _prepare_ttt_dataset(
 ) -> tuple[Any, _config.TrainConfig]:
 
     if dataset_to_use == "libero_10":
-        repo_id = "physical-intelligence/libero"
+        repo_id = "antoniomari/libero"
     else:
         assert dataset_to_use == "libero_90"
-        repo_id = "physical-intelligence/libero_90"
+        repo_id = "antoniomari/libero_90"
 
     with override_create_torch_dataset(repo_id=repo_id):
         dataloader = _data_loader.create_data_loader(
@@ -98,6 +119,41 @@ def _prepare_ttt_dataset(
         )
         dataset = dataloader._data_loader._data_loader.dataset  # type: ignore[attr-defined]
     return dataset, config
+
+
+def _hf_preflight_check(dataset_to_use: str) -> None:
+    """Validate Hugging Face auth and dataset accessibility in job environment."""
+    if dataset_to_use == "libero_10":
+        repo_id = "antoniomari/libero"
+    else:
+        assert dataset_to_use == "libero_90"
+        repo_id = "antoniomari/libero_90"
+
+    token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
+    api = HfApi(token=token)
+
+    print("=== Hugging Face preflight ===")
+    print(f"HF_HOME: {os.getenv('HF_HOME', '<unset>')}")
+    print(f"HF token env present: {'yes' if token else 'no (using cached auth if available)'}")
+
+    try:
+        who = api.whoami(token=token) if token else api.whoami()
+        print(f"HF identity: {who.get('name', '<unknown>')}")
+    except Exception as exc:
+        raise RuntimeError(
+            "Hugging Face authentication failed in this runtime. "
+            "Run `huggingface-cli login` or pass HF_TOKEN/HUGGINGFACE_HUB_TOKEN to the job."
+        ) from exc
+
+    try:
+        api.repo_info(repo_id=repo_id, repo_type="dataset", token=token)
+        print(f"HF dataset access OK: {repo_id}")
+    except Exception as exc:
+        raise RuntimeError(
+            f"Hugging Face dataset access failed for `{repo_id}`. "
+            "Check repo id, permissions/gating, and account access."
+        ) from exc
+    print("=== Hugging Face preflight passed ===")
 
 
 def _init_nn_fetcher(model: _model.BaseModel, dataset_to_use: str = "libero_10") -> NearestNeighborFetcher:
@@ -141,8 +197,8 @@ def _ensure_results_paths(
     ttt_cfg: TTTConfig,
     model_cfg: ModelConfig,
     dataset_to_use: str,
-) -> tuple[Path, Path, Path, Path]:
-    """Create results directory tree and return (csv, losses_pdf, actions_pdf, video_dir)."""
+) -> tuple[Path, Path, Path, Path, Path]:
+    """Create results directory tree and return (summary_csv, run_dir, losses_pdf, actions_pdf, video_dir)."""
     main_dir = "ttt_base_model" if model_cfg.use_base_model else "ttt"
 
     if dataset_to_use == "libero_90":
@@ -154,45 +210,62 @@ def _ensure_results_paths(
         main_dir += "_no_reset_policy"
 
     if model_cfg.use_lora:
-        base_dir = Path("meta_libero") / "results" / main_dir / "lora"
+        base_dir = _results_root() / main_dir / "lora"
     elif model_cfg.action_expert_only:
-        base_dir = Path("meta_libero") / "results" / main_dir / "action_only"
+        base_dir = _results_root() / main_dir / "action_only"
     else:
-        base_dir = Path("meta_libero") / "results" / main_dir
+        base_dir = _results_root() / main_dir
 
     task_dir = base_dir / f"{eval_cfg.task_suite_name}_task_{eval_cfg.task_id}"
     hyper_sub = _hyperparams_subfolder(ttt_cfg, eval_cfg)
     run_dir = task_dir / hyper_sub
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    csv_path = run_dir / "results.csv"
+    summary_csv_path = base_dir / "results_summary.csv"
     losses_pdf = run_dir / "losses_grid.pdf"
     actions_pdf = run_dir / "action_distances_grid.pdf"
     video_out_path = run_dir / "videos"
-    return csv_path, losses_pdf, actions_pdf, video_out_path
+    return summary_csv_path, run_dir, losses_pdf, actions_pdf, video_out_path
 
 
-def _append_csv_row(
-    csv_path: Path,
+def _append_summary_csv_row(
+    summary_csv_path: Path,
     ttt_cfg: TTTConfig,
     eval_cfg: EvalConfig,
+    model_cfg: ModelConfig,
+    batch_size: int | None,
     success_rate: float,
 ) -> None:
-    header = ["lr", "ttt_frequency", "seed", "num_trials", "ttt_num_steps", "ttt_k", "success_rate", "reset_policy"]
-    file_exists = csv_path.exists()
-    with csv_path.open("a", newline="") as f:
+    header = [
+        "lr",
+        "ttt_frequency",
+        "ttt_num_steps",
+        "batch_size",
+        "seed",
+        "task_suite_name",
+        "task_id",
+        "success_rate",
+        "num_trials",
+        "use_lora",
+        "action_expert_only",
+    ]
+    file_exists = summary_csv_path.exists()
+    with summary_csv_path.open("a", newline="") as f:
         writer = csv.writer(f)
         if not file_exists:
             writer.writerow(header)
         writer.writerow([
             ttt_cfg.learning_rate,
             ttt_cfg.ttt_frequency,
-            eval_cfg.seed,
-            eval_cfg.num_trials,
             ttt_cfg.ttt_num_steps,
-            ttt_cfg.k,
+            batch_size,
+            eval_cfg.seed,
+            eval_cfg.task_suite_name,
+            eval_cfg.task_id,
             success_rate,
-            ttt_cfg.reset_policy,
+            eval_cfg.num_trials,
+            model_cfg.use_lora,
+            model_cfg.action_expert_only,
         ])
 
 
@@ -279,6 +352,19 @@ def main() -> None:
     parser.add_argument("--no-reset-policy", action="store_true", default=None, help="Do not reset policy between episodes")
     parser.add_argument("--noise-ttt", action="store_true", default=None, help="Perform TTT with noise perturbation")
     parser.add_argument("--libero-90-dataset", action="store_true", default=None, help="Use LIBERO 90 dataset")
+    parser.add_argument(
+        "--num_samples",
+        type=int,
+        default=10,
+        help="Number of noise samples used when generating action chunks for TTT logging/plots. "
+        "If > 1, batched inference is used automatically.",
+    )
+    parser.add_argument(
+        "--debug-metrics",
+        action="store_true",
+        default=False,
+        help="Enable expensive per-step auxiliary denoising-loss logging.",
+    )
 
     args = parser.parse_args()
 
@@ -289,7 +375,7 @@ def main() -> None:
     model_cfg = exp.model
 
     _setup_logging()
-    CHECKPOINT_DIR = "/cluster/home/anmari/.cache/openpi/openpi-assets/checkpoints/pi05_libero"
+    CHECKPOINT_DIR = _checkpoint_dir()
 
     print("=" * 70)
     print("TTT Evaluation")
@@ -313,6 +399,7 @@ def main() -> None:
 
     dataset_to_use = "libero_90" if args.libero_90_dataset else "libero_10"
 
+    _hf_preflight_check(dataset_to_use)
 
     # ---- Prepare dataset + NN fetcher -------------------------------------
     dataset, config = _prepare_ttt_dataset(config, dataset_to_use=dataset_to_use)
@@ -327,12 +414,11 @@ def main() -> None:
     )
 
     # ---- Results paths ----------------------------------------------------
-    csv_path, losses_pdf, actions_pdf, video_out_path = _ensure_results_paths(
+    summary_csv_path, run_dir, losses_pdf, actions_pdf, video_out_path = _ensure_results_paths(
         eval_cfg, ttt_cfg, model_cfg, dataset_to_use,
     )
 
     # ---- Save the resolved config for reproducibility ---------------------
-    run_dir = csv_path.parent
     save_experiment(exp, run_dir / "experiment_config.yaml")
 
     # ---- Run evaluation ---------------------------------------------------
@@ -371,13 +457,22 @@ def main() -> None:
             ttt_use_modalities=ttt_cfg.use_modalities or ["image1", "image2", "text"],
             reset_policy=ttt_cfg.reset_policy,
             max_ttt_step=ttt_cfg.ttt_max_step,
+            num_samples=args.num_samples,
+            debug_metrics=args.debug_metrics,
         )
 
     print(f"\nSuccess rate: {success_rate * 100:.1f}%")
     print(f"All episode metrics: {all_episode_metrics}")
 
     # ---- Persist results --------------------------------------------------
-    _append_csv_row(csv_path, ttt_cfg, eval_cfg, success_rate)
+    _append_summary_csv_row(
+        summary_csv_path=summary_csv_path,
+        ttt_cfg=ttt_cfg,
+        eval_cfg=eval_cfg,
+        model_cfg=model_cfg,
+        batch_size=getattr(config, "batch_size", None),
+        success_rate=success_rate,
+    )
 
     episode_metrics = getattr(run_evaluation_ttt, "last_episode_metrics", None)
     if isinstance(episode_metrics, list):

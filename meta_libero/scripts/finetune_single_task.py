@@ -21,16 +21,24 @@ warnings.filterwarnings("ignore", message=".*shape requires ndarray or scalar ar
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="flax.core.scope")
 
 import os
+from pathlib import Path
+
+# Make script runnable without manual PYTHONPATH exports.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+for _path in (_REPO_ROOT, _REPO_ROOT / "src", _REPO_ROOT / "meta_libero"):
+    _path_str = str(_path)
+    if _path_str not in sys.path:
+        sys.path.insert(0, _path_str)
 
 os.environ["HF_HUB_OFFLINE"] = "1"
-os.environ["HF_HOME"] = "/cluster/home/anmari/.cache/huggingface"
-os.environ["HF_LEROBOT_HOME"] = "/cluster/home/anmari/.cache/huggingface/lerobot"
+DEFAULT_HF_HOME = str(Path.home() / ".cache" / "huggingface")
+os.environ.setdefault("HF_HOME", DEFAULT_HF_HOME)
+os.environ.setdefault("HF_LEROBOT_HOME", str(Path(os.environ["HF_HOME"]) / "lerobot"))
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.99"
 os.environ["XLA_FLAGS"] = "--xla_gpu_deterministic_ops=true"
 os.environ["JAX_TRACEBACK_FILTERING"] = "off"
 
-from pathlib import Path
 from typing import Any
 import argparse
 import csv
@@ -45,22 +53,20 @@ import numpy as np
 import jax.numpy as jnp
 import jax
 
-sys.path.append("./meta_libero")
-
-from nn_fetcher import NearestNeighborFetcher  # type: ignore
-from libero_dataset import override_create_torch_dataset  # type: ignore
 from openpi.training import data_loader as _data_loader  # type: ignore
 import openpi.models.model as _model  # type: ignore
 import openpi.training.config as _config  # type: ignore
 import openpi.shared.download as download  # type: ignore
 
-from utils import (  # type: ignore
+from meta_libero.src.nn_fetcher import NearestNeighborFetcher  # type: ignore
+from meta_libero.src.dataset import override_create_torch_dataset  # type: ignore
+from meta_libero.src.ttt import (  # type: ignore
     create_policy,
     load_pi05_libero_model,
-    run_evaluation_ttt,
+    run_evaluation,
     train_model_on_fly,
 )
-from configs import (  # type: ignore
+from meta_libero.configs import (  # type: ignore
     ExperimentConfig,
     FinetuneConfig,
     EvalConfig,
@@ -74,6 +80,17 @@ from configs import (  # type: ignore
 # ---------------------------------------------------------------------------
 # Helpers (mirrors ttt_evaluation.py)
 # ---------------------------------------------------------------------------
+
+def _results_root() -> Path:
+    return Path(os.getenv("META_LIBERO_RESULTS_DIR", "meta_libero/results"))
+
+
+def _checkpoint_dir() -> str:
+    return os.getenv(
+        "OPENPI_CHECKPOINT_DIR",
+        str(Path.home() / ".cache" / "openpi" / "openpi-assets" / "checkpoints" / "pi05_libero"),
+    )
+
 
 def _setup_logging() -> None:
     class VersionWarningFilter(logging.Filter):
@@ -89,15 +106,16 @@ def _setup_logging() -> None:
 def _prepare_dataset(
     config: _config.TrainConfig,
     dataset_to_use: str = "libero_10",
+    task_id: int | None = None,
 ) -> tuple[Any, _config.TrainConfig]:
     """Create the full LIBERO dataset (same as _prepare_ttt_dataset in ttt_evaluation.py)."""
     if dataset_to_use == "libero_10":
         repo_id = "physical-intelligence/libero"
     else:
         assert dataset_to_use == "libero_90"
-        repo_id = "physical-intelligence/libero_90"
+        repo_id = "antoniomari/libero_90"
 
-    with override_create_torch_dataset(repo_id=repo_id):
+    with override_create_torch_dataset(repo_id=repo_id, task_id=task_id):
         dataloader = _data_loader.create_data_loader(
             config, sharding=None, shuffle=False,
         )
@@ -134,34 +152,126 @@ def _ensure_finetune_results(
     eval_cfg: EvalConfig,
     ft_cfg: FinetuneConfig,
     model_cfg: ModelConfig,
-) -> tuple[Path, Path]:
-    """Create results directory and return (csv_path, results_dir)."""
+) -> tuple[Path, Path, Path]:
+    """Create results tree and return (summary_csv_path, base_dir, run_dir)."""
     model_suffix = "_base" if model_cfg.use_base_model else ""
-    results_dir = (
-        Path("meta_libero") / "results"
+    base_dir = (
+        _results_root()
         / f"full_finetuning_{eval_cfg.task_suite_name}"
         / f"lr_{ft_cfg.learning_rate}{model_suffix}_b{ft_cfg.batch_size}"
     )
-    results_dir.mkdir(parents=True, exist_ok=True)
-    csv_path = results_dir / f"{eval_cfg.task_suite_name}_{eval_cfg.task_id}.csv"
-    return csv_path, results_dir
+    run_dir = base_dir / f"{eval_cfg.task_suite_name}_task_{eval_cfg.task_id}" / f"seed{eval_cfg.seed}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    summary_csv_path = base_dir / "results_summary.csv"
+    return summary_csv_path, base_dir, run_dir
 
 
-def _append_csv_row(
-    csv_path: Path,
-    step: int,
-    success_rate: float,
-    is_first: bool = False,
+def _append_alignment_rows(
+    alignment_csv_path: Path,
+    *,
+    eval_step: int,
+    episode_metrics: list[dict[str, Any]],
 ) -> None:
-    """Append one evaluation result row to CSV."""
-    header = ["train_step", "mean_accuracy"]
-    mode = "w" if is_first else "a"
-    with csv_path.open(mode, newline="") as f:
+    """Append alignment-ratio rows from one evaluation pass."""
+    header = ["eval_step", "episode_idx", "episode_step", "alignment_ratio", "success"]
+    file_exists = alignment_csv_path.exists()
+    with alignment_csv_path.open("a", newline="") as f:
         writer = csv.writer(f)
-        if is_first:
+        if not file_exists:
             writer.writerow(header)
-        writer.writerow([step, success_rate])
-    print(f"  -> Saved to {csv_path.name}")
+        for m in episode_metrics:
+            episode_idx = int(m.get("episode_idx", -1))
+            success = bool(m.get("success", False))
+            for episode_step, ratio in m.get("alignment_ratio_by_step", []):
+                writer.writerow([eval_step, episode_idx, int(episode_step), float(ratio), success])
+
+
+def _append_train_losses_chunk(train_losses_csv_path: Path, *, start_step: int, losses: list[float]) -> None:
+    """Append a contiguous chunk of training losses with global train-step index."""
+    if not losses:
+        return
+    header = ["train_step", "loss"]
+    file_exists = train_losses_csv_path.exists()
+    with train_losses_csv_path.open("a", newline="") as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow(header)
+        for idx, loss_val in enumerate(losses, start=start_step):
+            writer.writerow([idx, float(loss_val)])
+
+
+def _write_train_losses_pdf(
+    train_losses: list[float],
+    *,
+    pdf_path: Path,
+    title: str,
+) -> None:
+    """Overwrite PDF showing current training losses."""
+    if not train_losses:
+        return
+    plt.figure(figsize=(10, 6))
+    plt.plot(range(1, len(train_losses) + 1), train_losses, linewidth=0.5, alpha=0.7)
+    plt.xlabel("Training Step")
+    plt.ylabel("Loss")
+    plt.title(title)
+    plt.grid(True, alpha=0.3)
+
+    window_size = min(50, len(train_losses) // 10) if len(train_losses) > 10 else 1
+    if window_size > 1:
+        smoothed = np.convolve(train_losses, np.ones(window_size) / window_size, mode="valid")
+        plt.plot(
+            range(window_size, len(train_losses) + 1),
+            smoothed,
+            "r-",
+            linewidth=2,
+            label=f"Smoothed (window={window_size})",
+        )
+        plt.legend()
+
+    plt.tight_layout()
+    plt.savefig(pdf_path, format="pdf", dpi=150)
+    plt.close()
+
+
+def _append_summary_csv_row(
+    summary_csv_path: Path,
+    ft_cfg: FinetuneConfig,
+    eval_cfg: EvalConfig,
+    model_cfg: ModelConfig,
+    train_step: int,
+    success_rate: float,
+) -> None:
+    """Append one evaluation summary row to CSV."""
+    header = [
+        "lr",
+        "train_step",
+        "batch_size",
+        "seed",
+        "task_suite_name",
+        "task_id",
+        "success_rate",
+        "num_trials",
+        "use_lora",
+        "action_expert_only",
+    ]
+    file_exists = summary_csv_path.exists()
+    with summary_csv_path.open("a", newline="") as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow(header)
+        writer.writerow([
+            ft_cfg.learning_rate,
+            train_step,
+            ft_cfg.batch_size,
+            eval_cfg.seed,
+            eval_cfg.task_suite_name,
+            eval_cfg.task_id,
+            success_rate,
+            eval_cfg.num_trials,
+            model_cfg.use_lora,
+            model_cfg.action_expert_only,
+        ])
+    print(f"  -> Appended to {summary_csv_path.name}")
 
 
 # ---------------------------------------------------------------------------
@@ -175,27 +285,20 @@ def _evaluate(
     nn_fetcher: NearestNeighborFetcher,
     dataset: Any,
     eval_cfg: EvalConfig,
-) -> float:
+) -> tuple[float, list[dict[str, Any]]]:
     """Create a fresh policy from *model* and evaluate with no TTT (ttt_num_steps=0)."""
     policy = create_policy(model, config, checkpoint_dir, rng_seed=eval_cfg.seed)
-    success_rate, _episode_metrics = run_evaluation_ttt(
+    success_rate, _episode_metrics = run_evaluation(
         policy=policy,
-        nn_fetcher=nn_fetcher,
         train_config=config,
-        dataset=dataset,
         num_trials=eval_cfg.num_trials,
         task_suite_name=eval_cfg.task_suite_name,
         task_id=eval_cfg.task_id,
         save_video=eval_cfg.save_video,
         video_out_path=eval_cfg.video_out_path,
         seed=eval_cfg.seed,
-        ttt_num_steps=0,       # <-- no TTT, pure evaluation
-        ttt_frequency=9999,    # effectively disabled
-        learning_rate=0.0,
-        ttt_k=1,
-        reset_policy=True,
     )
-    return success_rate
+    return success_rate, _episode_metrics
 
 
 # ---------------------------------------------------------------------------
@@ -226,7 +329,7 @@ def main() -> None:
     model_cfg = exp.model
 
     _setup_logging()
-    CHECKPOINT_DIR = "/cluster/home/anmari/.cache/openpi/openpi-assets/checkpoints/pi05_libero"
+    CHECKPOINT_DIR = _checkpoint_dir()
 
     print("=" * 70)
     print("Fine-tune Single Task")
@@ -257,7 +360,7 @@ def main() -> None:
         dataset_to_use = "libero_10"
 
     # ---- Prepare dataset (for run_evaluation_ttt) -------------------------
-    dataset, config = _prepare_dataset(config, dataset_to_use=dataset_to_use)
+    dataset, config = _prepare_dataset(config, dataset_to_use=dataset_to_use, task_id=eval_cfg.task_id)
     print(f"Dataset size: {len(dataset)} samples")
 
     # ---- Init NN fetcher (required by run_evaluation_ttt) -----------------
@@ -265,15 +368,18 @@ def main() -> None:
     print("NearestNeighborFetcher initialized")
 
     # ---- Results paths ----------------------------------------------------
-    csv_path, results_dir = _ensure_finetune_results(eval_cfg, ft_cfg, model_cfg)
-    video_out_path = results_dir / "videos"
+    summary_csv_path, results_dir, run_dir = _ensure_finetune_results(eval_cfg, ft_cfg, model_cfg)
+    video_out_path = run_dir / "videos"
     video_out_path.mkdir(parents=True, exist_ok=True)
+    alignment_csv_path = run_dir / "alignment_scores.csv"
+    train_losses_csv_path = run_dir / "training_losses.csv"
+    train_losses_pdf_path = run_dir / "training_losses.pdf"
 
     # Point eval_cfg.video_out_path at the actual output directory
     eval_cfg = dataclasses.replace(eval_cfg, video_out_path=str(video_out_path))
 
     # ---- Save the resolved config for reproducibility ---------------------
-    save_experiment(exp, results_dir / "experiment_config.yaml")
+    save_experiment(exp, run_dir / "experiment_config.yaml")
 
     eval_results: list[tuple[int, float]] = []
 
@@ -282,7 +388,7 @@ def main() -> None:
         print("\n" + "=" * 60)
         print("Evaluating BEFORE fine-tuning (step 0)")
         print("=" * 60)
-        success_rate = _evaluate(
+        success_rate, episode_metrics = _evaluate(
             model=model,
             config=config,
             checkpoint_dir=CHECKPOINT_DIR,
@@ -291,7 +397,19 @@ def main() -> None:
             eval_cfg=eval_cfg,
         )
         eval_results.append((0, success_rate))
-        _append_csv_row(csv_path, step=0, success_rate=success_rate, is_first=True)
+        _append_alignment_rows(
+            alignment_csv_path,
+            eval_step=0,
+            episode_metrics=episode_metrics,
+        )
+        _append_summary_csv_row(
+            summary_csv_path=summary_csv_path,
+            ft_cfg=ft_cfg,
+            eval_cfg=eval_cfg,
+            model_cfg=model_cfg,
+            train_step=0,
+            success_rate=success_rate,
+        )
 
     # ---- Create training data loader --------------------------------------
     config = dataclasses.replace(config, batch_size=ft_cfg.batch_size)
@@ -299,7 +417,7 @@ def main() -> None:
     if dataset_to_use == "libero_10":
         repo_id = "physical-intelligence/libero"
     else:
-        repo_id = "physical-intelligence/libero_90"
+        repo_id = "antoniomari/libero_90"
 
     with override_create_torch_dataset(repo_id=repo_id, task_id=eval_cfg.task_id):
         data_loader = _data_loader.create_data_loader(
@@ -349,13 +467,25 @@ def main() -> None:
                 resume_losses=train_losses,
             )
 
+        prev_loss_count = len(train_losses)
         trained_model, train_losses, train_state = train_model_on_fly(**train_kwargs)
+        new_losses = train_losses[prev_loss_count:]
+        _append_train_losses_chunk(
+            train_losses_csv_path,
+            start_step=prev_loss_count + 1,
+            losses=new_losses,
+        )
+        _write_train_losses_pdf(
+            train_losses,
+            pdf_path=train_losses_pdf_path,
+            title=f"Training Loss - {eval_cfg.task_suite_name} Task {eval_cfg.task_id}",
+        )
 
         # Evaluate
         print("\n" + "=" * 60)
         print(f"Evaluating after step {current_step}")
         print("=" * 60)
-        success_rate = _evaluate(
+        success_rate, episode_metrics = _evaluate(
             model=trained_model,
             config=config,
             checkpoint_dir=CHECKPOINT_DIR,
@@ -364,39 +494,28 @@ def main() -> None:
             eval_cfg=eval_cfg,
         )
         eval_results.append((current_step, success_rate))
-        is_first = len(eval_results) == 1 and not csv_path.exists()
-        _append_csv_row(csv_path, step=current_step, success_rate=success_rate, is_first=is_first)
+        _append_alignment_rows(
+            alignment_csv_path,
+            eval_step=current_step,
+            episode_metrics=episode_metrics,
+        )
+        _append_summary_csv_row(
+            summary_csv_path=summary_csv_path,
+            ft_cfg=ft_cfg,
+            eval_cfg=eval_cfg,
+            model_cfg=model_cfg,
+            train_step=current_step,
+            success_rate=success_rate,
+        )
 
     # ---- Plot losses ------------------------------------------------------
     if train_losses:
-        plot_filename = results_dir / f"{eval_cfg.task_suite_name}_{eval_cfg.task_id}_losses.pdf"
-        print(f"\nSaving losses plot to {plot_filename}")
-
-        plt.figure(figsize=(10, 6))
-        plt.plot(range(len(train_losses)), train_losses, linewidth=0.5, alpha=0.7)
-        plt.xlabel("Training Step")
-        plt.ylabel("Loss")
-        plt.title(f"Training Loss - {eval_cfg.task_suite_name} Task {eval_cfg.task_id}")
-        plt.grid(True, alpha=0.3)
-
-        window_size = min(50, len(train_losses) // 10) if len(train_losses) > 10 else 1
-        if window_size > 1:
-            smoothed = np.convolve(train_losses, np.ones(window_size) / window_size, mode="valid")
-            plt.plot(
-                range(window_size - 1, len(train_losses)),
-                smoothed, "r-", linewidth=2,
-                label=f"Smoothed (window={window_size})",
-            )
-            plt.legend()
-
-        plt.tight_layout()
-        plt.savefig(plot_filename, format="pdf", dpi=150)
-        plt.close()
-        print(f"Saved losses plot")
+        print(f"\nSaved incremental losses to {train_losses_csv_path}")
+        print(f"Saved/updated losses PDF at {train_losses_pdf_path}")
 
     # ---- Plot accuracy vs gradient steps ----------------------------------
     if eval_results:
-        acc_plot_filename = results_dir / f"{eval_cfg.task_suite_name}_{eval_cfg.task_id}_accuracy.pdf"
+        acc_plot_filename = run_dir / "accuracy.pdf"
         print(f"\nSaving accuracy plot to {acc_plot_filename}")
 
         plt.figure(figsize=(10, 6))
@@ -435,7 +554,7 @@ def main() -> None:
     print(f"\nEvaluation Results:")
     for step, acc in eval_results:
         print(f"  Step {step:4d}: {acc * 100:.1f}% success rate")
-    print(f"\nResults saved to: {results_dir}")
+    print(f"\nResults saved to: {run_dir}")
 
 
 if __name__ == "__main__":  # pragma: no cover

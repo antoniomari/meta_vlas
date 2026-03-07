@@ -1,3 +1,164 @@
+"""General-purpose utilities for meta_libero.
+
+This module is intentionally small. TTT/training/evaluation logic lives in
+`meta_libero.src.ttt`.
+"""
+
+from __future__ import annotations
+
+import jax
+
+
+PRINT_MEMORY_CHECKPOINT = True
+
+
+def get_gpu_memory_usage() -> dict[str, float] | dict[str, str] | None:
+    """Get current GPU memory usage in GB."""
+    try:
+        devices = jax.devices()
+        if not devices:
+            return None
+        mem_info = devices[0].memory_stats()
+        allocated = mem_info.get("bytes_in_use", 0) / (1024**3)
+        reserved = mem_info.get("bytes_reserved", 0) / (1024**3)
+        return {
+            "allocated_gb": allocated,
+            "reserved_gb": reserved,
+            "total_gb": reserved,
+        }
+    except Exception as exc:  # pragma: no cover
+        return {"error": str(exc)}
+
+
+def print_memory_checkpoint(label: str, line_num: int | None = None) -> None:
+    """Print memory usage at a checkpoint."""
+    if not PRINT_MEMORY_CHECKPOINT:
+        return
+    mem = get_gpu_memory_usage()
+    if isinstance(mem, dict) and "error" not in mem:
+        line_info = f" (line {line_num})" if line_num else ""
+        print(
+            f"[MEMORY CHECKPOINT{line_info}] {label}: "
+            f"Allocated: {mem['allocated_gb']:.2f} GB, "
+            f"Reserved: {mem['reserved_gb']:.2f} GB"
+        )
+    else:
+        print(f"[MEMORY CHECKPOINT] {label}: {mem}")
+
+
+__all__ = [
+    "PRINT_MEMORY_CHECKPOINT",
+    "get_gpu_memory_usage",
+    "print_memory_checkpoint",
+]
+
+"""General-purpose utilities for meta_libero.
+
+TTT/training/evaluation logic now lives in `meta_libero.src.ttt`.
+"""
+
+from __future__ import annotations
+
+import jax
+
+
+PRINT_MEMORY_CHECKPOINT = True
+
+
+def get_gpu_memory_usage() -> dict[str, float] | dict[str, str] | None:
+    """Get current GPU memory usage in GB."""
+    try:
+        devices = jax.devices()
+        if not devices:
+            return None
+        mem_info = devices[0].memory_stats()
+        return {
+            "allocated_gb": mem_info.get("bytes_in_use", 0) / (1024**3),
+            "reserved_gb": mem_info.get("bytes_reserved", 0) / (1024**3),
+            "total_gb": mem_info.get("bytes_reserved", 0) / (1024**3),
+        }
+    except Exception as exc:  # pragma: no cover
+        return {"error": str(exc)}
+
+
+def print_memory_checkpoint(label: str, line_num: int | None = None) -> None:
+    """Print memory usage at a checkpoint."""
+    if not PRINT_MEMORY_CHECKPOINT:
+        return
+    mem = get_gpu_memory_usage()
+    if isinstance(mem, dict) and "error" not in mem:
+        line_info = f" (line {line_num})" if line_num else ""
+        print(
+            f"[MEMORY CHECKPOINT{line_info}] {label}: "
+            f"Allocated: {mem['allocated_gb']:.2f} GB, "
+            f"Reserved: {mem['reserved_gb']:.2f} GB"
+        )
+    else:
+        print(f"[MEMORY CHECKPOINT] {label}: {mem}")
+
+
+__all__ = [
+    "PRINT_MEMORY_CHECKPOINT",
+    "get_gpu_memory_usage",
+    "print_memory_checkpoint",
+]
+
+"""General-purpose utilities for meta_libero.
+
+This module is intentionally small. TTT/training/evaluation logic now lives in
+`meta_libero.src.ttt`.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+import jax
+
+
+PRINT_MEMORY_CHECKPOINT = True
+
+
+def get_gpu_memory_usage() -> dict[str, float] | dict[str, str] | None:
+    """Get current GPU memory usage in GB."""
+    try:
+        devices = jax.devices()
+        if not devices:
+            return None
+        mem_info = devices[0].memory_stats()
+        allocated = mem_info.get("bytes_in_use", 0) / (1024**3)
+        reserved = mem_info.get("bytes_reserved", 0) / (1024**3)
+        return {
+            "allocated_gb": allocated,
+            "reserved_gb": reserved,
+            "total_gb": reserved,
+        }
+    except Exception as exc:  # pragma: no cover - runtime dependent
+        return {"error": str(exc)}
+
+
+def print_memory_checkpoint(label: str, line_num: int | None = None) -> None:
+    """Print memory usage at a checkpoint."""
+    if not PRINT_MEMORY_CHECKPOINT:
+        return
+    mem = get_gpu_memory_usage()
+    if isinstance(mem, dict) and "error" not in mem:
+        line_info = f" (line {line_num})" if line_num else ""
+        print(
+            f"[MEMORY CHECKPOINT{line_info}] {label}: "
+            f"Allocated: {mem['allocated_gb']:.2f} GB, "
+            f"Reserved: {mem['reserved_gb']:.2f} GB"
+        )
+    else:
+        print(f"[MEMORY CHECKPOINT] {label}: {mem}")
+
+
+__all__ = [
+    "PRINT_MEMORY_CHECKPOINT",
+    "get_gpu_memory_usage",
+    "print_memory_checkpoint",
+]
+
 ## Training Function
 # Suppress all warnings at the very beginning
 import warnings
@@ -807,6 +968,7 @@ def run_evaluation_ttt(
     use_test_task: bool = False,
     random_neighbors: bool = False,
     cfg_weight: float = 1.0,
+    loss_samples: int = 1,
 ):
 
 
@@ -835,6 +997,7 @@ def run_evaluation_ttt(
         use_test_task=use_test_task,
         random_neighbors=random_neighbors,
         cfg_weight=cfg_weight,
+        loss_samples=loss_samples,
         adapt_kwargs={},
     )
 
@@ -907,6 +1070,7 @@ def run_evaluation_with_adaptation(
     use_test_task: bool = False,
     random_neighbors: bool = False,
     cfg_weight: float = 1.0,
+    loss_samples: int = 1,
     adapt_kwargs: dict[str, Any] = {},
 ):
     """
@@ -951,6 +1115,24 @@ def run_evaluation_with_adaptation(
     jax_key = jax.random.PRNGKey(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+    if loss_samples < 1:
+        raise ValueError(f"loss_samples must be >= 1, got {loss_samples}")
+
+    def _batch_obs_dict_for_samples(obs_dict: dict[str, Any], num_samples: int) -> dict[str, Any]:
+        """Replicate single-observation dict along batch dimension for multi-sample inference."""
+        batched: dict[str, Any] = {}
+        for key, value in obs_dict.items():
+            if key == "prompt":
+                batched[key] = [value] * num_samples
+                continue
+
+            arr = np.asarray(value)
+            if arr.ndim >= 1 and arr.shape[0] == num_samples:
+                batched[key] = arr
+            else:
+                batched[key] = np.repeat(arr[None, ...], num_samples, axis=0)
+        return batched
 
 
     # Start evaluation
@@ -1051,7 +1233,7 @@ def run_evaluation_with_adaptation(
         ################################################################################
         new_policy_original = new_policy_like(policy, original_model)
         del policy
-        policy = new_policy_original
+        policy: _policy.Policy = new_policy_original
 
         while t < max_steps + num_steps_wait:
             # Wait for objects to stabilize
@@ -1118,17 +1300,27 @@ def run_evaluation_with_adaptation(
                     ),
                     "prompt": str(task_description),
                 }
+                curr_obs_dict_batched = _batch_obs_dict_for_samples(curr_obs_dict, loss_samples)
 
                 # Query model directly (no websocket)
                 policy._rng, rng = jax.random.split(policy._rng)
-                noise = jax.random.normal(rng, (1, original_model.action_horizon, original_model.action_dim))
-                action_chunk = policy.infer(curr_obs_dict, noise=noise)["actions"]
+                noise = jax.random.normal(
+                    rng, (loss_samples, original_model.action_horizon, original_model.action_dim)
+                )
+                action_chunk_samples = policy.infer(curr_obs_dict_batched, noise=noise)["actions"]
+                if getattr(action_chunk_samples, "ndim", 0) == 2:
+                    action_chunk_samples = action_chunk_samples[None, ...]
+                # Keep backward-compatible behavior for control/action execution by using the first sample.
+                action_chunk = action_chunk_samples[0]
 
                 # check alignment ratio
                 # NOTE: override action_chunk with cfg action chunk, the default weight is 1.0 so no change
-                alignment_ratio, action_chunk_cfg = compute_alignment_ratio(policy, action_chunk, curr_obs_dict, noise=noise, cfg_weight=cfg_weight)
+                alignment_ratio, action_chunk_cfg = compute_alignment_ratio(
+                    policy, action_chunk_samples, curr_obs_dict_batched, noise=noise, cfg_weight=cfg_weight
+                )
                 if t <= max_ttt_step:
-                    action_chunk = action_chunk_cfg
+                    action_chunk_samples = action_chunk_cfg
+                    action_chunk = action_chunk_samples[0]
 
                 pbar.write(f"[TTT] Alignment ratio: {alignment_ratio:.4f}")
                 stats["alignment_ratio"].append((t, alignment_ratio))
@@ -1228,6 +1420,7 @@ def run_evaluation_with_adaptation(
                         log_interval=max(1, ttt_num_steps // 2),
                         seed=seed + ttt_count,
                         pbar=pbar,
+                        loss_samples=loss_samples,
                         **adapt_kwargs,
                     )
 
@@ -1240,28 +1433,29 @@ def run_evaluation_with_adaptation(
                     #)
                     # Generate new action_chunk with fine-tuned model
                     # ttt_action_chunk = ttt_policy.infer(curr_obs_dict)["actions"]
-                    ttt_action_chunk = ttt_policy.infer(curr_obs_dict, noise=noise)["actions"]
+                    ttt_action_chunk_samples = ttt_policy.infer(curr_obs_dict_batched, noise=noise)["actions"]
+                    if getattr(ttt_action_chunk_samples, "ndim", 0) == 2:
+                        ttt_action_chunk_samples = ttt_action_chunk_samples[None, ...]
 
                     # Compare action_chunk with ttt_action_chunk
                     # Compute distance on GPU using JAX to avoid expensive GPU->CPU transfer
                     # Only transfer the final scalar result, not the full arrays
                     action_chunk_jax = (
-                        action_chunk
-                        if isinstance(action_chunk, jax.Array)
-                        else jnp.array(action_chunk)
+                        action_chunk_samples
+                        if isinstance(action_chunk_samples, jax.Array)
+                        else jnp.array(action_chunk_samples)
                     )
                     ttt_action_chunk_jax = (
-                        ttt_action_chunk
-                        if isinstance(ttt_action_chunk, jax.Array)
-                        else jnp.array(ttt_action_chunk)
+                        ttt_action_chunk_samples
+                        if isinstance(ttt_action_chunk_samples, jax.Array)
+                        else jnp.array(ttt_action_chunk_samples)
                     )
 
-                    # Compute distance on GPU
-                    action_distance_jax = jnp.linalg.norm(
-                        action_chunk_jax - ttt_action_chunk_jax
+                    # Compute per-sample distance and average across samples on GPU.
+                    action_distance_per_sample = jnp.linalg.norm(
+                        action_chunk_jax - ttt_action_chunk_jax, axis=(1, 2)
                     )
-                    # Only transfer the scalar result (much faster than transferring full arrays)
-                    action_distance = float(jax.device_get(action_distance_jax))
+                    action_distance = float(jax.device_get(jnp.mean(action_distance_per_sample)))
                     distances_actions.append((t, action_distance))
                     similarities.append((t, distances[0]))
                     episode_losses.append(list(losses))
@@ -1292,7 +1486,8 @@ def run_evaluation_with_adaptation(
 
                     # Explicitly delete all TTT-related objects to free memory
                     # NOTE: check if needed the next line
-                    action_chunk = ttt_action_chunk
+                    action_chunk_samples = ttt_action_chunk_samples
+                    action_chunk = action_chunk_samples[0]
 
                     if reset_policy:
                         del trained_model
@@ -1571,6 +1766,28 @@ def nn_lookup(
     return nn_observations, nn_actions, distances
 
 
+def _compute_aux_denoising_losses(
+    model: _model.BaseModel,
+    observation: _model.Observation,
+    actions: _model.Actions,
+    *,
+    seed: int,
+    num_samples: int,
+) -> list[float]:
+    """
+    Compute auxiliary denoising losses for logging only.
+
+    This does NOT perform optimization; it evaluates model.compute_loss multiple
+    times with different RNG seeds.
+    """
+    losses: list[float] = []
+    for i in range(num_samples):
+        rng = jax.random.PRNGKey(seed + i)
+        chunked_loss = model.compute_loss(rng, observation, actions, train=False)
+        losses.append(float(jax.device_get(jnp.mean(chunked_loss))))
+    return losses
+
+
 def adapt_fn_ttt(
     policy: _policy.Policy,
     train_config: _config.TrainConfig,
@@ -1617,7 +1834,7 @@ def adapt_fn_ttt(
     # Perform fine-tuning on the copy (with donation enabled to save memory)
     # Each TTT should start fresh - don't resume from previous TTT state to avoid memory accumulation
     # Use donation=True to save memory - the copy will be modified, original is preserved
-    trained_model, losses, train_state = train_model_on_fly(
+    trained_model, train_losses, train_state = train_model_on_fly(
         model=model_copy,  # Pass copy, original model is preserved
         training_data_loader=ttt_data_loader,
         config=train_config,
@@ -1637,9 +1854,25 @@ def adapt_fn_ttt(
     # which handled all necessary blocking during the copy/merge process
     trained_model.eval()
 
-    del train_state, ttt_data_loader
+    # Auxiliary denoising losses for logging/plots only (not the training objective).
+    loss_samples = int(kwargs.get("loss_samples", 1))
+    if loss_samples < 1:
+        raise ValueError(f"loss_samples must be >= 1, got {loss_samples}")
+    aux_losses = _compute_aux_denoising_losses(
+        model=trained_model,
+        observation=train_obs,
+        actions=train_actions,
+        seed=seed,
+        num_samples=loss_samples,
+    )
+    pbar.write(
+        f"\tAux denoising loss over {loss_samples} samples: mean={float(np.mean(aux_losses)):.4f}"
+    )
 
-    return trained_model, losses
+    del train_state, ttt_data_loader
+    del train_losses
+
+    return trained_model, aux_losses
 
 
 def adapt_fn_gaussian_perturbation(
@@ -1730,19 +1963,33 @@ def compute_alignment_ratio(
     curr_obs_dict: dict[str, Any],
     noise: np.ndarray | jnp.ndarray | None = None,
     cfg_weight: float = 1.0
-) -> float:
+) -> tuple[float, _model.Actions]:
     """
     Calculate the alignment ratio of the model.
     """
 
     original_prompt = curr_obs_dict["prompt"]
     # Use empty prompt
-    curr_obs_dict["prompt"] = ""
+    if isinstance(original_prompt, list):
+        curr_obs_dict["prompt"] = [""] * len(original_prompt)
+    else:
+        curr_obs_dict["prompt"] = ""
     action_chunk_empty = policy.infer(curr_obs_dict, noise=noise)["actions"]
     curr_obs_dict["prompt"] = original_prompt
 
+    action_chunk_jax = action_chunk if isinstance(action_chunk, jax.Array) else jnp.array(action_chunk)
+    action_chunk_empty_jax = (
+        action_chunk_empty if isinstance(action_chunk_empty, jax.Array) else jnp.array(action_chunk_empty)
+    )
 
-    alignment_ratio = jnp.linalg.norm(action_chunk[:,:5] - action_chunk_empty[:,:5]) / jnp.linalg.norm(action_chunk_empty[:,:5])
+    if action_chunk_jax.ndim == 2:
+        action_chunk_jax = action_chunk_jax[None, ...]
+        action_chunk_empty_jax = action_chunk_empty_jax[None, ...]
+
+    # Compute ratio per sample and average for logging.
+    num = jnp.linalg.norm(action_chunk_jax[:, :5] - action_chunk_empty_jax[:, :5], axis=(1, 2))
+    den = jnp.linalg.norm(action_chunk_empty_jax[:, :5], axis=(1, 2))
+    alignment_ratio = float(jax.device_get(jnp.mean(num / den)))
     cfg_actions = action_chunk_empty + cfg_weight * (action_chunk - action_chunk_empty)
 
     return alignment_ratio, cfg_actions

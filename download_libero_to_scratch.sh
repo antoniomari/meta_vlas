@@ -1,20 +1,29 @@
 #!/bin/bash
-# Script to download LIBERO datasets to scratch space
+# Download Embodied-CoT LIBERO dataset with Hugging Face API.
 
-# Set the download directory to scratch
-DOWNLOAD_DIR="/cluster/scratch/anmari/libero_datasets"
+set -euo pipefail
 
-# Change to the meta_vlas directory
+REPO_ID="Embodied-CoT/embodied_features_and_demos_libero"
+DOWNLOAD_DIR="/cluster/home/anmari/.cache/huggingface/hub/datasets--Embodied-CoT--embodied_features_and_demos_libero"
+
 cd /cluster/home/anmari/meta_vlas
-
-# Make sure the download directory exists
 mkdir -p "$DOWNLOAD_DIR"
 
-# Download all datasets (or specify a specific one: libero_goal, libero_spatial, libero_object, libero_100)
-# For example, to download just one: --datasets libero_10
-python third_party/libero/benchmark_scripts/download_libero_datasets.py \
-    --download-dir "$DOWNLOAD_DIR" \
-    --datasets all
+python - <<'PY'
+from huggingface_hub import snapshot_download
 
-echo "Download complete! Datasets are in: $DOWNLOAD_DIR"
+repo_id = "Embodied-CoT/embodied_features_and_demos_libero"
+local_dir = "/cluster/home/anmari/.cache/huggingface/hub/datasets--Embodied-CoT--embodied_features_and_demos_libero"
+
+snapshot_download(
+    repo_id=repo_id,
+    repo_type="dataset",
+    local_dir=local_dir,
+    local_dir_use_symlinks=False,
+    resume_download=True,
+)
+PY
+
+echo "Download complete from ${REPO_ID}"
+echo "Local path: ${DOWNLOAD_DIR}"
 

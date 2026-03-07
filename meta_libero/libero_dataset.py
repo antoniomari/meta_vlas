@@ -75,47 +75,61 @@ torch.serialization.add_safe_globals(
 
 from torch.utils.data import Dataset
 
-class FilteredDataset(Dataset):
-    """Wraps a dataset and filters samples by task_index."""
+_TASK_INDICES_CACHE: dict[str, dict[int, list[int]]] = {}
 
-    def __init__(self, dataset: Dataset, task_index: int, episode_index: int = None):
+LIBERO_90_TASK_IDS_MAPPING = {
+    0: 55,
+}
+
+
+def _build_task_indices_map(dataset: Dataset) -> dict[int, list[int]]:
+    """Build a map from task_id/task_index to dataset sample indices."""
+    task_to_indices: dict[int, list[int]] = collections.defaultdict(list)
+    if hasattr(dataset, "hf_dataset") and "task_index" in dataset.hf_dataset.column_names:
+        task_indices = dataset.hf_dataset["task_index"]
+        for idx, task_idx in enumerate(task_indices):
+            task_to_indices[int(task_idx)].append(idx)
+    else:
+        # Fallback path if hf metadata is not directly available.
+        for idx in range(len(dataset)):
+            sample = dataset[idx]
+            if "task_index" in sample:
+                task_to_indices[int(sample["task_index"])].append(idx)
+    return dict(task_to_indices)
+
+
+def _get_cached_task_indices(repo_id: str, dataset: Dataset) -> dict[int, list[int]]:
+    """Return cached task->indices mapping for this repo, building once if needed."""
+    if repo_id not in _TASK_INDICES_CACHE:
+        print(f"Building task index cache for repo '{repo_id}'...")
+        _TASK_INDICES_CACHE[repo_id] = _build_task_indices_map(dataset)
+        print(f"Task index cache built with {len(_TASK_INDICES_CACHE[repo_id])} tasks")
+    return _TASK_INDICES_CACHE[repo_id]
+
+
+class FilteredDataset(Dataset):
+    """Wraps a dataset and filters samples by task_index/task_id."""
+
+    def __init__(
+        self,
+        dataset: Dataset,
+        task_index: int,
+        repo_id: str | None = None,
+        episode_index: int = None,
+    ):
         self.dataset = dataset
         self.task_index = task_index
         self.episode_index = episode_index
 
-        # Build index mapping: only samples with matching task_index
-        self.indices = []
         print(f"Filtering dataset for task_index={task_index} and episode_index={episode_index}...")
-
-        # Fast path: Access metadata directly from LeRobot dataset
-        if hasattr(dataset, 'hf_dataset') and 'task_index' in dataset.hf_dataset.column_names:
-
-            # Direct access to HuggingFace dataset column (much faster!)
-            task_indices = dataset.hf_dataset['task_index']
-            self.indices = [i for i, ti in enumerate(task_indices) if ti == task_index]
-            print(f"Filtered dataset (fast): {len(self.indices)} / {len(dataset)} samples")
-
-            # Verify filtering worked correctly by spot-checking
-            if len(self.indices) > 0:
-                print(f"  Verifying filter correctness...")
-                # Check first few samples
-                num_to_check = min(3, len(self.indices))
-                all_correct = True
-                for idx in self.indices[:num_to_check]:
-                    actual_ti = task_indices[idx]
-                    if actual_ti != task_index:
-                        print(f"  ⚠️  ERROR: Index {idx} has task_index={actual_ti}, expected {task_index}")
-                        all_correct = False
-                if all_correct:
-                    print(f"  ✓ First {num_to_check} samples verified correct")
+        if repo_id is not None:
+            task_to_indices = _get_cached_task_indices(repo_id, dataset)
+            self.indices = list(task_to_indices.get(int(task_index), []))
+            print(f"Filtered dataset (cached): {len(self.indices)} / {len(dataset)} samples")
         else:
-            # Fallback: iterate through samples (slow)
-            print("Warning: Falling back to slow filtering (no direct metadata access)")
-            for i in range(len(dataset)):
-                sample = dataset[i]
-                if sample.get('task_index') == task_index:
-                    self.indices.append(i)
-            print(f"Filtered dataset: {len(self.indices)} / {len(dataset)} samples")
+            # Fallback if repo_id is not provided.
+            self.indices = _build_task_indices_map(dataset).get(int(task_index), [])
+            print(f"Filtered dataset (uncached): {len(self.indices)} / {len(dataset)} samples")
 
     def __len__(self):
         return len(self.indices)
@@ -125,12 +139,17 @@ class FilteredDataset(Dataset):
 
 
 @contextlib.contextmanager
-def override_create_torch_dataset(repo_id: Optional[str] = None, task_index: int | None = None, load_in_memory: bool = False):
+def override_create_torch_dataset(
+    repo_id: Optional[str] = None,
+    task_id: int | None = None,
+    load_in_memory: bool = False,
+):
     """Context manager to temporarily override create_torch_dataset in data_loader module.
 
     Args:
         repo_id: The LeRobot dataset repo_id
-        task_index: If provided, filter to only this task_index
+        task_id: If provided, filter to only this numeric task_id (as of the simulator, which is different from the one in the dataset)
+        task_index: Backward-compatible alias for task_id
         load_in_memory: If True, load entire dataset into RAM (faster but uses more memory)
     """
     original = _data_loader.create_torch_dataset
@@ -138,7 +157,6 @@ def override_create_torch_dataset(repo_id: Optional[str] = None, task_index: int
     def create_dataset(
         data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
     ) -> Dataset:
-
         repo = repo_id if repo_id is not None else data_config.repo_id
 
         dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo)
@@ -160,9 +178,15 @@ def override_create_torch_dataset(repo_id: Optional[str] = None, task_index: int
                 _ = dataset.hf_dataset[:]  # This loads everything
                 print(f"Dataset loaded into memory: {len(dataset)} samples")
 
-        # Filter by task_index if specified
-        if task_index is not None:
-            dataset = FilteredDataset(dataset, task_index)
+        # Filter by task_id/task_index if specified
+        if task_id is not None:
+            if repo_id == "antoniomari/libero_90":
+                assert task_id in LIBERO_90_TASK_IDS_MAPPING, f"Task ID {task_id} not found in LIBERO_90_TASK_IDS_MAPPING"
+                task_id_dataset = LIBERO_90_TASK_IDS_MAPPING[task_id]
+            else:
+                raise NotImplementedError(f"Only supported for antoniomari/libero_90, got {repo_id}")
+            # Create a new dataset with only samples from the specified task
+            dataset = FilteredDataset(dataset, task_id_dataset, repo_id=repo)
 
         if data_config.prompt_from_task:
             dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
@@ -195,7 +219,7 @@ def extract_prompt_from_filename(name: str) -> str:
 # Convert LIBERO data to model format
 def prepare_task_dataset(task_suite_name: str = "libero_90", task_id: int = 0) -> List[List[Dict]]:
 
-    DATASET_DIR = "/cluster/scratch/anmari/libero_datasets"
+    DATASET_DIR = os.getenv("LIBERO_DATASET_DIR", str(Path.home() / "libero_datasets"))
     IMAGE_RESOLUTION = (256, 256)
     libero_path = Path(DATASET_DIR) / task_suite_name
     hdf5_files = sorted(list(libero_path.glob("*.hdf5")))
@@ -363,7 +387,13 @@ def override_create_torch_dataset_old(repo_id: str):
         _data_loader.create_torch_dataset = original
 
 
-def create_data_loader(config, repo_id: str, task_index: int | None = None, load_in_memory: bool = False):
+def create_data_loader(
+    config,
+    repo_id: str,
+    task_id: int | None = None,
+    task_index: int | None = None,
+    load_in_memory: bool = False,
+):
 
     if repo_id is None:
         data_loader = _data_loader.create_data_loader(
@@ -372,7 +402,8 @@ def create_data_loader(config, repo_id: str, task_index: int | None = None, load
                 shuffle=True,
             )
     else:
-        with override_create_torch_dataset(repo_id, task_index=task_index, load_in_memory=load_in_memory):
+        selected_task_id = task_id if task_id is not None else task_index
+        with override_create_torch_dataset(repo_id, task_id=selected_task_id, load_in_memory=load_in_memory):
             data_loader = _data_loader.create_data_loader(
                     config,
                     sharding=None,
