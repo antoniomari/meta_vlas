@@ -33,7 +33,7 @@ from meta_libero.src.libero_inputs_override import BatchableLiberoInputs, Batcha
 from meta_libero.src.rendering import plot_observation_with_decoded_prompt
 
 
-PRINT_MEMORY_CHECKPOINT = True
+PRINT_MEMORY_CHECKPOINT = False
 
 
 def get_gpu_memory_usage() -> dict[str, float] | dict[str, str] | None:
@@ -68,7 +68,8 @@ def print_memory_checkpoint(label: str, line_num: int | None = None) -> None:
         print(f"[MEMORY CHECKPOINT] {label}: {mem}")
 
 
-def fetch_samples(dataset, idx, repeat=1) -> Tuple[_model.Observation, _model.Actions]:
+
+def fetch_samples(dataset, idx, repeat=1) -> List[Any]:
     def _find_filtered_dataset(ds):
         cur = ds
         while True:
@@ -91,21 +92,8 @@ def fetch_samples(dataset, idx, repeat=1) -> Tuple[_model.Observation, _model.Ac
         examples = [dataset[i] for i in idx_int]
 
     examples = [example for _ in range(repeat) for example in examples]
-    batch = _data_loader._collate_fn(examples)
+    return examples
 
-    def to_jax(x):
-        if isinstance(x, torch.Tensor):
-            return jnp.asarray(x)
-        elif isinstance(x, np.ndarray):
-            return jnp.asarray(x)
-        elif isinstance(x, jax.Array):
-            return x
-        else:
-            return jnp.asarray(x)
-
-    batch = jax.tree.map(to_jax, batch)
-    obs, actions = _model.Observation.from_dict(batch), batch["actions"]
-    return obs, actions
 
 
 def load_pi05_libero_model(
@@ -276,8 +264,6 @@ def nn_lookup(
         observation.images["base_0_rgb"] = observation.images["base_0_rgb"][:, :, ::-1, :]
         observation.images["left_wrist_0_rgb"] = observation.images["left_wrist_0_rgb"][:, :, ::-1, :]
 
-    print(f"Using modalities: {use_modalities}")
-
     distances, indices, metadata = nn_fetcher.fetch_neighbors(
         observation=observation,
         use_modalities=use_modalities,
@@ -292,9 +278,10 @@ def nn_lookup(
     if random_neighbors:
         indices = np.random.choice(len(dataset), size=k, replace=False)
 
-    nn_observations, nn_actions = fetch_samples(dataset, indices, repeat=repeat_batch)
+    examples = fetch_samples(dataset, indices, repeat=repeat_batch)
 
     if use_test_task:
+        raise NotImplementedError("Test task needs to be reimplemented after refactoring the data loader")
         nn_observations = dataclasses.replace(
             nn_observations,
             tokenized_prompt=jnp.repeat(observation.tokenized_prompt, k, axis=0),
@@ -304,6 +291,22 @@ def nn_lookup(
         )
 
     if plot_observations:
+
+        batch = _data_loader._collate_fn(examples)
+
+        def to_jax(x):
+            if isinstance(x, torch.Tensor):
+                return jnp.asarray(x)
+            elif isinstance(x, np.ndarray):
+                return jnp.asarray(x)
+            elif isinstance(x, jax.Array):
+                return x
+            else:
+                return jnp.asarray(x)
+
+        batch = jax.tree.map(to_jax, batch)
+        nn_observations = _model.Observation.from_dict(batch)
+        
         plot_observation_with_decoded_prompt(
             observation=observation,
             similarity_score=None,
@@ -315,8 +318,7 @@ def nn_lookup(
                 similarity_score=distances,
                 plot_title_prefix=f"\tFetched Observation (Best Match)",
             )
-
-    return nn_observations, nn_actions, distances
+    return examples, distances
 
 
 def _compute_aux_denoising_losses(

@@ -1,3 +1,9 @@
+"""Backward-compatible dataset shim.
+
+Canonical implementation now lives in `meta_libero.src.dataset`.
+"""
+
+from meta_libero.src.dataset import *  # noqa: F403
 ## Training Function
 import contextlib
 import copy

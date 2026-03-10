@@ -1,3 +1,13 @@
+"""Backward-compatible re-export for rendering utilities.
+
+The canonical implementation now lives in `meta_libero.src.rendering`.
+"""
+
+from meta_libero.src import rendering as _rendering
+from meta_libero.src.rendering import *  # noqa: F403
+
+# `import *` excludes underscore-prefixed symbols; re-export this legacy helper.
+_draw_step_on_frame = _rendering._draw_step_on_frame
 ## Training Function
 # Suppress all warnings at the very beginning
 import warnings
@@ -180,18 +190,20 @@ def plot_observation_with_decoded_prompt(
         plot_title_prefix: Prefix for the plot title.
     """
     batch_size = _observation_batch_size(observation)
+    max_plot_rows = 6
+    plot_batch_size = min(batch_size, max_plot_rows)
     scores = np.atleast_1d(similarity_score) if similarity_score is not None else np.full(batch_size, np.nan)
     if scores.size == 1 and batch_size > 1:
         scores = np.broadcast_to(scores, (batch_size,))
-    scores = np.asarray(scores).flat[:batch_size]
+    scores = np.asarray(scores).reshape(-1)[:plot_batch_size]
 
     images1 = observation.images.get("base_0_rgb")
     images2 = observation.images.get("left_wrist_0_rgb")
     assert images1 is not None and images2 is not None
 
-    fig, axes = plt.subplots(batch_size, 2, figsize=(8, 4 * batch_size), squeeze=False)
+    fig, axes = plt.subplots(plot_batch_size, 2, figsize=(8, 4 * plot_batch_size), squeeze=False)
 
-    for i in range(batch_size):
+    for i in range(plot_batch_size):
         # Decode prompt
         token_prompt = observation.tokenized_prompt
         token_mask = observation.tokenized_prompt_mask
@@ -211,7 +223,7 @@ def plot_observation_with_decoded_prompt(
         title_parts = [plot_title_prefix]
         if i < len(scores) and not np.isnan(scores[i]):
             title_parts.append(f"(similarity: {scores[i]:.4f})")
-        if batch_size > 1:
+        if plot_batch_size > 1:
             title_parts.append(f"[{i}]")
         title_parts.append(f": {decoded_task_description}")
         row_title = " ".join(title_parts)
@@ -233,7 +245,10 @@ def plot_observation_with_decoded_prompt(
 
         axes[i, 0].set_ylabel(row_title, fontsize=9, labelpad=4)
 
-    fig.suptitle(plot_title_prefix, fontsize=12, fontweight="bold")
+    suptitle = plot_title_prefix
+    if batch_size > plot_batch_size:
+        suptitle = f"{plot_title_prefix} (showing first {plot_batch_size}/{batch_size})"
+    fig.suptitle(suptitle, fontsize=12, fontweight="bold")
     plt.tight_layout()
     plt.show()
     plt.close(fig)
@@ -242,6 +257,15 @@ def plot_observation_with_decoded_prompt(
 def make_observation_from_simulator(
     policy: _policy.Policy, curr_obs_dict: dict
 ) -> _model.Observation:
+    """
+    Make an observation from the current observation dictionary.
+    Args:
+        policy: The policy object.
+        curr_obs_dict: The current observation dictionary.
+
+    Returns:
+        The observation object.
+    """
     # Create Observation object from the current obs_dict
     inputs = jax.tree.map(lambda x: x, curr_obs_dict)
     inputs = policy._input_transform(inputs)

@@ -138,6 +138,7 @@ PRINT_TIME_EXECUTION = False
 
 
 
+
 def _legacy_fetch_samples(dataset, idx, repeat=1) -> Tuple[_model.Observation, _model.Actions]:
     def _find_filtered_dataset(ds):
         cur = ds
@@ -385,6 +386,7 @@ def train_model_on_fly(
     weight_decay: float = 0.0,
     log_interval: int = 100,
     seed: int = 42,
+    show_progress_bar: bool = True,
     # Resume parameters - pass these to continue training from a previous run
     resume_train_state: training_utils.TrainState | None = None,
     resume_losses: list[float] | None = None,
@@ -541,7 +543,7 @@ def train_model_on_fly(
         dynamic_ncols=True,
         mininterval=0.5,
         maxinterval=2.0,
-        # disable=True,  # Disable progress bar for TTT training
+        disable=not show_progress_bar,
     )
 
     # Initialize iterator
@@ -622,8 +624,8 @@ def train_model_on_fly(
             step_model.eval()
             step_aux_losses = _compute_aux_denoising_losses(
                 model=step_model,
-                observation=aux_observation,
-                actions=aux_actions,
+                observation=batch[0],
+                actions=batch[1],
                 seed=seed,
                 num_samples=aux_num_samples,
             )
@@ -638,9 +640,8 @@ def train_model_on_fly(
         total_time = batch_fetch_time + train_step_time
         fetch_percent = (batch_fetch_time / total_time) * 100
         pbar.write(
-            f"Step {step}: fetch={batch_fetch_time:6.2f}ms ({fetch_percent:4.1f}%), train={train_step_time:6.2f}ms, loss={loss_val:.4f}"
+            f"Step {step}: train={train_step_time:6.2f}ms, loss={loss_val:.4f} grad_norm={grad_norm:.4f}"
         )
-        # Note: Detailed timings are printed directly in train_step() when JIT is disabled
 
         # Update progress bar after every step
         pbar.set_postfix({"loss": f"{loss_val:.4f}", "grad_norm": f"{grad_norm:.4f}"})
@@ -659,13 +660,6 @@ def train_model_on_fly(
                 }
             )
 
-
-        if step % log_interval == 0 or step == end_step - 1:
-            avg_loss = np.mean([info["loss"] for info in infos[-log_interval:]])
-            avg_grad_norm = np.mean(
-                [info["grad_norm"] for info in infos[-log_interval:]]
-            )
-            pbar.write(f"Step {step}: loss={avg_loss:.4f}, grad_norm={avg_grad_norm:.4f}")
 
     # Merge to create a fresh model instance with independent buffers
     trained_model = nnx.merge(train_state.model_def, train_state.params)
@@ -758,26 +752,55 @@ def run_evaluation(
 
 
 # Create a simple dataloader that returns the same batch every time
-class SingleBatchDataLoader:
+class NeighborsDataLoader:
     """A simple dataloader that returns the same batch (obs, actions) every time."""
 
     def __init__(
         self,
-        obs: _model.Observation,
-        actions: _model.Actions,
+        examples: List[Any],
+        batch_size: int,
         data_config: _config.DataConfig,
     ):
-        self.obs = obs
-        self.actions = actions
+        if batch_size <= 0:
+            raise ValueError(f"batch_size must be > 0, got {batch_size}")
+        self.batch_size = batch_size
         self._data_config = data_config
+
+        # examples = [example for _ in range(repeat) for example in examples]
+        self.data = _data_loader._collate_fn(examples)
+
+        def to_jax(x):
+            if isinstance(x, torch.Tensor):
+                return jnp.asarray(x)
+            elif isinstance(x, np.ndarray):
+                return jnp.asarray(x)
+            elif isinstance(x, jax.Array):
+                return x
+            else:
+                return jnp.asarray(x)
+
+        self.data = jax.tree.map(to_jax, self.data)
+        leaves = jax.tree.leaves(self.data)
+        if not leaves:
+            raise ValueError("examples must not be empty")
+        self.num_examples = int(leaves[0].shape[0])
+        if self.num_examples == 0:
+            raise ValueError("examples must contain at least one sample")
+
 
     def data_config(self) -> _config.DataConfig:
         return self._data_config
 
-    def __iter__(self):
-        """Yield the same batch repeatedly."""
+    def __iter__(self) -> Iterator[tuple[_model.Observation, _model.Actions]]:
+        """Yield random fixed-size minibatches from collated neighbor data."""
         while True:
-            yield (self.obs, self.actions)
+            # Sample a minibatch with replacement to keep a fixed shape.
+            batch_idx = np.random.randint(0, self.num_examples, size=self.batch_size)
+            batch = jax.tree.map(
+                lambda x: jnp.take(x, batch_idx, axis=0),
+                self.data,
+            )
+            yield (_model.Observation.from_dict(batch), batch["actions"])
 
 
 def copy_model(model, train_config: _config.TrainConfig):
@@ -808,6 +831,54 @@ def copy_model(model, train_config: _config.TrainConfig):
     return model_copy
 
 
+def merge_model_parameters(
+    trained_model: _model.BaseModel,
+    original_model: _model.BaseModel,
+    merging_eps: float,
+) -> _model.BaseModel:
+    """Blend trained/original params while reusing trained_model storage."""
+    if not (0.0 <= merging_eps <= 1.0):
+        raise ValueError(f"merging_eps must be in [0, 1], got {merging_eps}")
+
+    @functools.partial(jax.jit, donate_argnums=(0,))
+    def _blend_params_donate(
+        trained_params: Any,
+        original_params: Any,
+        eps: float,
+    ) -> Any:
+        return jax.tree.map(
+            lambda t, o: eps * t + (1.0 - eps) * o,
+            trained_params,
+            original_params,
+        )
+
+    trained_state = nnx.state(trained_model)
+    original_state = nnx.state(original_model)
+
+    trained_params = jax.tree.map(
+        lambda leaf: leaf.value if hasattr(leaf, "value") else leaf,
+        trained_state,
+    )
+    original_params = jax.tree.map(
+        lambda leaf: leaf.value if hasattr(leaf, "value") else leaf,
+        original_state,
+    )
+
+    blended_params = _blend_params_donate(trained_params, original_params, merging_eps)
+    blended_state = jax.tree.map(
+        lambda leaf, value: (
+            # Important: for non-Variable leaves, use `value` (the blended tensor),
+            # not `leaf`, because `leaf` may reference donated/deleted buffers.
+            leaf.replace(value=value) if hasattr(leaf, "value") else value
+        ),
+        trained_state,
+        blended_params,
+    )
+    nnx.update(trained_model, blended_state)
+    trained_model.eval()
+    return trained_model
+
+
 def run_evaluation_ttt(
     policy: _policy.Policy,
     nn_fetcher: Any,
@@ -824,17 +895,20 @@ def run_evaluation_ttt(
     max_ttt_step: int = 1000, # No further TTT after this step
     ttt_frequency: int = 50,
     learning_rate: float = 2.5e-5,
-    ttt_k: int = 50,
+    ttt_k: int = 6,
+    num_neighbors_fetch: int = 32,
     ttt_use_modalities: Optional[List[str]] = None,
     plot_observations: bool = False,
     disable_adaptation: bool = False,
     repeat_batch: int = 1,
-    reset_policy: bool = True,
+    meta_update: str = "reset",
+    no_reset: bool = False,
     use_test_task: bool = False,
     random_neighbors: bool = False,
     cfg_weight: float = 1.0,
-    num_samples: int = 10,
+    num_samples: int = 1,
     debug_metrics: bool = False,
+    merging_eps: float | None = None,
 ):
 
 
@@ -856,15 +930,18 @@ def run_evaluation_ttt(
         ttt_frequency=ttt_frequency,
         learning_rate=learning_rate,
         ttt_k=ttt_k,
+        num_neighbors_fetch=num_neighbors_fetch,
         ttt_use_modalities=ttt_use_modalities,
         plot_observations=plot_observations,
         repeat_batch=repeat_batch,
-        reset_policy=reset_policy,
+        meta_update=meta_update,
+        no_reset=no_reset,
         use_test_task=use_test_task,
         random_neighbors=random_neighbors,
         cfg_weight=cfg_weight,
         num_samples=num_samples,
         debug_metrics=debug_metrics,
+        merging_eps=merging_eps,
         adapt_kwargs={},
         disable_adaptation=disable_adaptation,
     )
@@ -908,7 +985,7 @@ def run_evaluation_noise(
         ttt_k=1,
         plot_observations=plot_observations,
         repeat_batch=1,
-        reset_policy=reset_policy,
+        meta_update="reset" if reset_policy else "continual_ttt",
         adapt_kwargs=dict(noise_std=noise_sigma),
     )
 
@@ -919,6 +996,11 @@ def _infer_action_chunk_samples(
     noise_arr: np.ndarray | jnp.ndarray | None,
 ) -> _model.Actions:
     """Stable per-sample inference helper used by rollout and TTT paths."""
+
+    return policy_obj.infer(obs_dict, noise=noise_arr)["actions"]
+
+    # TODO: restore this code for batched inference
+    """
     if noise_arr is None or getattr(noise_arr, "ndim", 0) <= 2:
         action_chunk_single = policy_obj.infer(obs_dict, noise=noise_arr)["actions"]
         if getattr(action_chunk_single, "ndim", 0) == 2:
@@ -932,6 +1014,7 @@ def _infer_action_chunk_samples(
         action_i = action_i if isinstance(action_i, jax.Array) else jnp.asarray(action_i)
         action_chunks.append(action_i)
     return jnp.stack(action_chunks, axis=0)
+    """
 
 
 def _max_steps_for_task_suite(task_suite_name: str) -> int:
@@ -1028,8 +1111,12 @@ def _save_episode_losses_plot(
     video_out_path: str,
     episode_idx: int,
     done: bool,
+    filename_prefix: str = "losses",
+    y_label: str = "Loss",
 ) -> None:
     if not episode_losses or ttt_num_steps <= 1:
+        return
+    if not any(len(step_losses) > 0 for step_losses in episode_losses):
         return
     n_ttt = len(episode_losses)
     n_cols = min(3, n_ttt)
@@ -1040,17 +1127,145 @@ def _save_episode_losses_plot(
     axes_flat = axes.ravel()
     for i, step_losses in enumerate(episode_losses):
         ax = axes_flat[i]
-        ax.plot(range(len(step_losses)), step_losses, "b-o", markersize=2)
+        if step_losses:
+            ax.plot(range(len(step_losses)), step_losses, "b-o", markersize=2)
         ax.set_title(f"TTT update {i+1} ({len(step_losses)} steps)")
         ax.set_xlabel("Gradient step")
-        ax.set_ylabel("Loss")
+        ax.set_ylabel(y_label)
     for j in range(i + 1, len(axes_flat)):
         axes_flat[j].set_visible(False)
     plt.suptitle(f"Episode {episode_idx+1} – {'success' if done else 'failure'}")
     plt.tight_layout()
     os.makedirs(pathlib.Path(video_out_path).parent / "plots_losses", exist_ok=True)
-    losses_plot_path = pathlib.Path(video_out_path).parent / "plots_losses" / f"losses_ep_{episode_idx+1}.pdf"
+    losses_plot_path = pathlib.Path(video_out_path).parent / "plots_losses" / f"{filename_prefix}_ep_{episode_idx+1}.pdf"
     plt.savefig(losses_plot_path, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _neighbor_prompt_text(example: Any) -> str:
+    """Best-effort prompt extraction from a neighbor sample."""
+    if isinstance(example, dict):
+        prompt = example.get("prompt")
+        if isinstance(prompt, str) and prompt.strip():
+            return prompt.strip()
+
+        tok = example.get("tokenized_prompt")
+        tok_mask = example.get("tokenized_prompt_mask")
+        if tok is not None:
+            try:
+                tok_arr = np.asarray(tok)
+                tok_mask_arr = np.asarray(tok_mask) if tok_mask is not None else None
+                if tok_arr.ndim > 1:
+                    tok_arr = tok_arr[0]
+                if tok_mask_arr is not None and tok_mask_arr.ndim > 1:
+                    tok_mask_arr = tok_mask_arr[0]
+                return decode_tokenized_prompt(
+                    tokenized_prompt=tok_arr,
+                    tokenized_prompt_mask=tok_mask_arr,
+                    max_token_len=200,
+                    fallback_text="(prompt unavailable)",
+                )
+            except Exception:
+                pass
+    return "(prompt unavailable)"
+
+
+def _neighbors_to_preview_data(
+    examples: list[Any],
+    *,
+    top_n: int = 4,
+) -> list[dict[str, Any]]:
+    """Build top-N preview entries: composite image + decoded prompt."""
+    if not examples:
+        return []
+
+    top_examples = examples[:top_n]
+    batch = _data_loader._collate_fn(top_examples)
+
+    def to_jax(x):
+        if isinstance(x, torch.Tensor):
+            return jnp.asarray(x)
+        if isinstance(x, np.ndarray):
+            return jnp.asarray(x)
+        if isinstance(x, jax.Array):
+            return x
+        return jnp.asarray(x)
+
+    batch = jax.tree.map(to_jax, batch)
+    obs = _model.Observation.from_dict(batch)
+    base_imgs = obs.images.get("base_0_rgb")
+    wrist_imgs = obs.images.get("left_wrist_0_rgb")
+    if base_imgs is None or wrist_imgs is None:
+        return []
+
+    preview_data: list[dict[str, Any]] = []
+    for i in range(min(top_n, int(base_imgs.shape[0]))):
+        base = np.asarray(base_imgs[i], dtype=np.float32)
+        wrist = np.asarray(wrist_imgs[i], dtype=np.float32)
+        base = np.clip((base + 1.0) / 2.0, 0.0, 1.0)
+        wrist = np.clip((wrist + 1.0) / 2.0, 0.0, 1.0)
+        preview_data.append(
+            {
+                "composite": np.concatenate([base, wrist], axis=1),
+                "prompt": _neighbor_prompt_text(top_examples[i]),
+            }
+        )
+    return preview_data
+
+
+def _save_episode_neighbors_plot(
+    *,
+    neighbor_previews: list[dict[str, Any]],
+    video_out_path: str,
+    episode_idx: int,
+    done: bool,
+) -> None:
+    """Save per-update neighbor preview grid (top-4 each update)."""
+    if not neighbor_previews:
+        return
+
+    n_updates = len(neighbor_previews)
+    n_cols = 4
+    fig, axes = plt.subplots(
+        n_updates, n_cols, figsize=(3.2 * n_cols, 2.4 * n_updates), squeeze=False
+    )
+
+    for row, preview in enumerate(neighbor_previews):
+        items: list[dict[str, Any]] = preview.get("items", [])
+        top_similarities: list[float] = preview.get("top_similarities", [])
+        max_sim = float(preview.get("max_similarity", float("nan")))
+        min_sim = float(preview.get("min_similarity", float("nan")))
+
+        for col in range(n_cols):
+            ax = axes[row, col]
+            if col < len(items):
+                item = items[col]
+                img = item.get("composite")
+                prompt = str(item.get("prompt", "(prompt unavailable)"))
+                sim = top_similarities[col] if col < len(top_similarities) else float("nan")
+                ax.imshow(img)
+                title_prompt = (prompt[:60] + "...") if len(prompt) > 60 else prompt
+                ax.set_title(f"NN {col+1} | sim={sim:.4f}\n{title_prompt}", fontsize=7)
+            ax.axis("off")
+
+        axes[row, 0].text(
+            0.0,
+            1.06,
+            f"TTT {row+1} | sim range: [{min_sim:.4f}, {max_sim:.4f}]",
+            transform=axes[row, 0].transAxes,
+            fontsize=8,
+            fontweight="bold",
+            va="bottom",
+            ha="left",
+        )
+
+    status = "success" if done else "failure"
+    plt.suptitle(f"Episode {episode_idx+1} – {status} – Neighbor previews", fontsize=11)
+    plt.tight_layout()
+    out_dir = pathlib.Path(video_out_path).parent / "plots_neighbors"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"neighbors_ep_{episode_idx+1}.pdf"
+    plt.savefig(out_path, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -1076,6 +1291,21 @@ def _save_rollout_video(
     )
 
 
+def compute_action_distances(action_chunk: _model.Actions, ttt_action_chunk: _model.Actions) -> float:
+    # Compute distance between action chunk and ttt action chunk
+    def preprocess_action(action: _model.Actions) -> jax.Array:
+        action = action if isinstance(action, jax.Array) else jnp.array(action)
+        if action.ndim == 2:
+            action = action[None, ...]
+        return action
+
+    action_chunk = preprocess_action(action_chunk)
+    ttt_action_chunk = preprocess_action(ttt_action_chunk)
+    action_distance_per_sample = jnp.linalg.norm(action_chunk - ttt_action_chunk, axis=(1, 2))
+    action_distance = float(jax.device_get(jnp.mean(action_distance_per_sample)))
+
+    return action_distance
+
 def _run_single_episode_with_adaptation(
     *,
     env: Any,
@@ -1096,6 +1326,7 @@ def _run_single_episode_with_adaptation(
     dataset: Any,
     ttt_use_modalities: Optional[List[str]],
     ttt_k: int,
+    num_neighbors_fetch: int,
     repeat_batch: int,
     plot_observations: bool,
     use_test_task: bool,
@@ -1107,13 +1338,28 @@ def _run_single_episode_with_adaptation(
     learning_rate: float,
     num_samples: int,
     debug_metrics: bool,
+    merging_eps: float | None,
     adapt_kwargs: dict[str, Any],
-    reset_policy: bool,
+    meta_update: str,
+    no_reset: bool,
     cfg_weight: float,
     ttt_count: int,
     jax_key: jax.Array,
     pbar: Any,
-) -> tuple[bool, int, list[np.ndarray], list[tuple[int, float]], list[tuple[int, float]], list[list[float]], list[tuple[int, float]], int, _policy.Policy, jax.Array]:
+) -> tuple[
+    bool,
+    int,
+    list[np.ndarray],
+    list[tuple[int, float]],
+    list[tuple[int, float]],
+    list[list[float]],
+    list[list[float]],
+    list[dict[str, Any]],
+    list[tuple[int, float]],
+    int,
+    _policy.Policy,
+    jax.Array,
+]:
     env.seed(episode_seed)
     env.reset()
 
@@ -1139,8 +1385,11 @@ def _run_single_episode_with_adaptation(
     similarities: list[tuple[int, float]] = []
     alignment_ratio_by_step: list[tuple[int, float]] = []
     episode_losses: list[list[float]] = []
+    episode_test_losses: list[list[float]] = []
+    neighbor_previews: list[dict[str, Any]] = []
 
-    policy = new_policy_like(policy, original_model)
+    if not no_reset:
+        policy = new_policy_like(policy, original_model)
 
     while t < max_steps + num_steps_wait:
         if t < num_steps_wait:
@@ -1162,40 +1411,29 @@ def _run_single_episode_with_adaptation(
                 f"wrist: sum={raw_wrist_img_sum:.10f}, mean={raw_wrist_img_mean:.10f}"
             )
 
+        # Images are flipped horizontally and vertically and resized
         img, wrist_img = _preprocess_images(obs, resize_size=resize_size)
-
-        if should_check_images:
-            uint8_img_sum = float(np.sum(img))
-            uint8_wrist_img_sum = float(np.sum(wrist_img))
-            uint8_img_mean = float(np.mean(img))
-            uint8_wrist_img_mean = float(np.mean(wrist_img))
-            pbar.write(
-                f"[ENV CHECK] After uint8 (t={t}) - base: sum={uint8_img_sum:.10f}, mean={uint8_img_mean:.10f}, "
-                f"wrist: sum={uint8_wrist_img_sum:.10f}, mean={uint8_wrist_img_mean:.10f}"
-            )
-
         replay_images.append(_draw_step_on_frame(img, t))
 
         if not action_plan:
+
+            # Packing the observation dictionary (no image processing)
             curr_obs_dict = _build_curr_obs_dict(obs, img, wrist_img, task_description)
             policy._rng, rng = jax.random.split(policy._rng)
-            if num_samples > 1:
-                noise = jax.random.normal(
+
+            # TODO: support also > 1
+            assert num_samples == 1, "num_samples must be 1 (only currently supported)"
+            noise = jax.random.normal(
                     rng, (num_samples, original_model.action_horizon, original_model.action_dim)
-                )
-            else:
-                noise = jax.random.normal(
-                    rng, (original_model.action_horizon, original_model.action_dim)
-                )
+            )
 
             # Sample action chunk from policy
-            action_chunk_samples = _infer_action_chunk_samples(policy, curr_obs_dict, noise)
-            action_chunk = action_chunk_samples[0]
+            action_chunk = _infer_action_chunk_samples(policy, curr_obs_dict, noise)
 
             # Compute alignment ratio between action chunk and the action the model would have sampled with empty prompt
             # action_chunk_cfg is the action taken with classifier free guidance ()
             alignment_ratio = compute_alignment_ratio(
-                policy, action_chunk_samples, curr_obs_dict, noise=noise, cfg_weight=cfg_weight
+                policy, action_chunk, curr_obs_dict, noise=noise, cfg_weight=cfg_weight
             )
             pbar.write(f"[TTT] Alignment ratio: {alignment_ratio:.4f}")
             alignment_ratio_by_step.append((t, alignment_ratio))
@@ -1205,55 +1443,32 @@ def _run_single_episode_with_adaptation(
                 f"Policy only predicts {len(action_chunk)} steps, need {replan_steps}"
             )
 
-            if check_determinism:
-                    action_chunk_jax_check = (
-                        action_chunk if isinstance(action_chunk, jax.Array) else jnp.array(action_chunk)
-                    )
-                    action_chunk_before_ttt_sum = float(jax.device_get(jnp.sum(action_chunk_jax_check)))
-                    action_chunk_before_ttt_mean = float(jax.device_get(jnp.mean(action_chunk_jax_check)))
-                    action_chunk_before_ttt_norm = float(jax.device_get(jnp.linalg.norm(action_chunk_jax_check)))
-                    pbar.write(
-                        f"[TTT] Action chunk BEFORE TTT (t={t}) - sum: {action_chunk_before_ttt_sum:.10f}, "
-                        f"mean: {action_chunk_before_ttt_mean:.10f}, norm: {action_chunk_before_ttt_norm:.10f}"
-                    )
-
             if not disable_adaptation and (t - num_steps_wait) % ttt_frequency == 0 and t > max_ttt_step:
+
                 observation = make_observation_from_simulator(policy, curr_obs_dict)
-                obs_ttt, actions_fetched, distances = nn_lookup(
+                _unused_examples, distances = nn_lookup(
                     observation=observation,
                     nn_fetcher=nn_fetcher,
                     dataset=dataset,
                     use_modalities=ttt_use_modalities,
-                    k=ttt_k,
+                    k=num_neighbors_fetch,
                     repeat_batch=repeat_batch,
                     plot_observations=plot_observations,
                     use_test_task=use_test_task,
                     pbar=pbar,
                 )
-                del obs_ttt, actions_fetched, distances
+                del _unused_examples, distances
 
             if not disable_adaptation and (t - num_steps_wait) % ttt_frequency == 0 and t <= max_ttt_step:
                 ttt_count += 1
-                pbar.write(f"[TTT {ttt_count}] Starting TTT update")
-
-                if check_determinism:
-                    jax_key, jax_subkey = jax.random.split(jax_key)
-                    jax_random_val = float(jax.device_get(jax.random.uniform(jax_subkey)))
-                    python_random_val = random.random()
-                    numpy_random_val = np.random.rand()
-                    pbar.write(
-                        f"[TTT {ttt_count}] Determinism check - JAX: {jax_random_val:.10f}, "
-                        f"Python: {python_random_val:.10f}, NumPy: {numpy_random_val:.10f}, "
-                        f"t={t}"
-                    )
 
                 observation = make_observation_from_simulator(policy, curr_obs_dict)
-                obs_ttt, actions_fetched, distances = nn_lookup(
+                ttt_training_data, distances = nn_lookup(
                     observation=observation,
                     nn_fetcher=nn_fetcher,
                     dataset=dataset,
                     use_modalities=ttt_use_modalities,
-                    k=ttt_k,
+                    k=num_neighbors_fetch,
                     repeat_batch=repeat_batch,
                     plot_observations=plot_observations,
                     use_test_task=use_test_task,
@@ -1261,12 +1476,24 @@ def _run_single_episode_with_adaptation(
                     random_neighbors=random_neighbors,
                 )
 
+                adaptation_kwargs = dict(adapt_kwargs)
+                adaptation_kwargs.setdefault("batch_size", ttt_k)
+                distances_np = np.asarray(distances, dtype=np.float32)
+                top_similarities = [float(v) for v in distances_np[:4].tolist()] if distances_np.size > 0 else []
+                neighbor_previews.append(
+                    {
+                        "items": _neighbors_to_preview_data(ttt_training_data, top_n=4),
+                        "top_similarities": top_similarities,
+                        "max_similarity": float(np.max(distances_np)) if distances_np.size > 0 else float("nan"),
+                        "min_similarity": float(np.min(distances_np)) if distances_np.size > 0 else float("nan"),
+                    }
+                )
+
                 trained_model, losses = adaptation_fn(
                     policy=policy,
                     train_config=train_config,
                     ttt_data_config=ttt_data_config,
-                    train_obs=obs_ttt,
-                    train_actions=actions_fetched,
+                    ttt_training_data=ttt_training_data,
                     learning_rate=learning_rate,
                     num_steps=ttt_num_steps,
                     warmup_steps=0,
@@ -1276,27 +1503,20 @@ def _run_single_episode_with_adaptation(
                     pbar=pbar,
                     num_samples=num_samples,
                     debug_metrics=debug_metrics,
-                    **adapt_kwargs,
+                    **adaptation_kwargs,
                 )
 
                 ttt_policy = new_policy_like(policy, trained_model)
-                ttt_action_chunk_samples = _infer_action_chunk_samples(ttt_policy, curr_obs_dict, noise)
+                ttt_action_chunk = _infer_action_chunk_samples(ttt_policy, curr_obs_dict, noise)
 
-
-                # Compute distance between action chunk and ttt action chunk
-
-                action_chunk_jax = (
-                    action_chunk_samples if isinstance(action_chunk_samples, jax.Array) else jnp.array(action_chunk_samples)
-                )
-                ttt_action_chunk_jax = (
-                    ttt_action_chunk_samples if isinstance(ttt_action_chunk_samples, jax.Array) else jnp.array(ttt_action_chunk_samples)
-                )
-                action_distance_per_sample = jnp.linalg.norm(action_chunk_jax - ttt_action_chunk_jax, axis=(1, 2))
-                action_distance = float(jax.device_get(jnp.mean(action_distance_per_sample)))
+                # Compute action distances
+                action_distance = compute_action_distances(action_chunk, ttt_action_chunk)
 
                 distances_actions.append((t, action_distance))
                 similarities.append((t, distances[0]))
                 episode_losses.append(list(losses))
+                test_losses = getattr(adaptation_fn, "last_test_losses", [])
+                episode_test_losses.append(list(test_losses) if isinstance(test_losses, list) else [])
                 pbar.write(
                     f"[TTT {ttt_count}] Distance between action_chunk and actions_fetched: {action_distance:.4f}"
                 )
@@ -1309,15 +1529,26 @@ def _run_single_episode_with_adaptation(
                     )
 
                 # Use the ttt action chunk as the action chunk for the next step
-                action_chunk = ttt_action_chunk_samples[0]
+                action_chunk = ttt_action_chunk
 
-                if reset_policy:
+
+                ### Meta update
+                if meta_update == "reset":
                     del trained_model
-                    print_memory_checkpoint(f"[TTT {ttt_count}] After deleting trained model", 1299)
-                else:
+                elif meta_update == "tt_reptile":
+                    assert merging_eps is not None
+                    trained_model = merge_model_parameters(
+                        trained_model=trained_model,
+                        original_model=original_model,
+                        merging_eps=merging_eps,
+                    )
                     policy = new_policy_like(policy, trained_model)
+                elif meta_update == "continual_ttt":
+                    policy = new_policy_like(policy, trained_model)
+                else:  # pragma: no cover
+                    raise ValueError(f"Unknown meta_update mode: {meta_update}")
 
-                del losses, obs_ttt, actions_fetched, ttt_policy
+                del losses, ttt_training_data, ttt_policy
                 print_memory_checkpoint(
                     f"[TTT {ttt_count}] At the end of the TTT update deleting objects", 1300
                 )
@@ -1337,6 +1568,8 @@ def _run_single_episode_with_adaptation(
         distances_actions,
         similarities,
         episode_losses,
+        episode_test_losses,
+        neighbor_previews,
         alignment_ratio_by_step,
         ttt_count,
         policy,
@@ -1362,15 +1595,18 @@ def run_evaluation_with_adaptation(
     ttt_frequency: int = 50,
     learning_rate: float = 2.5e-5,
     ttt_k: int = 50,
+    num_neighbors_fetch: int = 32,
     ttt_use_modalities: Optional[List[str]] = None,
     plot_observations: bool = False,
     repeat_batch: int = 1,
-    reset_policy: bool = True,
+    meta_update: str = "reset",
+    no_reset: bool = False,
     use_test_task: bool = False,
     random_neighbors: bool = False,
     cfg_weight: float = 1.0,
     num_samples: int = 10,
     debug_metrics: bool = False,
+    merging_eps: float | None = None,
     adapt_kwargs: dict[str, Any] = {},
     disable_adaptation: bool = False,
 ):
@@ -1419,6 +1655,20 @@ def run_evaluation_with_adaptation(
 
     if num_samples < 1:
         raise ValueError(f"num_samples must be >= 1, got {num_samples}")
+    if num_neighbors_fetch < 1:
+        raise ValueError(f"num_neighbors_fetch must be >= 1, got {num_neighbors_fetch}")
+    if ttt_k < 1:
+        raise ValueError(f"ttt_k (TTT minibatch size) must be >= 1, got {ttt_k}")
+    valid_meta_update = {"reset", "continual_ttt", "tt_reptile"}
+    if meta_update not in valid_meta_update:
+        raise ValueError(f"meta_update must be one of {sorted(valid_meta_update)}, got {meta_update}")
+    if meta_update == "tt_reptile":
+        if merging_eps is None:
+            raise ValueError("merging_eps must be provided when meta_update='tt_reptile'")
+        if not (0.0 <= merging_eps <= 1.0):
+            raise ValueError(f"merging_eps must be in [0, 1], got {merging_eps}")
+    elif merging_eps is not None:
+        raise ValueError("merging_eps is only valid when meta_update='tt_reptile'")
 
     # Start evaluation
     task_episodes, task_successes = 0, 0
@@ -1484,6 +1734,8 @@ def run_evaluation_with_adaptation(
             distances_actions,
             similarities,
             episode_losses,
+            episode_test_losses,
+            neighbor_previews,
             alignment_ratio_by_step,
             ttt_count,
             policy,
@@ -1507,6 +1759,7 @@ def run_evaluation_with_adaptation(
             dataset=dataset,
             ttt_use_modalities=ttt_use_modalities,
             ttt_k=ttt_k,
+            num_neighbors_fetch=num_neighbors_fetch,
             repeat_batch=repeat_batch,
             plot_observations=plot_observations,
             use_test_task=use_test_task,
@@ -1518,8 +1771,10 @@ def run_evaluation_with_adaptation(
             learning_rate=learning_rate,
             num_samples=num_samples,
             debug_metrics=debug_metrics,
+            merging_eps=merging_eps,
             adapt_kwargs=adapt_kwargs,
-            reset_policy=reset_policy,
+            meta_update=meta_update,
+            no_reset=no_reset,
             cfg_weight=cfg_weight,
             ttt_count=ttt_count,
             jax_key=jax_key,
@@ -1542,6 +1797,7 @@ def run_evaluation_with_adaptation(
                 "distances_actions": list(distances_actions),
                 "similarities": list(similarities),
                 "losses": episode_losses,
+                "test_losses": episode_test_losses,
                 "num_steps": t,
                 "alignment_ratio_by_step": list(alignment_ratio_by_step),
             }
@@ -1551,6 +1807,23 @@ def run_evaluation_with_adaptation(
         _save_episode_losses_plot(
             episode_losses=episode_losses,
             ttt_num_steps=ttt_num_steps,
+            video_out_path=VIDEO_OUT_PATH,
+            episode_idx=episode_idx,
+            done=done,
+            filename_prefix="losses",
+            y_label="Train loss",
+        )
+        _save_episode_losses_plot(
+            episode_losses=episode_test_losses,
+            ttt_num_steps=ttt_num_steps,
+            video_out_path=VIDEO_OUT_PATH,
+            episode_idx=episode_idx,
+            done=done,
+            filename_prefix="test_losses",
+            y_label="Test loss",
+        )
+        _save_episode_neighbors_plot(
+            neighbor_previews=neighbor_previews,
             video_out_path=VIDEO_OUT_PATH,
             episode_idx=episode_idx,
             done=done,
@@ -1564,6 +1837,8 @@ def run_evaluation_with_adaptation(
             done=done,
             replay_images=replay_images,
         )
+
+        del neighbor_previews, replay_images
 
         # Log progress
         if (episode_idx + 1) % 1 == 0:
@@ -1729,8 +2004,6 @@ def _legacy_nn_lookup(
         observation.images["base_0_rgb"] = observation.images["base_0_rgb"][:, :, ::-1, :]
         observation.images["left_wrist_0_rgb"] = observation.images["left_wrist_0_rgb"][:, :, ::-1, :]
 
-    print(f"Using modalities: {use_modalities}")
-
     distances, indices, metadata = nn_fetcher.fetch_neighbors(
         observation=observation,
         use_modalities=use_modalities,
@@ -1805,8 +2078,7 @@ def adapt_fn_ttt(
     policy: _policy.Policy,
     train_config: _config.TrainConfig,
     ttt_data_config: _config.DataConfig,
-    train_obs: _model.Observation,
-    train_actions: _model.Actions,
+    ttt_training_data: List[Any],
     learning_rate: float,
     num_steps: int,
     warmup_steps: int,
@@ -1818,9 +2090,12 @@ def adapt_fn_ttt(
 ):
     # Prepare dataloader for TTT
     start_time = time.time()
+    batch_size = kwargs["batch_size"]
 
-    ttt_data_loader = SingleBatchDataLoader(
-        train_obs, train_actions, ttt_data_config
+    ttt_data_loader = NeighborsDataLoader(
+        examples=ttt_training_data,
+        batch_size=batch_size,
+        data_config=ttt_data_config,
     )
     end_time = time.time()
     pbar.write(
@@ -1862,11 +2137,10 @@ def adapt_fn_ttt(
         weight_decay=0.0,
         log_interval=max(1, num_steps // 2),
         seed=seed,
+        show_progress_bar=False,
         resume_train_state=None,  # Each TTT starts fresh - don't accumulate optimizer state
         resume_losses=None,  # Don't carry over losses
         donate_buffers=True,  # Enable donation to save memory (copy is modified, original preserved)
-        aux_observation=train_obs if debug_metrics else None,
-        aux_actions=train_actions if debug_metrics else None,
         aux_num_samples=num_samples,
     )
 
@@ -1884,11 +2158,14 @@ def adapt_fn_ttt(
             pbar.write(f"\tAux denoising mean per inner step: {aux_losses}")
     else:
         aux_losses = []
+    try:
+        adapt_fn_ttt.last_test_losses = list(aux_losses)  # type: ignore[attr-defined]
+    except Exception:
+        pass
 
     del train_state, ttt_data_loader
-    del train_losses
 
-    return trained_model, aux_losses
+    return trained_model, list(train_losses)
 
 
 def adapt_fn_gaussian_perturbation(
@@ -1969,6 +2246,10 @@ def adapt_fn_gaussian_perturbation(
 
     pbar.write(f"[Gaussian Perturbation] Added noise (std={noise_std}) to {key_idx[0]} trainable parameters")
 
+    try:
+        adapt_fn_gaussian_perturbation.last_test_losses = []  # type: ignore[attr-defined]
+    except Exception:
+        pass
     # Return the perturbed model with empty losses (no training was performed)
     return model_copy, []
 

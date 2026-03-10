@@ -1,0 +1,12 @@
+lr,train_step,batch_size,seed,task_suite_name,task_id,success_rate,num_trials,use_lora,action_expert_only
+0.00025,0,32,1,libero_90,0,0.08,50,False,False
+0.00025,100,32,1,libero_90,0,1.0,50,False,False
+0.00025,100,32,2,libero_90,0,1.0,50,False,False
+0.00025,200,32,1,libero_90,0,1.0,50,False,False
+0.00025,200,32,2,libero_90,0,1.0,50,False,False
+0.00025,300,32,1,libero_90,0,1.0,50,False,False
+0.00025,300,32,2,libero_90,0,1.0,50,False,False
+0.00025,400,32,1,libero_90,0,1.0,50,False,False
+0.00025,400,32,2,libero_90,0,1.0,50,False,False
+0.00025,500,32,1,libero_90,0,1.0,50,False,False
+0.00025,500,32,2,libero_90,0,1.0,50,False,False

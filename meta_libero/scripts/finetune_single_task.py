@@ -50,8 +50,6 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 import numpy as np
-import jax.numpy as jnp
-import jax
 
 from openpi.training import data_loader as _data_loader  # type: ignore
 import openpi.models.model as _model  # type: ignore
@@ -59,7 +57,9 @@ import openpi.training.config as _config  # type: ignore
 import openpi.shared.download as download  # type: ignore
 
 from meta_libero.src.nn_fetcher import NearestNeighborFetcher  # type: ignore
-from meta_libero.src.dataset import override_create_torch_dataset  # type: ignore
+from meta_libero.src.dataset import (  # type: ignore
+    override_create_torch_dataset,
+)
 from meta_libero.src.ttt import (  # type: ignore
     create_policy,
     load_pi05_libero_model,
@@ -107,6 +107,7 @@ def _prepare_dataset(
     config: _config.TrainConfig,
     dataset_to_use: str = "libero_10",
     task_id: int | None = None,
+    mirror_data: bool = False,
 ) -> tuple[Any, _config.TrainConfig]:
     """Create the full LIBERO dataset (same as _prepare_ttt_dataset in ttt_evaluation.py)."""
     if dataset_to_use == "libero_10":
@@ -115,7 +116,9 @@ def _prepare_dataset(
         assert dataset_to_use == "libero_90"
         repo_id = "antoniomari/libero_90"
 
-    with override_create_torch_dataset(repo_id=repo_id, task_id=task_id):
+    with override_create_torch_dataset(
+        repo_id=repo_id, task_id=task_id, mirror_data=mirror_data
+    ):
         dataloader = _data_loader.create_data_loader(
             config, sharding=None, shuffle=False,
         )
@@ -155,9 +158,11 @@ def _ensure_finetune_results(
 ) -> tuple[Path, Path, Path]:
     """Create results tree and return (summary_csv_path, base_dir, run_dir)."""
     model_suffix = "_base" if model_cfg.use_base_model else ""
+    mode_subdir = "lora" if model_cfg.use_lora else ("action_expert_only" if model_cfg.action_expert_only else "full")
     base_dir = (
         _results_root()
-        / f"full_finetuning_{eval_cfg.task_suite_name}"
+        / f"full_finetuning_new_{eval_cfg.task_suite_name}"
+        / mode_subdir
         / f"lr_{ft_cfg.learning_rate}{model_suffix}_b{ft_cfg.batch_size}"
     )
     run_dir = base_dir / f"{eval_cfg.task_suite_name}_task_{eval_cfg.task_id}" / f"seed{eval_cfg.seed}"
@@ -231,6 +236,81 @@ def _write_train_losses_pdf(
     plt.tight_layout()
     plt.savefig(pdf_path, format="pdf", dpi=150)
     plt.close()
+
+
+def _prepare_image_for_plot(img: np.ndarray) -> np.ndarray:
+    """Convert image tensor to plottable HWC float image in [0, 1]."""
+    arr = np.asarray(img)
+    if arr.ndim == 3 and arr.shape[0] in (1, 3, 4) and arr.shape[-1] not in (1, 3, 4):
+        arr = np.transpose(arr, (1, 2, 0))
+    arr = arr.astype(np.float32)
+    if arr.min() >= -1.0 and arr.max() <= 1.0:
+        arr = (arr + 1.0) / 2.0
+    elif arr.max() > 1.0:
+        arr = arr / 255.0
+    return np.clip(arr, 0.0, 1.0)
+
+
+def _save_first_batch_samples_pdf(
+    dataset: Any,
+    *,
+    batch_size: int,
+    pdf_path: Path,
+    max_samples: int = 6,
+) -> None:
+    """Save random training batch samples to a PDF.
+
+    Uses direct dataset indexing (single process) to avoid multiprocessing
+    worker spawning/pickling issues from iterating the training dataloader.
+    """
+    if dataset is None:
+        return
+
+    n_fetch = max(1, int(batch_size))
+    n_fetch = min(n_fetch, len(dataset))
+    if n_fetch <= 0:
+        return
+
+    rng = np.random.default_rng()
+    if n_fetch >= len(dataset):
+        indices = np.arange(len(dataset))
+    else:
+        indices = rng.choice(len(dataset), size=n_fetch, replace=False)
+    examples = [dataset[int(i)] for i in indices]
+    batch = _data_loader._collate_fn(examples)
+    observation = _model.Observation.from_dict(batch)
+    if not hasattr(observation, "images"):
+        return
+
+    base = observation.images.get("base_0_rgb")
+    wrist = observation.images.get("left_wrist_0_rgb")
+    if base is None or wrist is None:
+        return
+
+    base_np = np.asarray(base)
+    wrist_np = np.asarray(wrist)
+    if base_np.ndim == 3:
+        base_np = base_np[None, ...]
+    if wrist_np.ndim == 3:
+        wrist_np = wrist_np[None, ...]
+
+    n = min(max_samples, int(base_np.shape[0]), int(wrist_np.shape[0]))
+    if n <= 0:
+        return
+
+    fig, axes = plt.subplots(n, 2, figsize=(8, 3 * n), squeeze=False)
+    for i in range(n):
+        axes[i, 0].imshow(_prepare_image_for_plot(base_np[i]))
+        axes[i, 0].set_title(f"Sample {i} - Base")
+        axes[i, 0].axis("off")
+
+        axes[i, 1].imshow(_prepare_image_for_plot(wrist_np[i]))
+        axes[i, 1].set_title(f"Sample {i} - Wrist")
+        axes[i, 1].axis("off")
+
+    plt.tight_layout()
+    fig.savefig(pdf_path, format="pdf", dpi=150)
+    plt.close(fig)
 
 
 def _append_summary_csv_row(
@@ -319,6 +399,12 @@ def main() -> None:
     parser.add_argument("--warmup_steps", type=int, default=None, help="LR warmup steps")
     parser.add_argument("--skip-first-eval", action="store_true", default=None, help="Skip evaluation before fine-tuning")
     parser.add_argument("--libero-90-dataset", action="store_true", default=None, help="Use LIBERO 90 dataset")
+    parser.add_argument(
+        "--no-mirror-data",
+        action="store_true",
+        default=False,
+        help="Disable mirrored dataloader transform.",
+    )
 
     args = parser.parse_args()
 
@@ -358,10 +444,17 @@ def main() -> None:
         dataset_to_use = "libero_90"
     else:
         dataset_to_use = "libero_10"
+    mirror_data = not args.no_mirror_data
 
     # ---- Prepare dataset (for run_evaluation_ttt) -------------------------
-    dataset, config = _prepare_dataset(config, dataset_to_use=dataset_to_use, task_id=eval_cfg.task_id)
+    dataset, config = _prepare_dataset(
+        config,
+        dataset_to_use=dataset_to_use,
+        task_id=eval_cfg.task_id,
+        mirror_data=mirror_data,
+    )
     print(f"Dataset size: {len(dataset)} samples")
+    print(f"Mirror dataloader data: {mirror_data}")
 
     # ---- Init NN fetcher (required by run_evaluation_ttt) -----------------
     nn_fetcher = _init_nn_fetcher(model, dataset_to_use=dataset_to_use)
@@ -374,6 +467,8 @@ def main() -> None:
     alignment_csv_path = run_dir / "alignment_scores.csv"
     train_losses_csv_path = run_dir / "training_losses.csv"
     train_losses_pdf_path = run_dir / "training_losses.pdf"
+    samples_dir = run_dir / "samples"
+    samples_dir.mkdir(parents=True, exist_ok=True)
 
     # Point eval_cfg.video_out_path at the actual output directory
     eval_cfg = dataclasses.replace(eval_cfg, video_out_path=str(video_out_path))
@@ -381,10 +476,26 @@ def main() -> None:
     # ---- Save the resolved config for reproducibility ---------------------
     save_experiment(exp, run_dir / "experiment_config.yaml")
 
+    # ---- Create training data loader --------------------------------------
+    config = dataclasses.replace(config, batch_size=ft_cfg.batch_size)
+
+    if dataset_to_use == "libero_10":
+        repo_id = "physical-intelligence/libero"
+    else:
+        repo_id = "antoniomari/libero_90"
+
+    with override_create_torch_dataset(
+        repo_id=repo_id, task_id=eval_cfg.task_id, mirror_data=mirror_data
+    ):
+        data_loader = _data_loader.create_data_loader(
+            config, sharding=None, shuffle=True,
+        )
+
     eval_results: list[tuple[int, float]] = []
 
     # ---- Evaluate before fine-tuning (step 0) -----------------------------
-    if not ft_cfg.skip_first_eval:
+    skip_first_eval = True
+    if not skip_first_eval:
         print("\n" + "=" * 60)
         print("Evaluating BEFORE fine-tuning (step 0)")
         print("=" * 60)
@@ -411,18 +522,12 @@ def main() -> None:
             success_rate=success_rate,
         )
 
-    # ---- Create training data loader --------------------------------------
-    config = dataclasses.replace(config, batch_size=ft_cfg.batch_size)
-
-    if dataset_to_use == "libero_10":
-        repo_id = "physical-intelligence/libero"
-    else:
-        repo_id = "antoniomari/libero_90"
-
-    with override_create_torch_dataset(repo_id=repo_id, task_id=eval_cfg.task_id):
-        data_loader = _data_loader.create_data_loader(
-            config, sharding=None, shuffle=True,
-        )
+    # Save first batch of samples
+    _save_first_batch_samples_pdf(
+        dataset,
+        batch_size=ft_cfg.batch_size,
+        pdf_path=samples_dir / "samples_0.pdf",
+    )
 
     print(f"\nStarting fine-tuning...")
     print(f"Training hyperparameters:")
@@ -506,6 +611,11 @@ def main() -> None:
             model_cfg=model_cfg,
             train_step=current_step,
             success_rate=success_rate,
+        )
+        _save_first_batch_samples_pdf(
+            dataset,
+            batch_size=ft_cfg.batch_size,
+            pdf_path=samples_dir / f"samples_{current_step}.pdf",
         )
 
     # ---- Plot losses ------------------------------------------------------

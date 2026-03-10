@@ -1,0 +1,8 @@
+lr,ttt_frequency,ttt_num_steps,batch_size,num_neighbors_fetch,merging_eps,seed,task_suite_name,task_id,success_rate,num_trials,use_lora,action_expert_only
+0.00025,20,5,256,6,0.25,2,libero_90,0,0.32,50,False,True
+0.00025,20,5,256,6,1.0,1,libero_90,0,0.88,50,False,True
+0.00025,20,5,256,6,0.5,2,libero_90,0,0.34,50,False,True
+0.00025,20,5,256,6,0.75,1,libero_90,0,0.36,50,False,True
+0.00025,20,5,256,6,0.5,1,libero_90,0,0.28,50,False,True
+0.00025,20,5,256,6,0.25,1,libero_90,0,0.22,50,False,True
+0.00025,20,5,256,6,0.0,1,libero_90,0,0.16,50,False,True

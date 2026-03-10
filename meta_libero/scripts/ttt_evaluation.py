@@ -45,8 +45,6 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 import numpy as np
-import jax.numpy as jnp
-import jax
 
 from openpi.training import data_loader as _data_loader  # type: ignore
 import openpi.models.model as _model  # type: ignore
@@ -55,7 +53,9 @@ import openpi.shared.download as download  # type: ignore
 from huggingface_hub import HfApi  # type: ignore
 
 from meta_libero.src.nn_fetcher import NearestNeighborFetcher  # type: ignore
-from meta_libero.src.dataset import override_create_torch_dataset  # type: ignore
+from meta_libero.src.dataset import (  # type: ignore
+    override_create_torch_dataset,
+)
 from meta_libero.src.ttt import (  # type: ignore
     create_policy,
     run_evaluation_ttt,
@@ -102,7 +102,8 @@ def _setup_logging() -> None:
 
 def _prepare_ttt_dataset(
     config: _config.TrainConfig,
-    dataset_to_use: str = "libero_10"
+    dataset_to_use: str = "libero_10",
+    mirror_data: bool = False,
 ) -> tuple[Any, _config.TrainConfig]:
 
     if dataset_to_use == "libero_10":
@@ -111,7 +112,7 @@ def _prepare_ttt_dataset(
         assert dataset_to_use == "libero_90"
         repo_id = "antoniomari/libero_90"
 
-    with override_create_torch_dataset(repo_id=repo_id):
+    with override_create_torch_dataset(repo_id=repo_id, mirror_data=mirror_data):
         dataloader = _data_loader.create_data_loader(
             config,
             sharding=None,
@@ -182,14 +183,29 @@ def _init_nn_fetcher(model: _model.BaseModel, dataset_to_use: str = "libero_10")
     return nn_fetcher
 
 
-def _hyperparams_subfolder(ttt_cfg: TTTConfig, eval_cfg: EvalConfig) -> str:
+def _hyperparams_subfolder(
+    ttt_cfg: TTTConfig,
+    eval_cfg: EvalConfig,
+    num_neighbors_fetch: int,
+    meta_update: str,
+    merging_eps: float | None = None,
+) -> str:
     """Build a filesystem-safe subfolder name from TTT hyperparameters."""
     lr_str = f"{ttt_cfg.learning_rate:.2e}".replace("-0", "-").replace("+0", "")
 
     if ttt_cfg.noise_ttt:
         return f"noise{lr_str}_freq{ttt_cfg.ttt_frequency}_steps{ttt_cfg.ttt_num_steps}_seed{eval_cfg.seed}"
     else:
-        return f"lr{lr_str}_freq{ttt_cfg.ttt_frequency}_steps{ttt_cfg.ttt_num_steps}_k{ttt_cfg.k}_seed{eval_cfg.seed}"
+        eps_part = ""
+        if meta_update == "tt_reptile":
+            if merging_eps is None:
+                raise ValueError("merging_eps must be provided for tt_reptile path naming")
+            eps_str = f"{merging_eps:g}"
+            eps_part = f"_eps{eps_str}"
+        return (
+            f"lr{lr_str}_freq{ttt_cfg.ttt_frequency}_steps{ttt_cfg.ttt_num_steps}"
+            f"_k{ttt_cfg.k}_nn{num_neighbors_fetch}{eps_part}_seed{eval_cfg.seed}"
+        )
 
 
 def _ensure_results_paths(
@@ -197,17 +213,31 @@ def _ensure_results_paths(
     ttt_cfg: TTTConfig,
     model_cfg: ModelConfig,
     dataset_to_use: str,
+    num_neighbors_fetch: int,
+    meta_update: str,
+    no_reset: bool = False,
+    mirror_data: bool = False,
+    merging_eps: float | None = None,
 ) -> tuple[Path, Path, Path, Path, Path]:
     """Create results directory tree and return (summary_csv, run_dir, losses_pdf, actions_pdf, video_dir)."""
-    main_dir = "ttt_base_model" if model_cfg.use_base_model else "ttt"
+    root_dir = "ttt_new_mirrored" if mirror_data else "ttt_new"
+    if model_cfg.use_base_model:
+        root_dir += "_base_model"
+    if no_reset:
+        root_dir += "_no_reset"
+    main_dir = root_dir
 
-    if dataset_to_use == "libero_90":
-        main_dir += "/dataset_libero_90"
-    else:
-        main_dir += "/dataset_libero_10"
+    dataset_dir = "dataset_libero_90" if dataset_to_use == "libero_90" else "dataset_libero_10"
+    mode_suffix = {
+        "reset": "reset",
+        "continual_ttt": "continual",
+        "tt_reptile": "reptile",
+    }.get(meta_update)
+    if mode_suffix is None:
+        raise ValueError(f"Unknown meta_update mode for results path: {meta_update}")
+    dataset_dir += f"_{mode_suffix}"
 
-    if not ttt_cfg.reset_policy:
-        main_dir += "_no_reset_policy"
+    main_dir += f"/{dataset_dir}"
 
     if model_cfg.use_lora:
         base_dir = _results_root() / main_dir / "lora"
@@ -217,7 +247,13 @@ def _ensure_results_paths(
         base_dir = _results_root() / main_dir
 
     task_dir = base_dir / f"{eval_cfg.task_suite_name}_task_{eval_cfg.task_id}"
-    hyper_sub = _hyperparams_subfolder(ttt_cfg, eval_cfg)
+    hyper_sub = _hyperparams_subfolder(
+        ttt_cfg=ttt_cfg,
+        eval_cfg=eval_cfg,
+        num_neighbors_fetch=num_neighbors_fetch,
+        meta_update=meta_update,
+        merging_eps=merging_eps,
+    )
     run_dir = task_dir / hyper_sub
     run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -234,6 +270,8 @@ def _append_summary_csv_row(
     eval_cfg: EvalConfig,
     model_cfg: ModelConfig,
     batch_size: int | None,
+    num_neighbors_fetch: int,
+    merging_eps: float | None,
     success_rate: float,
 ) -> None:
     header = [
@@ -241,6 +279,8 @@ def _append_summary_csv_row(
         "ttt_frequency",
         "ttt_num_steps",
         "batch_size",
+        "num_neighbors_fetch",
+        "merging_eps",
         "seed",
         "task_suite_name",
         "task_id",
@@ -259,6 +299,8 @@ def _append_summary_csv_row(
             ttt_cfg.ttt_frequency,
             ttt_cfg.ttt_num_steps,
             batch_size,
+            num_neighbors_fetch,
+            merging_eps if merging_eps is not None else "",
             eval_cfg.seed,
             eval_cfg.task_suite_name,
             eval_cfg.task_id,
@@ -347,15 +389,39 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=None, help="Learning rate for TTT")
     parser.add_argument("--ttt_frequency", type=int, default=None, help="Perform TTT every N steps during rollout")
     parser.add_argument("--ttt_num_steps", type=int, default=None, help="Number of gradient steps per TTT update")
-    parser.add_argument("--ttt_k", type=int, default=None, help="Number of nearest neighbors to retrieve")
+    parser.add_argument("--ttt_k", type=int, default=None, help="TTT minibatch size used by the neighbors data loader")
+    parser.add_argument(
+        "--num_neighbors_fetch",
+        type=int,
+        default=None,
+        help="Number of neighbors to fetch from retrieval for each TTT update. If unset, defaults to --ttt_k.",
+    )
     parser.add_argument("--max_ttt_step", type=int, default=None, help="Maximum step to perform TTT")
-    parser.add_argument("--no-reset-policy", action="store_true", default=None, help="Do not reset policy between episodes")
+    parser.add_argument(
+        "--meta_update",
+        type=str,
+        choices=["reset", "continual_ttt", "tt_reptile"],
+        default="reset",
+        help="Meta-update strategy: reset (default), continual_ttt, or tt_reptile.",
+    )
+    parser.add_argument(
+        "--no_reset",
+        action="store_true",
+        default=False,
+        help="If set, do not reset policy/model across episodes.",
+    )
     parser.add_argument("--noise-ttt", action="store_true", default=None, help="Perform TTT with noise perturbation")
+    parser.add_argument(
+        "--merging_eps",
+        type=float,
+        default=None,
+        help="If set, blend updated policy parameters with original model after each TTT update.",
+    )
     parser.add_argument("--libero-90-dataset", action="store_true", default=None, help="Use LIBERO 90 dataset")
     parser.add_argument(
         "--num_samples",
         type=int,
-        default=10,
+        default=1,
         help="Number of noise samples used when generating action chunks for TTT logging/plots. "
         "If > 1, batched inference is used automatically.",
     )
@@ -365,6 +431,12 @@ def main() -> None:
         default=False,
         help="Enable expensive per-step auxiliary denoising-loss logging.",
     )
+    parser.add_argument(
+        "--no-mirror-data",
+        action="store_true",
+        default=False,
+        help="Disable mirrored dataloader transform.",
+    )
 
     args = parser.parse_args()
 
@@ -373,6 +445,15 @@ def main() -> None:
     ttt_cfg = exp.ttt
     eval_cfg = exp.eval
     model_cfg = exp.model
+    num_neighbors_fetch = args.num_neighbors_fetch if args.num_neighbors_fetch is not None else ttt_cfg.k
+    meta_update = args.meta_update
+    no_reset = args.no_reset
+    mirror_data = not args.no_mirror_data
+
+    if meta_update == "tt_reptile" and args.merging_eps is None:
+        raise ValueError("--merging_eps must be provided when --meta_update tt_reptile")
+    if meta_update != "tt_reptile" and args.merging_eps is not None:
+        raise ValueError("--merging_eps can only be used with --meta_update tt_reptile")
 
     _setup_logging()
     CHECKPOINT_DIR = _checkpoint_dir()
@@ -385,6 +466,10 @@ def main() -> None:
     print(f"Num trials : {eval_cfg.num_trials}")
     print(f"LR: {ttt_cfg.learning_rate}, TTT frequency: {ttt_cfg.ttt_frequency}, "
           f"TTT steps: {ttt_cfg.ttt_num_steps}, k: {ttt_cfg.k}")
+    print(f"Num neighbors fetched per update: {num_neighbors_fetch}")
+    print(f"Meta update mode: {meta_update}")
+    print(f"No reset across episodes: {no_reset}")
+    print(f"Mirror dataloader data: {mirror_data}")
     print(f"Seed       : {eval_cfg.seed}")
     if args.config:
         print(f"Config     : {args.config}")
@@ -402,7 +487,11 @@ def main() -> None:
     _hf_preflight_check(dataset_to_use)
 
     # ---- Prepare dataset + NN fetcher -------------------------------------
-    dataset, config = _prepare_ttt_dataset(config, dataset_to_use=dataset_to_use)
+    dataset, config = _prepare_ttt_dataset(
+        config,
+        dataset_to_use=dataset_to_use,
+        mirror_data=mirror_data,
+    )
     print(f"TTT dataset size: {len(dataset)} samples")
 
     nn_fetcher = _init_nn_fetcher(model, dataset_to_use=dataset_to_use)
@@ -415,7 +504,15 @@ def main() -> None:
 
     # ---- Results paths ----------------------------------------------------
     summary_csv_path, run_dir, losses_pdf, actions_pdf, video_out_path = _ensure_results_paths(
-        eval_cfg, ttt_cfg, model_cfg, dataset_to_use,
+        eval_cfg,
+        ttt_cfg,
+        model_cfg,
+        dataset_to_use,
+        num_neighbors_fetch,
+        meta_update,
+        no_reset,
+        mirror_data,
+        args.merging_eps,
     )
 
     # ---- Save the resolved config for reproducibility ---------------------
@@ -454,11 +551,14 @@ def main() -> None:
             ttt_frequency=ttt_cfg.ttt_frequency,
             learning_rate=ttt_cfg.learning_rate,
             ttt_k=ttt_cfg.k,
+            num_neighbors_fetch=num_neighbors_fetch,
             ttt_use_modalities=ttt_cfg.use_modalities or ["image1", "image2", "text"],
-            reset_policy=ttt_cfg.reset_policy,
+            meta_update=meta_update,
+            no_reset=no_reset,
             max_ttt_step=ttt_cfg.ttt_max_step,
             num_samples=args.num_samples,
             debug_metrics=args.debug_metrics,
+            merging_eps=args.merging_eps,
         )
 
     print(f"\nSuccess rate: {success_rate * 100:.1f}%")
@@ -471,6 +571,8 @@ def main() -> None:
         eval_cfg=eval_cfg,
         model_cfg=model_cfg,
         batch_size=getattr(config, "batch_size", None),
+        num_neighbors_fetch=num_neighbors_fetch,
+        merging_eps=args.merging_eps,
         success_rate=success_rate,
     )
 

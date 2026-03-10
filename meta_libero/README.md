@@ -97,10 +97,22 @@ sbatch /cluster/home/anmari/meta_vlas/meta_libero/jobs/ttt.sh
 sbatch /cluster/home/anmari/meta_vlas/meta_libero/jobs/ttt.sh
 ```
 
-- Run a single TTT command directly in an interactive job (no `sbatch`):
+- Run a single TTT command directly in an interactive job (no `sbatch`) with `meta_update=reset` (default):
 
 ```bash
-python meta_libero/scripts/ttt_evaluation.py --task_suite_name libero_90 --task_id 0 --num_trials 50 --lr 2.5e-4 --ttt_frequency 20 --ttt_num_steps 5 --ttt_k 6 --seed 1 --use-lora --libero-90-dataset --num_samples 4
+python meta_libero/scripts/ttt_evaluation.py --task_suite_name libero_90 --task_id 0 --num_trials 50 --lr 2.5e-4 --ttt_frequency 20 --ttt_num_steps 5 --ttt_k 6 --num_neighbors_fetch 32 --meta_update reset --seed 1 --use-lora --libero-90-dataset --save-video
+```
+
+- Run TTT with `meta_update=continual_ttt` (continual adaptation, no per-episode reset):
+
+```bash
+python meta_libero/scripts/ttt_evaluation.py --task_suite_name libero_90 --task_id 0 --num_trials 50 --lr 2.5e-4 --ttt_frequency 20 --ttt_num_steps 5 --ttt_k 6 --num_neighbors_fetch 32 --meta_update continual_ttt --seed 1 --use-lora --libero-90-dataset --save-video
+```
+
+- Run TTT with `meta_update=tt_reptile` (model merging enabled via `--merging_eps`):
+
+```bash
+python meta_libero/scripts/ttt_evaluation.py --task_suite_name libero_90 --task_id 0 --num_trials 50 --lr 2.5e-4 --ttt_frequency 20 --ttt_num_steps 5 --ttt_k 6 --num_neighbors_fetch 32 --meta_update tt_reptile --merging_eps 0.75 --seed 1 --use-lora --libero-90-dataset --save-video
 ```
 
 ### Fine-tuning (`finetune_single_task.py`)
