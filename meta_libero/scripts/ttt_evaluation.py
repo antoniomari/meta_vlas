@@ -104,6 +104,8 @@ def _prepare_ttt_dataset(
     config: _config.TrainConfig,
     dataset_to_use: str = "libero_10",
     mirror_data: bool = False,
+    task_id: int | None = None,
+    single_episode: bool = False,
 ) -> tuple[Any, _config.TrainConfig]:
 
     if dataset_to_use == "libero_10":
@@ -112,9 +114,18 @@ def _prepare_ttt_dataset(
         assert dataset_to_use == "libero_90"
         repo_id = "antoniomari/libero_90"
 
-    with override_create_torch_dataset(repo_id=repo_id, mirror_data=mirror_data):
+    # In single-episode mode, keep initial dataset loader batch small to avoid
+    # empty/invalid loader behavior when episode length < default batch size.
+    loader_config = dataclasses.replace(config, batch_size=1) if single_episode else config
+
+    with override_create_torch_dataset(
+        repo_id=repo_id,
+        task_id=task_id,
+        mirror_data=mirror_data,
+        single_episode=single_episode,
+    ):
         dataloader = _data_loader.create_data_loader(
-            config,
+            loader_config,
             sharding=None,
             shuffle=False,
         )
@@ -437,6 +448,12 @@ def main() -> None:
         default=False,
         help="Disable mirrored dataloader transform.",
     )
+    parser.add_argument(
+        "--single-episode",
+        action="store_true",
+        default=False,
+        help="Use only one mapped episode for the selected task (see SINGLE_EPISODE_TASK_TO_EPISODE_INDEX).",
+    )
 
     args = parser.parse_args()
 
@@ -449,6 +466,7 @@ def main() -> None:
     meta_update = args.meta_update
     no_reset = args.no_reset
     mirror_data = not args.no_mirror_data
+    single_episode = args.single_episode
 
     if meta_update == "tt_reptile" and args.merging_eps is None:
         raise ValueError("--merging_eps must be provided when --meta_update tt_reptile")
@@ -470,6 +488,7 @@ def main() -> None:
     print(f"Meta update mode: {meta_update}")
     print(f"No reset across episodes: {no_reset}")
     print(f"Mirror dataloader data: {mirror_data}")
+    print(f"Single-episode mode: {single_episode}")
     print(f"Seed       : {eval_cfg.seed}")
     if args.config:
         print(f"Config     : {args.config}")
@@ -491,6 +510,8 @@ def main() -> None:
         config,
         dataset_to_use=dataset_to_use,
         mirror_data=mirror_data,
+        task_id=eval_cfg.task_id,
+        single_episode=single_episode,
     )
     print(f"TTT dataset size: {len(dataset)} samples")
 
@@ -558,6 +579,7 @@ def main() -> None:
             max_ttt_step=ttt_cfg.ttt_max_step,
             num_samples=args.num_samples,
             debug_metrics=args.debug_metrics,
+            plot_observations=args.debug_metrics,
             merging_eps=args.merging_eps,
         )
 

@@ -156,6 +156,34 @@ squeue -u $USER
 ls /cluster/home/anmari/meta_vlas/meta_libero/logs
 ```
 
+### Interactive Evaluation Web UI (`eval_ui_server.py`)
+
+A local web UI for interactive LIBERO-90 evaluation: select a task, load the environment, optionally edit the task instruction (prompt), and run a single-episode rollout with Play/Pause/Reset controls.
+
+**Prerequisites:**
+
+```bash
+pip install fastapi uvicorn
+```
+
+**Run the server:**
+
+```bash
+cd /cluster/home/anmari/meta_vlas
+python meta_libero/scripts/eval_ui_server.py --host 0.0.0.0 --port 8765
+```
+
+Open in any browser: **http://localhost:8765** (or `http://<machine-ip>:8765` for remote access).
+
+**Usage:**
+
+1. Select a task from the dropdown (all 90 LIBERO-90 tasks).
+2. Optionally edit the task instruction (defaults to the task’s instruction).
+3. Click **Load environment**.
+4. Use **Play** for continuous rollout, **Pause** to stop, **Step** for single steps, **Reset** to restart the episode.
+
+The UI reuses the same policy inference and environment stepping logic as `ttt_evaluation.py` (no TTT adaptation).
+
 ## 6) Results folder structure
 
 ### TTT results
@@ -206,6 +234,8 @@ Recommended mental model:
   - `ttt_evaluation.py`: TTT evaluation loop
   - `finetune_single_task.py`: single-task fine-tuning + evaluation
   - `eval_tasks.py`: task evaluation helper entrypoint
+  - `eval_ui_server.py`: interactive web UI server for LIBERO-90 evaluation
+  - `eval_ui.html`: frontend for the evaluation UI
 - `meta_libero/jobs/`
   - SLURM launchers
   - `send_jobs.sh`: TTT sweeps

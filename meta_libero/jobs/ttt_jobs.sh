@@ -31,6 +31,7 @@ SAVE_VIDEO="--save-video"           # Set to "" to disable
 USE_BASE_MODEL=""                   # Set to "--use-base-model" to enable
 NO_RESET="--no_reset"                         # Set to "--no_reset" to disable reset across episodes
 NO_MIRROR="--no-mirror-data"                        # Set to "--no-mirror-data" to disable mirrored dataloader transform
+SINGLE_EPISODE=""                   # Set to "--single-episode" to run on mapped single episode
 
 # ! Important: Use noise injection instead of TTT
 NOISE_TTT=""             # Set to "" to disable
@@ -41,7 +42,7 @@ DATASET_TO_USE="--libero-90-dataset"  # Set to "--libero_90_dataset" to use libe
 TIME="24:00:00"
 MEM="64G"
 
-# For interactive job: srun --time=4:0:0 --mem-per-cpu=32G --gpus= pro_6000:1--pty bash -l
+# For interactive job: srun --time=4:0:0 --mem-per-cpu=32G --gpus= pro_6000:1 --pty bash -l
 # GPUs available: v100:1, a100-pcie-40gb:1, a100_80gb:1, pro_6000:1
 GPU="pro_6000:1"
 
@@ -121,7 +122,8 @@ python meta_libero/scripts/ttt_evaluation.py \
     ${USE_BASE_MODEL} \
     ${NOISE_TTT} \
     ${DATASET_TO_USE} \
-    ${NO_MIRROR}
+    ${NO_MIRROR} \
+    ${SINGLE_EPISODE}
 EOF
 
                                 job_count=$((job_count + 1))

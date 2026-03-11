@@ -26,6 +26,12 @@ LIBERO_90_TASK_IDS_MAPPING = {
     0: 55,
 }
 
+# Map simulator task_id -> episode_index to use when single-episode mode is enabled.
+# Populate this as needed (kept empty by default).
+SINGLE_EPISODE_TASK_TO_EPISODE_INDEX: dict[int, int] = {
+    0: 98
+}
+
 
 def _build_task_indices_map(dataset: Dataset) -> dict[int, list[int]]:
     """Build a map from task_id/task_index to dataset sample indices."""
@@ -74,11 +80,28 @@ class FilteredDataset(Dataset):
             self.indices = _build_task_indices_map(dataset).get(int(task_index), [])
             print(f"Filtered dataset (uncached): {len(self.indices)} / {len(dataset)} samples")
 
+        if episode_index is not None:
+            self.indices = self._filter_indices_by_episode(self.indices, int(episode_index))
+            print(f"Episode-filtered: {len(self.indices)} samples for episode_index={episode_index}")
+
     def __len__(self):
         return len(self.indices)
 
     def __getitem__(self, idx):
         return self.dataset[self.indices[idx]]
+
+    def _filter_indices_by_episode(self, indices: list[int], episode_index: int) -> list[int]:
+        """Filter physical dataset indices by episode index."""
+        if hasattr(self.dataset, "hf_dataset") and "episode_index" in self.dataset.hf_dataset.column_names:
+            episode_col = self.dataset.hf_dataset["episode_index"]
+            return [i for i in indices if int(episode_col[i]) == episode_index]
+
+        filtered: list[int] = []
+        for i in indices:
+            sample = self.dataset[i]
+            if "episode_index" in sample and int(sample["episode_index"]) == episode_index:
+                filtered.append(i)
+        return filtered
 
 
 @contextlib.contextmanager
@@ -87,6 +110,7 @@ def override_create_torch_dataset(
     task_id: int | None = None,
     load_in_memory: bool = False,
     mirror_data: bool = True,
+    single_episode: bool = False,
 ):
     """Temporarily override OpenPI create_torch_dataset with LIBERO-aware one."""
     original = _data_loader.create_torch_dataset
@@ -116,12 +140,18 @@ def override_create_torch_dataset(
 
         if task_id is not None:
             if repo_id == "antoniomari/libero_90":
-                if task_id not in LIBERO_90_TASK_IDS_MAPPING:
-                    raise AssertionError(f"Task ID {task_id} not found in LIBERO_90_TASK_IDS_MAPPING")
-                task_id_dataset = LIBERO_90_TASK_IDS_MAPPING[task_id]
+                task_id_dataset = LIBERO_90_TASK_IDS_MAPPING.get(task_id, task_id)
             else:
                 raise NotImplementedError(f"Only supported for antoniomari/libero_90, got {repo_id}")
-            dataset = FilteredDataset(dataset, task_id_dataset, repo_id=repo)
+            episode_index = None
+            if single_episode:
+                episode_index = int(SINGLE_EPISODE_TASK_TO_EPISODE_INDEX.get(task_id, 0))
+            dataset = FilteredDataset(
+                dataset,
+                task_id_dataset,
+                repo_id=repo,
+                episode_index=episode_index,
+            )
 
         if data_config.prompt_from_task:
             dataset = TransformedDataset(dataset, [transforms.PromptFromLeRobotTask(dataset_meta.tasks)])

@@ -7,3 +7,10 @@ lr,ttt_frequency,ttt_num_steps,batch_size,num_neighbors_fetch,merging_eps,seed,t
 0.00025,20,5,32,6,0.25,2,libero_90,0,0.0,50,True,False
 0.00025,20,5,32,6,0.5,2,libero_90,0,0.04,50,True,False
 0.00025,20,5,32,6,1.0,2,libero_90,0,0.16,50,True,False
+0.00025,20,5,32,6,1.0,3,libero_90,0,0.26,50,True,False
+0.00025,20,5,32,6,0.75,3,libero_90,0,0.12,50,True,False
+0.00025,20,5,32,6,0.0,3,libero_90,0,0.16,50,True,False
+0.00025,20,5,32,6,0.0,1,libero_90,0,0.12,50,True,False
+0.00025,20,5,32,6,0.0,2,libero_90,0,0.1,50,True,False
+0.00025,20,5,32,6,0.5,3,libero_90,0,0.06,50,True,False
+0.00025,20,5,32,6,0.25,3,libero_90,0,0.0,50,True,False

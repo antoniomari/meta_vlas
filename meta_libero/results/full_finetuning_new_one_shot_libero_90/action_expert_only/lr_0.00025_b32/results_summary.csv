@@ -1,0 +1,6 @@
+lr,train_step,batch_size,seed,task_suite_name,task_id,success_rate,num_trials,use_lora,action_expert_only
+0.00025,20,32,1,libero_90,0,0.78,50,False,True
+0.00025,40,32,1,libero_90,0,1.0,50,False,True
+0.00025,60,32,1,libero_90,0,1.0,50,False,True
+0.00025,80,32,1,libero_90,0,0.98,50,False,True
+0.00025,100,32,1,libero_90,0,1.0,50,False,True

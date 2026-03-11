@@ -108,6 +108,7 @@ def _prepare_dataset(
     dataset_to_use: str = "libero_10",
     task_id: int | None = None,
     mirror_data: bool = False,
+    single_episode: bool = False,
 ) -> tuple[Any, _config.TrainConfig]:
     """Create the full LIBERO dataset (same as _prepare_ttt_dataset in ttt_evaluation.py)."""
     if dataset_to_use == "libero_10":
@@ -116,11 +117,15 @@ def _prepare_dataset(
         assert dataset_to_use == "libero_90"
         repo_id = "antoniomari/libero_90"
 
+    # In single-episode mode, keep initial dataset loader batch small to avoid
+    # empty/invalid loader behavior when episode length < default batch size.
+    loader_config = dataclasses.replace(config, batch_size=1) if single_episode else config
+
     with override_create_torch_dataset(
-        repo_id=repo_id, task_id=task_id, mirror_data=mirror_data
+        repo_id=repo_id, task_id=task_id, mirror_data=mirror_data, single_episode=single_episode
     ):
         dataloader = _data_loader.create_data_loader(
-            config, sharding=None, shuffle=False,
+            loader_config, sharding=None, shuffle=False,
         )
         dataset = dataloader._data_loader._data_loader.dataset  # type: ignore[attr-defined]
     return dataset, config
@@ -155,13 +160,17 @@ def _ensure_finetune_results(
     eval_cfg: EvalConfig,
     ft_cfg: FinetuneConfig,
     model_cfg: ModelConfig,
+    single_episode: bool = False,
+    mirror_data: bool = True,
 ) -> tuple[Path, Path, Path]:
     """Create results tree and return (summary_csv_path, base_dir, run_dir)."""
     model_suffix = "_base" if model_cfg.use_base_model else ""
     mode_subdir = "lora" if model_cfg.use_lora else ("action_expert_only" if model_cfg.action_expert_only else "full")
+    run_prefix = "full_finetuning_new_one_shot" if single_episode else "full_finetuning_new"
+    run_prefix = f"{run_prefix}_mirrored" if mirror_data else f"{run_prefix}_no_mirror"
     base_dir = (
         _results_root()
-        / f"full_finetuning_new_{eval_cfg.task_suite_name}"
+        / f"{run_prefix}_{eval_cfg.task_suite_name}"
         / mode_subdir
         / f"lr_{ft_cfg.learning_rate}{model_suffix}_b{ft_cfg.batch_size}"
     )
@@ -405,6 +414,12 @@ def main() -> None:
         default=False,
         help="Disable mirrored dataloader transform.",
     )
+    parser.add_argument(
+        "--single-episode",
+        action="store_true",
+        default=False,
+        help="Use only one mapped episode for the selected task (see SINGLE_EPISODE_TASK_TO_EPISODE_INDEX).",
+    )
 
     args = parser.parse_args()
 
@@ -452,16 +467,24 @@ def main() -> None:
         dataset_to_use=dataset_to_use,
         task_id=eval_cfg.task_id,
         mirror_data=mirror_data,
+        single_episode=args.single_episode,
     )
     print(f"Dataset size: {len(dataset)} samples")
     print(f"Mirror dataloader data: {mirror_data}")
+    print(f"Single-episode mode: {args.single_episode}")
 
     # ---- Init NN fetcher (required by run_evaluation_ttt) -----------------
     nn_fetcher = _init_nn_fetcher(model, dataset_to_use=dataset_to_use)
     print("NearestNeighborFetcher initialized")
 
     # ---- Results paths ----------------------------------------------------
-    summary_csv_path, results_dir, run_dir = _ensure_finetune_results(eval_cfg, ft_cfg, model_cfg)
+    summary_csv_path, results_dir, run_dir = _ensure_finetune_results(
+        eval_cfg,
+        ft_cfg,
+        model_cfg,
+        single_episode=args.single_episode,
+        mirror_data=mirror_data,
+    )
     video_out_path = run_dir / "videos"
     video_out_path.mkdir(parents=True, exist_ok=True)
     alignment_csv_path = run_dir / "alignment_scores.csv"
@@ -485,7 +508,10 @@ def main() -> None:
         repo_id = "antoniomari/libero_90"
 
     with override_create_torch_dataset(
-        repo_id=repo_id, task_id=eval_cfg.task_id, mirror_data=mirror_data
+        repo_id=repo_id,
+        task_id=eval_cfg.task_id,
+        mirror_data=mirror_data,
+        single_episode=args.single_episode,
     ):
         data_loader = _data_loader.create_data_loader(
             config, sharding=None, shuffle=True,

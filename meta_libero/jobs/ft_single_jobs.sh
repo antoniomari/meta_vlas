@@ -14,13 +14,13 @@ mkdir -p "${LOG_DIR}"
 
 TASK_SUITE_NAME="libero_90"
 TASK_IDS=(0)               # Task IDs to fine-tune on
-SEEDS=(2 3)                           # Seeds to iterate over
+SEEDS=(1)                           # Seeds to iterate over
 LEARNING_RATES=(2.5e-05 2.5e-04)            # Learning rates
 BATCH_SIZES=(32)                    # Batch sizes
-TOTAL_STEPS=(500)                   # Total gradient steps
-EVAL_INTERVALS=(100)                 # Evaluate every N steps
+TOTAL_STEPS=(100)                   # Total gradient steps
+EVAL_INTERVALS=(20)                 # Evaluate every N steps
 WARMUP_STEPS=(0)                 # LR warmup steps
-FINETUNE_TYPES=("lora" "full" "action_expert_only")  # possible values: "lora", "full", "action_expert_only"
+FINETUNE_TYPES=("lora" "action_expert_only")  # possible values: "lora", "full", "action_expert_only"
 
 # Fixed parameters
 NUM_TRIALS=50
@@ -29,6 +29,7 @@ USE_BASE_MODEL=""                   # Set to "--use-base-model" to enable
 SKIP_FIRST_EVAL=""                  # Set to "--skip-first-eval" to skip step-0 eval
 DATASET_TO_USE="--libero-90-dataset"                   # Set to "--libero_90_dataset" to use libero_90
 NO_MIRROR=""                           # Set to "--no-mirror-data" to disable mirrored dataloader transform
+SINGLE_EPISODE="--single-episode"                      # Set to "--single-episode" to train/eval on mapped single episode
 
 # SLURM settings
 TIME="24:00:00"
@@ -96,7 +97,8 @@ python meta_libero/scripts/finetune_single_task.py \
     ${USE_BASE_MODEL} \
     ${SKIP_FIRST_EVAL} \
     ${DATASET_TO_USE} \
-    ${NO_MIRROR}
+    ${NO_MIRROR} \
+    ${SINGLE_EPISODE}
 EOF
 
                             job_count=$((job_count + 1))

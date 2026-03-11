@@ -396,6 +396,8 @@ def train_model_on_fly(
     aux_observation: _model.Observation | None = None,
     aux_actions: _model.Actions | None = None,
     aux_num_samples: int = 10,
+    # Optional callback (step, loss) after each gradient step (e.g. for UI streaming).
+    on_step_callback: Optional[Callable[[int, float], None]] = None,
 ) -> tuple[_model.BaseModel, list[float], training_utils.TrainState]:
     """
     Train a model on the fly and return a copy of the trained model, training losses, and final train state.
@@ -616,6 +618,8 @@ def train_model_on_fly(
         loss_val = float(jax.device_get(info["loss"]))
         grad_norm = float(jax.device_get(info["grad_norm"]))
         losses.append(loss_val)  # Store loss for plotting
+        if on_step_callback is not None:
+            on_step_callback(step, loss_val)
         infos.append({"loss": loss_val, "grad_norm": grad_norm})
 
         # Optional: compute auxiliary denoising loss after each optimization step.
@@ -1480,14 +1484,15 @@ def _run_single_episode_with_adaptation(
                 adaptation_kwargs.setdefault("batch_size", ttt_k)
                 distances_np = np.asarray(distances, dtype=np.float32)
                 top_similarities = [float(v) for v in distances_np[:4].tolist()] if distances_np.size > 0 else []
-                neighbor_previews.append(
-                    {
-                        "items": _neighbors_to_preview_data(ttt_training_data, top_n=4),
-                        "top_similarities": top_similarities,
-                        "max_similarity": float(np.max(distances_np)) if distances_np.size > 0 else float("nan"),
-                        "min_similarity": float(np.min(distances_np)) if distances_np.size > 0 else float("nan"),
-                    }
-                )
+                if plot_observations:
+                    neighbor_previews.append(
+                        {
+                            "items": _neighbors_to_preview_data(ttt_training_data, top_n=4),
+                            "top_similarities": top_similarities,
+                            "max_similarity": float(np.max(distances_np)) if distances_np.size > 0 else float("nan"),
+                            "min_similarity": float(np.min(distances_np)) if distances_np.size > 0 else float("nan"),
+                        }
+                    )
 
                 trained_model, losses = adaptation_fn(
                     policy=policy,
@@ -1822,12 +1827,13 @@ def run_evaluation_with_adaptation(
             filename_prefix="test_losses",
             y_label="Test loss",
         )
-        _save_episode_neighbors_plot(
-            neighbor_previews=neighbor_previews,
-            video_out_path=VIDEO_OUT_PATH,
-            episode_idx=episode_idx,
-            done=done,
-        )
+        if plot_observations:
+            _save_episode_neighbors_plot(
+                neighbor_previews=neighbor_previews,
+                video_out_path=VIDEO_OUT_PATH,
+                episode_idx=episode_idx,
+                done=done,
+            )
         _save_rollout_video(
             save_video=save_video,
             video_out_path=VIDEO_OUT_PATH,

@@ -1,2 +1,0 @@
-lr,ttt_frequency,ttt_num_steps,batch_size,num_neighbors_fetch,seed,task_suite_name,task_id,success_rate,num_trials,use_lora,action_expert_only
-0.00025,20,5,32,32,1,libero_90,0,0.2,50,True,False
