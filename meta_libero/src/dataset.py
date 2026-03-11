@@ -24,12 +24,28 @@ _TASK_INDICES_CACHE: dict[str, dict[int, list[int]]] = {}
 
 LIBERO_90_TASK_IDS_MAPPING = {
     0: 55,
+    1: 63,
+    2: 11,
+    3: 10,
+    4: 19,
+    5: 9,
+    6: 59,
+    7: 24,
+    8: 3,
 }
 
 # Map simulator task_id -> episode_index to use when single-episode mode is enabled.
 # Populate this as needed (kept empty by default).
 SINGLE_EPISODE_TASK_TO_EPISODE_INDEX: dict[int, int] = {
-    0: 98
+    0: 98,
+    1: 129,
+    2: 260,
+    3: 12,
+    4: 23,
+    5: 254,
+    6: 118,
+    7: 28,
+    8: 4,
 }
 
 
@@ -288,7 +304,6 @@ def mirror_images_jnp(img):
     - CHW / BCHW: flip width axis `-1`
     """
     arr = jnp.asarray(img)
-    print(arr.shape)
     if arr.ndim == 4:
         # BHWC
         if arr.shape[-1] in (1, 3, 4):
