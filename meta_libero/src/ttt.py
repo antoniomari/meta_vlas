@@ -98,7 +98,7 @@ from meta_libero.src.rendering import (
     _draw_step_on_frame,
     render_image,
 )
-from meta_libero.src.dataset import FilteredDataset
+from meta_libero.src.dataset import FilteredDataset, make_pseudo_label_inference_fn
 from meta_libero.src.libero_inputs_override import (
     BatchableLiberoInputs,
     BatchableLiberoOutputs,
@@ -362,6 +362,22 @@ def init_train_state(
     )
 
 
+def _compute_validation_loss(
+    model: _model.BaseModel,
+    validation_batches: list[tuple[_model.Observation, _model.Actions]],
+    seed: int,
+) -> float:
+    """Compute mean loss over cached validation batches (no gradients, no disk I/O)."""
+    model.eval()
+    total_loss = 0.0
+    rng = jax.random.key(seed)
+    for observation, actions in validation_batches:
+        rng, step_rng = jax.random.split(rng)
+        chunked_loss = model.compute_loss(step_rng, observation, actions, train=False)
+        total_loss += float(jax.device_get(jnp.mean(chunked_loss)))
+    return total_loss / len(validation_batches) if validation_batches else 0.0
+
+
 def print_trainable_parameters(params: at.Params, trainable_filter):
     def param_count(x):
         if hasattr(x, "value"):
@@ -398,6 +414,10 @@ def train_model_on_fly(
     aux_num_samples: int = 10,
     # Optional callback (step, loss) after each gradient step (e.g. for UI streaming).
     on_step_callback: Optional[Callable[[int, float], None]] = None,
+    # Optional validation: compute loss on validation set every N steps.
+    validation_data_loader: Optional[_data_loader.DataLoader] = None,
+    validation_interval: int = 5,
+    on_validation_callback: Optional[Callable[[int, float], None]] = None,
 ) -> tuple[_model.BaseModel, list[float], training_utils.TrainState]:
     """
     Train a model on the fly and return a copy of the trained model, training losses, and final train state.
@@ -551,6 +571,13 @@ def train_model_on_fly(
     # Initialize iterator
     data_iter = iter(training_data_loader)
 
+    # Cache validation batches once to avoid re-loading from disk every validation step
+    validation_batches: list[tuple[_model.Observation, _model.Actions]] | None = None
+    if validation_data_loader is not None:
+        validation_batches = list(validation_data_loader)
+        if not validation_batches:
+            validation_batches = None
+
     # Following marco.py: no separate warmup, first training step will compile naturally
     print_memory_checkpoint("Before training loop starts", 604)
 
@@ -621,6 +648,18 @@ def train_model_on_fly(
         if on_step_callback is not None:
             on_step_callback(step, loss_val)
         infos.append({"loss": loss_val, "grad_norm": grad_norm})
+
+        # Optional: compute validation loss at step 0 and every N steps (uses cached batches, no disk I/O).
+        if (
+            validation_batches is not None
+            and on_validation_callback is not None
+            and step % validation_interval == 0
+        ):
+            val_model = nnx.merge(train_state.model_def, train_state.params)
+            val_model.eval()
+            val_loss = _compute_validation_loss(val_model, validation_batches, seed)
+            on_validation_callback(step, val_loss)
+            del val_model
 
         # Optional: compute auxiliary denoising loss after each optimization step.
         if aux_enabled:

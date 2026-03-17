@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -15,7 +16,11 @@
       --success: #22c55e;
       --muted: #71717a;
     }
-    * { box-sizing: border-box; }
+
+    * {
+      box-sizing: border-box;
+    }
+
     body {
       font-family: 'JetBrains Mono', 'SF Mono', 'Consolas', monospace;
       background: var(--bg);
@@ -24,16 +29,19 @@
       padding: 24px;
       min-height: 100vh;
     }
+
     h1 {
       font-size: 1.5rem;
       font-weight: 600;
       margin-bottom: 24px;
       color: var(--text);
     }
+
     .container {
       max-width: 1200px;
       margin: 0 auto;
     }
+
     .panel {
       background: var(--surface);
       border: 1px solid var(--border);
@@ -41,6 +49,7 @@
       padding: 20px;
       margin-bottom: 20px;
     }
+
     .panel h2 {
       font-size: 0.9rem;
       font-weight: 500;
@@ -49,23 +58,28 @@
       text-transform: uppercase;
       letter-spacing: 0.05em;
     }
+
     .row {
       display: flex;
       gap: 20px;
       flex-wrap: wrap;
       align-items: flex-start;
     }
+
     .col {
       flex: 1;
       min-width: 280px;
     }
+
     label {
       display: block;
       font-size: 0.8rem;
       color: var(--muted);
       margin-bottom: 6px;
     }
-    select, textarea {
+
+    select,
+    textarea {
       width: 100%;
       background: var(--bg);
       border: 1px solid var(--border);
@@ -75,21 +89,30 @@
       font-family: inherit;
       font-size: 0.9rem;
     }
-    select { cursor: pointer; }
+
+    select {
+      cursor: pointer;
+    }
+
     textarea {
       min-height: 80px;
       resize: vertical;
     }
-    textarea:focus, select:focus, button:focus {
+
+    textarea:focus,
+    select:focus,
+    button:focus {
       outline: none;
       border-color: var(--accent);
     }
+
     .btn-group {
       display: flex;
       gap: 10px;
       flex-wrap: wrap;
       margin-top: 16px;
     }
+
     button {
       background: var(--accent);
       color: white;
@@ -102,36 +125,57 @@
       cursor: pointer;
       transition: background 0.15s;
     }
-    button:hover { background: var(--accent-hover); }
+
+    button:hover {
+      background: var(--accent-hover);
+    }
+
     button:disabled {
       opacity: 0.5;
       cursor: not-allowed;
     }
+
     button.secondary {
       background: var(--surface);
       border: 1px solid var(--border);
       color: var(--text);
     }
-    button.secondary:hover { background: var(--border); }
-    button.danger { background: #dc2626; }
-    button.danger:hover { background: #ef4444; }
+
+    button.secondary:hover {
+      background: var(--border);
+    }
+
+    button.danger {
+      background: #dc2626;
+    }
+
+    button.danger:hover {
+      background: #ef4444;
+    }
+
     .status {
       font-size: 0.85rem;
       color: var(--muted);
       margin-top: 12px;
     }
-    .status.success { color: var(--success); }
+
+    .status.success {
+      color: var(--success);
+    }
+
     .images {
       display: flex;
       gap: 20px;
       flex-wrap: wrap;
       margin-top: 16px;
     }
+
     .img-box {
       flex: 1;
       min-width: 200px;
       max-width: 400px;
     }
+
     .img-box img {
       width: 100%;
       height: auto;
@@ -139,11 +183,13 @@
       border: 1px solid var(--border);
       background: #000;
     }
+
     .img-box .caption {
       font-size: 0.75rem;
       color: var(--muted);
       margin-top: 6px;
     }
+
     .loading {
       display: inline-block;
       width: 16px;
@@ -155,18 +201,27 @@
       vertical-align: middle;
       margin-right: 8px;
     }
-    @keyframes spin { to { transform: rotate(360deg); } }
-    .error { color: #ef4444; }
+
+    @keyframes spin {
+      to {
+        transform: rotate(360deg);
+      }
+    }
+
+    .error {
+      color: #ef4444;
+    }
 
     .finetune-panel {
       position: fixed;
       inset: 0;
-      background: rgba(0,0,0,0.7);
+      background: rgba(0, 0, 0, 0.7);
       display: flex;
       align-items: center;
       justify-content: center;
       z-index: 1000;
     }
+
     .finetune-panel-inner {
       background: var(--surface);
       border: 1px solid var(--border);
@@ -177,24 +232,35 @@
       max-height: 90vh;
       overflow-y: auto;
     }
-    .finetune-panel-inner h2 { margin: 0 0 8px 0; font-size: 1.1rem; }
+
+    .finetune-panel-inner h2 {
+      margin: 0 0 8px 0;
+      font-size: 1.1rem;
+    }
+
     .finetune-desc {
       font-size: 0.85rem;
       color: var(--muted);
       margin: 0 0 20px 0;
       line-height: 1.4;
     }
-    .finetune-form { margin-bottom: 20px; }
+
+    .finetune-form {
+      margin-bottom: 20px;
+    }
+
     .form-row {
       display: flex;
       gap: 16px;
       margin-bottom: 12px;
       flex-wrap: wrap;
     }
+
     .form-field {
       flex: 1;
       min-width: 120px;
     }
+
     .form-field input[type="number"],
     .form-field input[type="text"] {
       width: 100%;
@@ -206,10 +272,12 @@
       font-family: inherit;
       font-size: 0.9rem;
     }
+
     .form-field input:focus {
       outline: none;
       border-color: var(--accent);
     }
+
     .checkbox-label {
       display: flex;
       align-items: center;
@@ -218,7 +286,11 @@
       cursor: pointer;
       color: var(--text);
     }
-    .checkbox-label input { cursor: pointer; }
+
+    .checkbox-label input {
+      cursor: pointer;
+    }
+
     .finetune-plot-wrap {
       margin-top: 16px;
       background: var(--bg);
@@ -226,59 +298,73 @@
       padding: 12px;
       border: 1px solid var(--border);
     }
+
     .finetune-plot-wrap canvas {
       display: block;
       width: 100%;
       height: auto;
     }
+
     .alignment-plot-wrap {
       background: var(--bg);
       border-radius: 8px;
       padding: 12px;
       border: 1px solid var(--border);
     }
+
     .alignment-plot-wrap canvas {
       display: block;
       width: 100%;
       height: auto;
     }
+
     .neighbors-grid {
       display: grid;
       grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
       gap: 16px;
       margin-top: 16px;
     }
+
     .neighbor-card {
       background: var(--bg);
       border: 1px solid var(--border);
       border-radius: 8px;
       padding: 12px;
     }
+
     .neighbor-card .similarity {
       font-size: 0.85rem;
       color: var(--accent);
       margin-bottom: 8px;
       font-weight: 500;
     }
+
     .neighbor-card .imgs {
       display: flex;
       gap: 8px;
       flex-wrap: wrap;
     }
+
     .neighbor-card .img-wrap {
       flex: 1;
       min-width: 90px;
     }
+
     .neighbor-card img {
       width: 100%;
       height: auto;
       border-radius: 6px;
       border: 1px solid var(--border);
     }
-    .neighbor-card .caption { font-size: 0.75rem; color: var(--muted); margin-top: 4px; }
 
+    .neighbor-card .caption {
+      font-size: 0.75rem;
+      color: var(--muted);
+      margin-top: 4px;
+    }
   </style>
 </head>
+
 <body>
   <div class="container">
     <h1>LIBERO-90 Evaluation UI</h1>
@@ -307,7 +393,8 @@
       <h2>Simulation</h2>
       <div class="form-row" style="margin-bottom:12px;">
         <label class="checkbox-label">
-          <input type="checkbox" id="showAlignment" title="When unchecked, skips alignment computation for smoother playback (no delay every 5 steps)">
+          <input type="checkbox" id="showAlignment"
+            title="When unchecked, skips alignment computation for smoother playback (no delay every 5 steps)">
           Show alignment score
         </label>
       </div>
@@ -325,7 +412,8 @@
     <div id="neighborsPanel" class="finetune-panel" style="display:none;">
       <div class="finetune-panel-inner">
         <h2>Nearest neighbors</h2>
-        <p class="finetune-desc">Retrieve similar demonstrations from the LIBERO-90 index for the current observation.</p>
+        <p class="finetune-desc">Retrieve similar demonstrations from the LIBERO-90 index for the current observation.
+        </p>
         <div class="form-row">
           <label class="checkbox-label">
             <input type="checkbox" id="neighborsFilterByTask">
@@ -344,26 +432,33 @@
     <div id="finetunePanel" class="finetune-panel" style="display:none;">
       <div class="finetune-panel-inner">
         <h2>Fine-tune on single demonstration</h2>
-        <p class="finetune-desc">Fine-tune the model on one demo from the current task. After training, close this panel and run simulation with the updated model.</p>
+        <div id="finetuneTaskSummary" class="form-row" style="margin-bottom:16px;padding:12px;background:var(--bg);border-radius:8px;border:1px solid var(--border);">
+          <div style="font-size:0.9rem;">
+            <div style="margin-bottom:6px;"><strong>Fine-tune on:</strong> <span id="finetuneTrainTaskDisplay" style="color:var(--accent);">—</span></div>
+            <div id="finetuneValidateTaskRow" style="display:none;"><strong>Validate on:</strong> <span id="finetuneValidateTaskDisplay" style="color:#dc2626;">—</span></div>
+          </div>
+        </div>
+        <p class="finetune-desc">Fine-tune the model on one demo from the current task. After training, close this panel
+          and run simulation with the updated model.</p>
         <div class="finetune-form">
           <div class="form-row">
             <div class="form-field">
               <label for="finetuneLr">Learning rate</label>
-              <input type="text" id="finetuneLr" value="2.5e-5" placeholder="e.g. 2.5e-5">
+              <input type="text" id="finetuneLr" value="2.5e-4" placeholder="e.g. 2.5e-4">
             </div>
             <div class="form-field">
               <label for="finetuneSteps">Number of steps</label>
-              <input type="number" id="finetuneSteps" value="100" min="1" max="10000">
+              <input type="number" id="finetuneSteps" value="20" min="1" max="10000">
             </div>
           </div>
           <div class="form-row">
             <div class="form-field">
               <label for="finetuneBatch">Batch size</label>
-              <input type="number" id="finetuneBatch" value="8" min="1" max="64">
+              <input type="number" id="finetuneBatch" value="32" min="1" max="64">
             </div>
             <div class="form-field">
               <label for="finetuneWarmup">Warmup steps</label>
-              <input type="number" id="finetuneWarmup" value="10" min="0" max="1000">
+              <input type="number" id="finetuneWarmup" value="0" min="0" max="1000">
             </div>
           </div>
           <div class="form-row">
@@ -378,13 +473,64 @@
               Single episode only
             </label>
           </div>
+          <div class="form-row" style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border);">
+            <label class="checkbox-label">
+              <input type="checkbox" id="finetuneAugment">
+              Augment (concatenate normal + augmented samples per batch)
+            </label>
+          </div>
+          <div id="finetuneAugmentOpts" class="form-row" style="display:none; margin-left:20px;">
+            <div class="form-field">
+              <label for="finetuneAugmentTaskId">Augment option</label>
+              <select id="finetuneAugmentTaskId">
+                <option value="">do nothing (zeros)</option>
+              </select>
+            </div>
+          </div>
+          <div class="form-row" style="margin-left:20px;">
+            <label class="checkbox-label">
+              <input type="checkbox" id="finetuneTaskReg">
+              Task regularization (use reference model for pseudo-labels; requires augment + task selected above)
+            </label>
+          </div>
+          <div id="finetuneRefSelectWrap" class="form-row" style="display:none; margin-left:20px;">
+            <div class="form-field" style="flex:1;">
+              <label for="finetuneRefSelect">Reference model</label>
+              <select id="finetuneRefSelect">
+                <option value="">-- Select reference --</option>
+              </select>
+            </div>
+          </div>
+          <div class="form-row" style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border);">
+            <label class="checkbox-label">
+              <input type="checkbox" id="finetuneAddValidation">
+              Add validation set
+            </label>
+          </div>
+          <div id="finetuneValidationOpts" class="form-row" style="display:none; margin-left:20px;">
+            <div class="form-field">
+              <label for="finetuneValidationTaskId">Validation task (single trajectory; same model as training)</label>
+              <select id="finetuneValidationTaskId">
+                <option value="">-- Select task --</option>
+              </select>
+            </div>
+          </div>
+        </div>
+        <div id="finetuneRefList" class="form-row" style="margin-top:8px;padding:8px;background:var(--bg);border-radius:8px;border:1px solid var(--border);display:none;">
+          <div class="caption" style="margin-bottom:4px;">Saved references:</div>
+          <div id="finetuneRefListContent" style="font-size:0.85rem;color:var(--muted);">None</div>
         </div>
         <div class="btn-group">
+          <button id="finetuneSaveRefBtn" class="secondary" title="Save current model as reference for Task regularization. Reference is never overwritten.">Save as reference</button>
           <button id="finetuneStartBtn">Start fine-tuning</button>
           <button id="finetuneCloseBtn" class="secondary">Close</button>
         </div>
         <div id="finetuneStatus" class="status" style="margin-top:12px;"></div>
         <div id="finetunePlotWrap" class="finetune-plot-wrap" style="display:none;">
+          <div class="caption" style="margin-bottom:6px;">
+            <span style="color:#6366f1;">●</span> Train &nbsp;
+            <span style="color:#dc2626;">●</span> Validation (same model, every 5 steps)
+          </div>
           <canvas id="finetunePlot" width="600" height="200"></canvas>
         </div>
       </div>
@@ -392,19 +538,24 @@
 
     <div class="panel">
       <h2>Observation</h2>
-      <div class="instruction-display" style="margin-bottom:16px;padding:12px;background:var(--bg);border-radius:8px;border:1px solid var(--border);">
+      <div class="instruction-display"
+        style="margin-bottom:16px;padding:12px;background:var(--bg);border-radius:8px;border:1px solid var(--border);">
         <div class="caption" style="margin-bottom:6px;">Current instruction fed to model:</div>
         <div id="currentInstruction" style="font-size:0.9rem;color:var(--text);font-style:italic;">—</div>
       </div>
       <div class="images">
         <div class="img-box">
           <img id="baseImg" src="" alt="Base view" style="display:none;">
-          <div id="basePlaceholder" style="height:224px;background:var(--bg);border-radius:8px;display:flex;align-items:center;justify-content:center;color:var(--muted);">No image</div>
+          <div id="basePlaceholder"
+            style="height:224px;background:var(--bg);border-radius:8px;display:flex;align-items:center;justify-content:center;color:var(--muted);">
+            No image</div>
           <div class="caption">Base camera</div>
         </div>
         <div class="img-box">
           <img id="wristImg" src="" alt="Wrist view" style="display:none;">
-          <div id="wristPlaceholder" style="height:224px;background:var(--bg);border-radius:8px;display:flex;align-items:center;justify-content:center;color:var(--muted);">No image</div>
+          <div id="wristPlaceholder"
+            style="height:224px;background:var(--bg);border-radius:8px;display:flex;align-items:center;justify-content:center;color:var(--muted);">
+            No image</div>
           <div class="caption">Wrist camera</div>
         </div>
       </div>
@@ -664,11 +815,120 @@
     // Fine-tune panel
     let finetunePollInterval = null;
 
-    document.getElementById('finetuneBtn').addEventListener('click', () => {
+    async function updateReferenceStatus() {
+      try {
+        const r = await fetch(API + '/api/reference_status');
+        const data = await r.json();
+        const refs = data.references || [];
+        const listEl = document.getElementById('finetuneRefList');
+        const contentEl = document.getElementById('finetuneRefListContent');
+        const selectEl = document.getElementById('finetuneRefSelect');
+        if (refs.length > 0) {
+          listEl.style.display = 'block';
+          contentEl.innerHTML = refs.map((x) => `• ${x.name}`).join('<br>');
+          selectEl.innerHTML = '<option value="">-- Select reference --</option>' +
+            refs.map((x) => `<option value="${x.id}">${x.name}</option>`).join('');
+        } else {
+          listEl.style.display = 'none';
+          contentEl.textContent = 'None';
+          selectEl.innerHTML = '<option value="">-- Select reference --</option>';
+        }
+      } catch (e) {
+        console.error('Reference status:', e);
+      }
+    }
+
+    function populateAugmentTaskDropdown() {
+      const sel = document.getElementById('finetuneAugmentTaskId');
+      sel.innerHTML = '<option value="">do nothing (zeros)</option>';
+      tasks.forEach((t, i) => {
+        const opt = document.createElement('option');
+        opt.value = i;
+        opt.textContent = `Task ${i}: ${t.instruction.substring(0, 40)}${t.instruction.length > 40 ? '...' : ''}`;
+        sel.appendChild(opt);
+      });
+    }
+
+    function populateValidationTaskDropdown() {
+      const sel = document.getElementById('finetuneValidationTaskId');
+      sel.innerHTML = '<option value="">-- Select task --</option>';
+      tasks.forEach((t, i) => {
+        const opt = document.createElement('option');
+        opt.value = i;
+        opt.textContent = `Task ${i}: ${t.instruction.substring(0, 40)}${t.instruction.length > 40 ? '...' : ''}`;
+        sel.appendChild(opt);
+      });
+    }
+
+    function updateFinetuneTaskSummary() {
+      const trainEl = document.getElementById('finetuneTrainTaskDisplay');
+      const validateRow = document.getElementById('finetuneValidateTaskRow');
+      const validateEl = document.getElementById('finetuneValidateTaskDisplay');
+      fetch(API + '/api/state')
+        .then((r) => r.json())
+        .then((data) => {
+          const taskId = data.task_id;
+          if (taskId != null && tasks[taskId]) {
+            trainEl.textContent = `Task ${taskId}: ${tasks[taskId].instruction}`;
+          } else {
+            trainEl.textContent = taskId != null ? `Task ${taskId}` : 'Load a task first';
+          }
+        })
+        .catch(() => { trainEl.textContent = '—'; });
+      const addValidation = document.getElementById('finetuneAddValidation').checked;
+      const valIdRaw = document.getElementById('finetuneValidationTaskId').value;
+      const valId = valIdRaw !== '' ? parseInt(valIdRaw, 10) : null;
+      if (addValidation && valId != null && tasks[valId]) {
+        validateRow.style.display = 'block';
+        validateEl.textContent = `Task ${valId}: ${tasks[valId].instruction}`;
+      } else {
+        validateRow.style.display = 'none';
+      }
+    }
+
+    document.getElementById('finetuneBtn').addEventListener('click', async () => {
       document.getElementById('finetunePanel').style.display = 'flex';
       document.getElementById('finetunePlotWrap').style.display = 'none';
       document.getElementById('finetuneStatus').textContent = '';
       document.getElementById('finetuneStatus').className = 'status';
+      await updateReferenceStatus();
+      populateAugmentTaskDropdown();
+      populateValidationTaskDropdown();
+      updateFinetuneTaskSummary();
+      document.getElementById('finetuneAugmentOpts').style.display =
+        document.getElementById('finetuneAugment').checked ? 'flex' : 'none';
+      document.getElementById('finetuneRefSelectWrap').style.display =
+        document.getElementById('finetuneTaskReg').checked ? 'flex' : 'none';
+      document.getElementById('finetuneValidationOpts').style.display =
+        document.getElementById('finetuneAddValidation').checked ? 'flex' : 'none';
+    });
+    document.getElementById('finetuneAugment').addEventListener('change', () => {
+      document.getElementById('finetuneAugmentOpts').style.display =
+        document.getElementById('finetuneAugment').checked ? 'flex' : 'none';
+    });
+    document.getElementById('finetuneTaskReg').addEventListener('change', () => {
+      document.getElementById('finetuneRefSelectWrap').style.display =
+        document.getElementById('finetuneTaskReg').checked ? 'flex' : 'none';
+    });
+    document.getElementById('finetuneAddValidation').addEventListener('change', () => {
+      document.getElementById('finetuneValidationOpts').style.display =
+        document.getElementById('finetuneAddValidation').checked ? 'flex' : 'none';
+      updateFinetuneTaskSummary();
+    });
+    document.getElementById('finetuneValidationTaskId').addEventListener('change', updateFinetuneTaskSummary);
+    document.getElementById('finetuneSaveRefBtn').addEventListener('click', async () => {
+      try {
+        const r = await fetch(API + '/api/save_as_reference', { method: 'POST' });
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.detail || 'Save failed');
+        document.getElementById('finetuneStatus').textContent =
+          data.reference_name ? `Saved: ${data.reference_name}` : (data.message || 'Reference saved.');
+        document.getElementById('finetuneStatus').className = 'status success';
+        await updateReferenceStatus();
+      } catch (e) {
+        document.getElementById('finetuneStatus').textContent = 'Error: ' + e.message;
+        document.getElementById('finetuneStatus').className = 'status error';
+      }
     });
 
     function closeFinetunePanel() {
@@ -740,16 +1000,22 @@
       }
     });
 
-    function drawLossPlot(losses) {
+    function drawLossPlot(losses, validationLosses) {
       const canvas = document.getElementById('finetunePlot');
       const ctx = canvas.getContext('2d');
       const w = canvas.width;
       const h = canvas.height;
       ctx.fillStyle = '#0f0f12';
       ctx.fillRect(0, 0, w, h);
-      if (losses.length === 0) return;
-      const minL = Math.min(...losses);
-      const maxL = Math.max(...losses);
+      const allLosses = [...losses];
+      if (validationLosses && validationLosses.length > 0) {
+        validationLosses.forEach((v) => allLosses.push(v.loss));
+      }
+      if (allLosses.length === 0) return;
+      const valSteps = (validationLosses || []).map((v) => v.step);
+      const maxStep = Math.max(losses.length - 1, ...(valSteps.length ? valSteps : [0]));
+      const minL = Math.min(...allLosses);
+      const maxL = Math.max(...allLosses);
       const marginLeft = 36;
       const marginRight = 8;
       const marginTop = 8;
@@ -757,9 +1023,9 @@
       const plotW = w - marginLeft - marginRight;
       const plotH = h - marginTop - marginBottom;
       const rangeL = maxL - minL || 1;
-      const n = losses.length;
+      const rangeStep = maxStep || 1;
       const scaleY = (v) => marginTop + plotH - ((v - minL) / rangeL) * plotH;
-      const scaleX = (i) => marginLeft + (n > 1 ? i / (n - 1) : 0.5) * plotW;
+      const scaleX = (step) => marginLeft + (step / rangeStep) * plotW;
       ctx.strokeStyle = '#71717a';
       ctx.lineWidth = 1;
       ctx.strokeRect(marginLeft, marginTop, plotW, plotH);
@@ -773,24 +1039,44 @@
         ctx.fillText(v.toFixed(3), marginLeft - 6, y + 4);
       }
       ctx.textAlign = 'center';
-      const xTicks = Math.min(6, Math.max(2, n));
+      const xTicks = Math.min(6, Math.max(2, Math.ceil(rangeStep)));
       for (let i = 0; i <= xTicks; i++) {
-        const step = Math.round((i / xTicks) * (n - 1));
+        const step = Math.round((i / xTicks) * rangeStep);
         const x = scaleX(step);
         ctx.fillText(String(step), x, h - 6);
       }
+      // Training loss (blue)
       ctx.strokeStyle = '#6366f1';
       ctx.lineWidth = 2;
+      const n = losses.length;
       if (n >= 2) {
         ctx.beginPath();
         ctx.moveTo(scaleX(0), scaleY(losses[0]));
         for (let i = 1; i < n; i++) ctx.lineTo(scaleX(i), scaleY(losses[i]));
         ctx.stroke();
-      } else {
+      } else if (n === 1) {
         ctx.fillStyle = '#6366f1';
         ctx.beginPath();
         ctx.arc(scaleX(0), scaleY(losses[0]), 4, 0, 2 * Math.PI);
         ctx.fill();
+      }
+      // Validation loss (red)
+      if (validationLosses && validationLosses.length > 0) {
+        ctx.strokeStyle = '#dc2626';
+        ctx.lineWidth = 2;
+        if (validationLosses.length >= 2) {
+          ctx.beginPath();
+          ctx.moveTo(scaleX(validationLosses[0].step), scaleY(validationLosses[0].loss));
+          for (let i = 1; i < validationLosses.length; i++) {
+            ctx.lineTo(scaleX(validationLosses[i].step), scaleY(validationLosses[i].loss));
+          }
+          ctx.stroke();
+        } else {
+          ctx.fillStyle = '#dc2626';
+          ctx.beginPath();
+          ctx.arc(scaleX(validationLosses[0].step), scaleY(validationLosses[0].loss), 4, 0, 2 * Math.PI);
+          ctx.fill();
+        }
       }
     }
 
@@ -806,7 +1092,7 @@
           statusEl.className = 'status';
           if (data.losses && data.losses.length > 0) {
             plotWrap.style.display = 'block';
-            drawLossPlot(data.losses);
+            drawLossPlot(data.losses, data.validation_losses || []);
           }
         } else if (data.status === 'done') {
           if (finetunePollInterval) {
@@ -817,7 +1103,7 @@
           statusEl.textContent = `Done. ${data.losses.length} steps. You can close this panel and run simulation with the finetuned model.`;
           statusEl.className = 'status success';
           plotWrap.style.display = 'block';
-          drawLossPlot(data.losses);
+          drawLossPlot(data.losses, data.validation_losses || []);
         } else if (data.status === 'error') {
           if (finetunePollInterval) {
             clearInterval(finetunePollInterval);
@@ -843,6 +1129,23 @@
       const batchSize = parseInt(document.getElementById('finetuneBatch').value, 10);
       const warmupSteps = parseInt(document.getElementById('finetuneWarmup').value, 10);
       const singleEp = document.getElementById('finetuneSingleEp').checked;
+      const augment = document.getElementById('finetuneAugment').checked;
+      const taskReg = document.getElementById('finetuneTaskReg').checked;
+      const augmentTaskIdRaw = document.getElementById('finetuneAugmentTaskId').value;
+      const augmentTaskId = augmentTaskIdRaw === '' ? null : parseInt(augmentTaskIdRaw, 10);
+      const referenceId = document.getElementById('finetuneRefSelect').value || null;
+      if (taskReg && !referenceId) {
+        alert('Select a reference model for Task regularization.');
+        return;
+      }
+      const addValidation = document.getElementById('finetuneAddValidation').checked;
+      const validationTaskIdRaw = document.getElementById('finetuneValidationTaskId').value;
+      const validationTaskId = addValidation && validationTaskIdRaw !== ''
+        ? parseInt(validationTaskIdRaw, 10) : null;
+      if (addValidation && validationTaskId === null) {
+        alert('Select a validation task when Add validation set is checked.');
+        return;
+      }
       const epsStr = document.getElementById('finetuneMergingEps').value.trim();
       const mergingEps = epsStr === '' ? 1.0 : parseFloat(epsStr);
       if (isNaN(mergingEps) || mergingEps < 0 || mergingEps > 1) {
@@ -866,6 +1169,12 @@
             warmup_steps: warmupSteps,
             single_episode: singleEp,
             merging_eps: mergingEps,
+            augment: augment,
+            augment_task_id: augmentTaskId,
+            task_regularization: taskReg,
+            reference_id: referenceId,
+            add_validation_set: addValidation,
+            validation_task_id: validationTaskId,
           }),
         });
         const data = await r.json();
@@ -883,4 +1192,5 @@
     fetchTasks();
   </script>
 </body>
+
 </html>

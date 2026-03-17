@@ -56,7 +56,12 @@ from meta_libero.src.ttt import (
     copy_model,
     merge_model_parameters,
 )
-from meta_libero.src.dataset import override_create_torch_dataset, LIBERO_90_TASK_IDS_MAPPING
+from meta_libero.src.dataset import (
+    override_create_torch_dataset,
+    LIBERO_90_TASK_IDS_MAPPING,
+    LIBERO_90_TASK_IDS_PROMPTS,
+    make_pseudo_label_inference_fn,
+)
 from meta_libero.src.rendering import make_observation_from_simulator
 from openpi.training import data_loader as _data_loader
 
@@ -96,9 +101,15 @@ _state = {
     "seed": 42,
     "finetune_status": "idle",
     "finetune_losses": [],
+    "finetune_validation_losses": [],  # list of {"step": int, "loss": float}
     "finetune_error": None,
     "finetune_total_steps": 0,
+    # Reference models for Task regularization (never overwritten by fine-tuning)
+    # List of {id, model, policy, task_id, name}; most recent first
+    "references": [],
+    "reference_counter": 0,
 }
+MAX_REFERENCES = 5
 
 
 def _ensure_model():
@@ -263,6 +274,12 @@ class FinetuneRequest(BaseModel):
     warmup_steps: int = 10
     single_episode: bool = True
     merging_eps: float | None = 1.0  # 1.0 = keep full fine-tuned model; 0.0 = keep original; 0.5 = 50/50 blend
+    augment: bool = False  # augment each batch with (normal + augmented) samples
+    augment_task_id: int | None = None  # None = "do nothing" + zeros; int = use task prompt
+    task_regularization: bool = False  # use reference model for pseudo-labels (requires augment_task_id)
+    reference_id: str | None = None  # which saved reference to use (required when task_regularization)
+    add_validation_set: bool = False  # compute validation loss every 5 steps
+    validation_task_id: int | None = None  # task for validation (single trajectory; required when add_validation_set)
 
 
 class NeighborsRequest(BaseModel):
@@ -465,6 +482,7 @@ def _run_finetune_thread(req: FinetuneRequest):
     try:
         _state["finetune_status"] = "running"
         _state["finetune_losses"] = []
+        _state["finetune_validation_losses"] = []
         _state["finetune_error"] = None
         _state["finetune_total_steps"] = req.num_steps
         _ensure_model()
@@ -473,7 +491,32 @@ def _run_finetune_thread(req: FinetuneRequest):
             _state["finetune_error"] = "Load a task first."
             return
         task_id = _state["task_id"]
-        original_model = _state["model"]
+
+        # Task regularization: use selected reference model as base, augment with pseudo-labels
+        if req.task_regularization:
+            if not req.reference_id:
+                _state["finetune_status"] = "error"
+                _state["finetune_error"] = "Select a reference model for Task regularization."
+                return
+            ref_entry = next((r for r in _state["references"] if r["id"] == req.reference_id), None)
+            if ref_entry is None:
+                _state["finetune_status"] = "error"
+                _state["finetune_error"] = f"Reference '{req.reference_id}' not found."
+                return
+            ref_task_id = req.augment_task_id if req.augment_task_id is not None else ref_entry["task_id"]
+            if ref_task_id not in LIBERO_90_TASK_IDS_PROMPTS:
+                _state["finetune_status"] = "error"
+                _state["finetune_error"] = f"Invalid augment_task_id. Use 0-{len(LIBERO_90_TASK_IDS_PROMPTS) - 1}."
+                return
+            original_model = ref_entry["model"]
+            augment_task_id = ref_task_id
+            augment_inference_fn = make_pseudo_label_inference_fn(ref_entry["policy"])
+        else:
+            original_model = _state["model"]
+            augment_task_id = req.augment_task_id
+            augment_inference_fn = None
+
+        augment = req.augment or req.task_regularization
         config = _state["config"]
         config = dataclasses.replace(config, batch_size=req.batch_size)
         repo_id = "antoniomari/libero_90"
@@ -482,15 +525,46 @@ def _run_finetune_thread(req: FinetuneRequest):
             task_id=task_id,
             mirror_data=True,
             single_episode=req.single_episode,
+            augment=augment,
+            augment_task_id=augment_task_id,
+            augment_inference_fn=augment_inference_fn,
         ):
             data_loader = _data_loader.create_data_loader(
                 config, sharding=None, shuffle=True,
             )
 
+        validation_loader = None
+        if req.add_validation_set and req.validation_task_id is not None:
+            _ensure_task_suite()
+            suite = _state["task_suite"]
+            val_task_id = req.validation_task_id
+            if val_task_id < 0 or val_task_id >= suite.n_tasks:
+                _state["finetune_status"] = "error"
+                _state["finetune_error"] = f"Invalid validation_task_id. Use 0-{suite.n_tasks - 1}."
+                return
+            # Use same batch_size as training to avoid JIT recompilation on different shapes
+            val_config = dataclasses.replace(config, batch_size=req.batch_size, num_workers=0)
+            with override_create_torch_dataset(
+                repo_id=repo_id,
+                task_id=val_task_id,
+                mirror_data=True,
+                single_episode=True,
+                augment=False,
+            ):
+                validation_loader = _data_loader.create_data_loader(
+                    val_config,
+                    sharding=None,
+                    shuffle=False,
+                    single_epoch=True,
+                )
+
         model_copy = copy_model(original_model, config)
 
         def _on_step(step: int, loss_val: float) -> None:
             _state["finetune_losses"].append(loss_val)
+
+        def _on_validation(step: int, val_loss: float) -> None:
+            _state["finetune_validation_losses"].append({"step": step, "loss": val_loss})
 
         trained_model, losses, _ = train_model_on_fly(
             model=model_copy,
@@ -505,6 +579,9 @@ def _run_finetune_thread(req: FinetuneRequest):
             show_progress_bar=False,
             donate_buffers=False,
             on_step_callback=_on_step,
+            validation_data_loader=validation_loader,
+            validation_interval=5,
+            on_validation_callback=_on_validation if validation_loader else None,
         )
 
         merging_eps = req.merging_eps if req.merging_eps is not None else 1.0
@@ -556,9 +633,60 @@ def api_finetune_status():
     return {
         "status": _state["finetune_status"],
         "losses": [float(x) for x in _state["finetune_losses"]],
+        "validation_losses": list(_state["finetune_validation_losses"]),
         "current_step": int(len(_state["finetune_losses"])),
         "total_steps": int(_state["finetune_total_steps"]),
         "error": _state["finetune_error"],
+    }
+
+
+@app.post("/api/save_as_reference")
+def api_save_as_reference():
+    """Save current model as reference for Task regularization. Reference is never overwritten by fine-tuning."""
+    if _state["model"] is None:
+        raise HTTPException(status_code=400, detail="No model loaded. Fine-tune on a task first.")
+    if _state["task_id"] is None:
+        raise HTTPException(status_code=400, detail="Load a task first.")
+    task_id = int(_state["task_id"])
+    prompt = LIBERO_90_TASK_IDS_PROMPTS.get(task_id, "unknown")
+    name = f"Task {task_id}: {prompt}"
+    ref_id = f"ref_{_state['reference_counter']}"
+    _state["reference_counter"] += 1
+    model_copy = copy_model(_state["model"], _state["config"])
+    policy = create_policy(
+        model_copy,
+        _state["config"],
+        CHECKPOINT_DIR,
+        rng_seed=_state["seed"],
+    )
+    ref_entry = {
+        "id": ref_id,
+        "model": model_copy,
+        "policy": policy,
+        "task_id": task_id,
+        "name": name,
+    }
+    refs = _state["references"]
+    refs.insert(0, ref_entry)
+    if len(refs) > MAX_REFERENCES:
+        _state["references"] = refs[:MAX_REFERENCES]
+    return {
+        "ok": True,
+        "reference_id": ref_id,
+        "reference_name": name,
+        "message": f"Reference saved: {name}",
+    }
+
+
+@app.get("/api/reference_status")
+def api_reference_status():
+    """Get reference models for Task regularization."""
+    refs = _state["references"]
+    return {
+        "references": [
+            {"id": r["id"], "name": r["name"], "task_id": r["task_id"]}
+            for r in refs
+        ],
     }
 
 
@@ -635,7 +763,7 @@ def main():
     parser.add_argument("--port", type=int, default=8765, help="Port")
     args = parser.parse_args()
 
-    logging.getLogger("uvicorn").setLevel(logging.INFO)
+    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
     import uvicorn
     import socket
     hostname = socket.gethostname()

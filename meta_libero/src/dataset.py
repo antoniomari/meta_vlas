@@ -3,24 +3,46 @@
 import collections
 import contextlib
 import dataclasses
+import logging
 import os
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any, Dict, List, Optional
 
 import h5py
+import jax
 import jax.numpy as jnp
 import numpy as np
+import torch
 import lerobot.common.datasets.lerobot_dataset as lerobot_dataset  # type: ignore
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset  # type: ignore
 import openpi.models.model as _model  # type: ignore
 from openpi.training import config as _config  # type: ignore
 import openpi.training.data_loader as _data_loader  # type: ignore
-from openpi.training.data_loader import Dataset, TransformedDataset  # type: ignore
+from openpi.training.data_loader import (  # type: ignore
+    Dataset,
+    DataLoaderImpl,
+    TorchDataLoader,
+    TransformedDataset,
+    transform_dataset,
+)
 import openpi.transforms as transforms  # type: ignore
 from openpi_client import image_tools  # type: ignore
 
 
 _TASK_INDICES_CACHE: dict[str, dict[int, list[int]]] = {}
+
+LIBERO_90_TASK_IDS_PROMPTS = {
+    0: "close the top drawer of the cabinet",
+    1: "close the top drawer of the cabinet and put the black bowl on top of it",
+    2: "put the black bowl in the top drawer of the cabinet",
+    3: "put the butter at the back in the top drawer of the cabinet and close it",
+    4: "put the butter at the front in the top drawer of the cabinet and close it",
+    5: "put the chocolate pudding in the top drawer of the cabinet and close it",
+    6: "open the bottom drawer of the cabinet",
+    7: "open the top drawer of the cabinet",
+    8: "open the top drawer of the cabinet and put the bowl in it",
+}
 
 LIBERO_90_TASK_IDS_MAPPING = {
     0: 55,
@@ -120,6 +142,329 @@ class FilteredDataset(Dataset):
         return filtered
 
 
+def _data_to_policy_obs_dict(data: dict[str, Any], prompt: str) -> dict[str, Any]:
+    """Convert dataset sample (post data_transforms) to policy input format.
+
+    Data has image (dict with base_0_rgb, left_wrist_0_rgb), state. Policy expects
+    observation/image, observation/wrist_image, observation/state, prompt.
+    """
+    img = data.get("image")
+    if isinstance(img, dict):
+        base_img = np.asarray(img.get("base_0_rgb", np.zeros((224, 224, 3), dtype=np.uint8)))
+        wrist_img = np.asarray(img.get("left_wrist_0_rgb", np.zeros((224, 224, 3), dtype=np.uint8)))
+    elif "observation/image" in data:
+        base_img = np.asarray(data["observation/image"])
+        wrist_img = np.asarray(data.get("observation/wrist_image", np.zeros((224, 224, 3), dtype=np.uint8)))
+    else:
+        base_img = np.asarray(img) if img is not None else np.zeros((224, 224, 3), dtype=np.uint8)
+        wrist_img = np.zeros((224, 224, 3), dtype=np.uint8)
+    state = np.asarray(data.get("state", data.get("observation/state", np.zeros(8, dtype=np.float32))))
+    return {
+        "observation/image": base_img,
+        "observation/wrist_image": wrist_img,
+        "observation/state": state,
+        "prompt": prompt,
+    }
+
+
+@dataclasses.dataclass(frozen=True)
+class MakePseudoLabelTransform(transforms.DataTransformFn):
+    """Transform that injects prompt and actions before model_transforms.
+
+    By default: prompt='do nothing', actions=zeros.
+    If inference_fn is provided: uses inference_fn(data) to get pseudo-label actions.
+    Insert this before TokenizePrompt.
+    """
+
+    prompt: str = "do nothing"
+    inference_fn: Callable[[dict[str, Any]], np.ndarray] | None = None
+
+    def __call__(self, data: dict[str, Any]) -> dict[str, Any]:
+        out = dict(data)
+        out["prompt"] = self.prompt
+        if self.inference_fn is not None:
+            out["actions"] = np.asarray(self.inference_fn(out))
+        elif "actions" in out:
+            out["actions"] = np.zeros_like(np.asarray(out["actions"]))
+        return out
+
+
+def make_pseudo_label_inference_fn(policy: Any) -> Callable[[dict[str, Any]], np.ndarray]:
+    """Create inference_fn for MakePseudoLabelTransform from a policy.
+
+    The returned callable receives a data dict (after prompt is set by the transform),
+    builds policy obs format, runs policy.infer, and returns actions for one sample.
+    """
+    def fn(data: dict[str, Any]) -> np.ndarray:
+        p = data.get("prompt", "do nothing")
+        obs = _data_to_policy_obs_dict(data, p)
+        result = policy.infer(obs, noise=None)
+        actions = np.asarray(result["actions"])
+        if actions.ndim == 3:
+            actions = actions[0]
+        return actions
+    return fn
+
+
+def augment_dataset_with_pseudo_labels(
+    dataset: Dataset,
+    data_config: _config.DataConfig,
+    *,
+    skip_norm_stats: bool = False,
+    prompt: str = "do nothing",
+    inference_fn: Callable[[dict[str, Any]], np.ndarray] | None = None,
+) -> TransformedDataset:
+    """Like transform_dataset but injects prompt and actions before model_transforms.
+
+    Produces samples with the given prompt and either zero actions or pseudo-labels
+    from inference_fn. Same pipeline as transform_dataset except model_transforms
+    receive the injected prompt/actions.
+    """
+    norm_stats = {}
+    if data_config.repo_id != "fake" and not skip_norm_stats:
+        if data_config.norm_stats is None:
+            raise ValueError(
+                f"Normalization stats not found for repo {data_config.repo_id}. "
+                "Make sure to run `scripts/compute_norm_stats.py --config-name=<your-config>`."
+            )
+        norm_stats = data_config.norm_stats
+
+    inject = MakePseudoLabelTransform(prompt=prompt, inference_fn=inference_fn)
+    return TransformedDataset(
+        dataset,
+        [
+            *data_config.repack_transforms.inputs,
+            *data_config.data_transforms.inputs,
+            transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
+            inject,
+            *data_config.model_transforms.inputs,
+        ],
+    )
+
+
+class AugmentedDataset(Dataset):
+    """Dataset that returns (normal_sample, null_sample) pairs for the same index.
+
+    Each __getitem__(i) returns a dict where each value is the concatenation of
+    dataset_normal[i] and dataset_null[i] along axis 0 (shape (2, ...)).
+    Used with _collate_pair_fn to produce batches of 2*B samples.
+    """
+
+    def __init__(self, dataset_normal: Dataset, dataset_null: Dataset):
+        assert len(dataset_normal) == len(dataset_null)
+        self._normal = dataset_normal
+        self._null = dataset_null
+
+    def __len__(self) -> int:
+        return len(self._normal)
+
+    def __getitem__(self, idx: int) -> dict[str, Any]:
+        normal = self._normal[idx]
+        null = self._null[idx]
+        return jax.tree.map(
+            lambda a, b: np.concatenate([np.asarray(a)[None, ...], np.asarray(b)[None, ...]], axis=0),
+            normal,
+            null,
+        )
+
+
+def _collate_pair_fn(items: list[dict[str, Any]]) -> dict[str, Any]:
+    """Collate items from AugmentedDataset: stack (B, 2, ...) then reshape to (2B, ...)."""
+    stacked = jax.tree.map(
+        lambda *xs: np.stack([np.asarray(x) for x in xs], axis=0),
+        *items,
+    )
+    return jax.tree.map(
+        lambda x: np.reshape(np.asarray(x), (-1,) + x.shape[2:]),
+        stacked,
+    )
+
+
+class _FlexibleTorchDataLoader:
+    """TorchDataLoader with configurable collate_fn. Mirrors openpi TorchDataLoader."""
+
+    def __init__(
+        self,
+        dataset: Any,
+        local_batch_size: int,
+        *,
+        collate_fn=None,
+        sharding: jax.sharding.Sharding | None = None,
+        shuffle: bool = False,
+        sampler: torch.utils.data.Sampler | None = None,
+        num_batches: int | None = None,
+        num_workers: int = 0,
+        seed: int = 0,
+        framework: str = "jax",
+    ):
+        import multiprocessing
+        import typing
+
+        if collate_fn is None:
+            collate_fn = _data_loader._collate_fn
+        if jax.process_count() > 1:
+            raise NotImplementedError("Data loading with multiple processes is not supported.")
+        if len(dataset) < local_batch_size:
+            raise ValueError(
+                f"Local batch size ({local_batch_size}) is larger than the dataset size ({len(dataset)})."
+            )
+
+        self._sharding = sharding
+        if sharding is None and framework == "jax":
+            self._sharding = jax.sharding.NamedSharding(
+                jax.sharding.Mesh(jax.devices(), ("B",)),
+                jax.sharding.PartitionSpec("B"),
+            )
+        self._num_batches = num_batches
+
+        mp_context = None
+        if num_workers > 0:
+            mp_context = multiprocessing.get_context("spawn")
+
+        generator = torch.Generator()
+        generator.manual_seed(seed)
+        self._data_loader = torch.utils.data.DataLoader(
+            typing.cast(torch.utils.data.Dataset, dataset),
+            batch_size=local_batch_size,
+            shuffle=(sampler is None and shuffle),
+            sampler=sampler,
+            num_workers=num_workers,
+            multiprocessing_context=mp_context,
+            persistent_workers=num_workers > 0,
+            collate_fn=collate_fn,
+            worker_init_fn=_data_loader._worker_init_fn,
+            drop_last=True,
+            generator=generator,
+        )
+
+    def __iter__(self):
+        num_items = 0
+        while True:
+            data_iter = iter(self._data_loader)
+            while True:
+                if self._num_batches is not None and num_items >= self._num_batches:
+                    return
+                try:
+                    batch = next(data_iter)
+                except StopIteration:
+                    break
+                num_items += 1
+                if self._sharding is not None:
+                    yield jax.tree.map(
+                        lambda x: jax.make_array_from_process_local_data(self._sharding, x),
+                        batch,
+                    )
+                else:
+                    yield jax.tree.map(torch.as_tensor, batch)
+
+
+def create_torch_data_loader(
+    data_config: _config.DataConfig,
+    model_config: _model.BaseModelConfig,
+    action_horizon: int,
+    batch_size: int,
+    *,
+    sharding: jax.sharding.Sharding | None = None,
+    skip_norm_stats: bool = False,
+    shuffle: bool = False,
+    num_batches: int | None = None,
+    num_workers: int = 0,
+    seed: int = 0,
+    framework: str = "jax",
+    augment: bool = False,
+    augment_task_id: int | None = None,
+    augment_inference_fn: Callable[[dict[str, Any]], np.ndarray] | None = None,
+    single_epoch: bool = False,
+):
+    """Create a data loader for training.
+
+    Entry point mirroring openpi.training.data_loader.create_torch_data_loader.
+    Uses transform_dataset (which applies data_config.model_transforms.inputs).
+    When augment=True: creates two datasets (normal + augmented), samples from both
+    for each batch, and concatenates (batch size becomes 2x).
+    Options:
+      - augment_task_id is None: "do nothing" prompt + zero actions
+      - augment_task_id is set: use that task's prompt; augment_inference_fn for
+        pseudo-labels (if None, actions=zeros).
+    """
+    base_dataset = _data_loader.create_torch_dataset(data_config, action_horizon, model_config)
+
+    if augment:
+        # augment_inference_fn is a closure (from make_pseudo_label_inference_fn) that
+        # captures the policy; it cannot be pickled for DataLoader multiprocessing.
+        if augment_inference_fn is not None and num_workers > 0:
+            num_workers = 0
+        augment_prompt = (
+            "do nothing" if augment_task_id is None
+            else LIBERO_90_TASK_IDS_PROMPTS.get(augment_task_id, "do nothing")
+        )
+        dataset_normal = transform_dataset(base_dataset, data_config, skip_norm_stats=skip_norm_stats)
+        dataset_augmented = augment_dataset_with_pseudo_labels(
+            base_dataset,
+            data_config,
+            skip_norm_stats=skip_norm_stats,
+            prompt=augment_prompt,
+            inference_fn=augment_inference_fn,
+        )
+        dataset = AugmentedDataset(dataset_normal, dataset_augmented)
+        # Each "sample" is a (normal, null) pair -> 2 samples. Use half batch size for pairs.
+        local_batch_size = batch_size // 2
+    else:
+        dataset = transform_dataset(base_dataset, data_config, skip_norm_stats=skip_norm_stats)
+        local_batch_size = batch_size
+
+    sampler = None
+    if framework == "pytorch":
+        if torch.distributed.is_initialized():
+            sampler = torch.utils.data.distributed.DistributedSampler(
+                dataset,
+                num_replicas=torch.distributed.get_world_size(),
+                rank=torch.distributed.get_rank(),
+                shuffle=shuffle,
+                drop_last=True,
+            )
+            local_batch_size = local_batch_size // torch.distributed.get_world_size()
+        else:
+            pass  # local_batch_size already set
+    else:
+        local_batch_size = local_batch_size // jax.process_count()
+
+    if single_epoch:
+        num_batches = len(dataset) // local_batch_size
+
+    if augment:
+        logging.info(
+            f"local_batch_size: {local_batch_size} pairs -> {2 * local_batch_size} samples (augmented)"
+        )
+        data_loader = _FlexibleTorchDataLoader(
+            dataset,
+            local_batch_size=local_batch_size,
+            collate_fn=_collate_pair_fn,
+            sharding=None if framework == "pytorch" else sharding,
+            shuffle=(sampler is None and shuffle),
+            sampler=sampler,
+            num_batches=num_batches,
+            num_workers=num_workers,
+            seed=seed,
+            framework=framework,
+        )
+    else:
+        logging.info(f"local_batch_size: {local_batch_size}")
+        data_loader = TorchDataLoader(
+            dataset,
+            local_batch_size=local_batch_size,
+            sharding=None if framework == "pytorch" else sharding,
+            shuffle=(sampler is None and shuffle),
+            sampler=sampler,
+            num_batches=num_batches,
+            num_workers=num_workers,
+            seed=seed,
+            framework=framework,
+        )
+
+    return DataLoaderImpl(data_config, data_loader)
+
+
 @contextlib.contextmanager
 def override_create_torch_dataset(
     repo_id: Optional[str] = None,
@@ -127,9 +472,20 @@ def override_create_torch_dataset(
     load_in_memory: bool = False,
     mirror_data: bool = True,
     single_episode: bool = False,
+    episode_index: int | None = None,
+    augment: bool = False,
+    augment_task_id: int | None = None,
+    augment_inference_fn: Callable[[dict[str, Any]], np.ndarray] | None = None,
 ):
-    """Temporarily override OpenPI create_torch_dataset with LIBERO-aware one."""
-    original = _data_loader.create_torch_dataset
+    """Temporarily override OpenPI create_torch_dataset with LIBERO-aware one.
+
+    If augment is True, also overrides create_torch_data_loader to use our
+    create_torch_data_loader, concatenating each batch with an augmented copy.
+    Options: augment_task_id=None for "do nothing"+zeros; augment_task_id set
+    for task prompt + augment_inference_fn (pseudo-labels).
+    """
+    original_create_dataset = _data_loader.create_torch_dataset
+    original_create_torch_data_loader = _data_loader.create_torch_data_loader
 
     def create_dataset(
         data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
@@ -159,14 +515,14 @@ def override_create_torch_dataset(
                 task_id_dataset = LIBERO_90_TASK_IDS_MAPPING.get(task_id, task_id)
             else:
                 raise NotImplementedError(f"Only supported for antoniomari/libero_90, got {repo_id}")
-            episode_index = None
-            if single_episode:
-                episode_index = int(SINGLE_EPISODE_TASK_TO_EPISODE_INDEX.get(task_id, 0))
+            ep_idx = episode_index
+            if ep_idx is None and single_episode:
+                ep_idx = int(SINGLE_EPISODE_TASK_TO_EPISODE_INDEX.get(task_id, 0))
             dataset = FilteredDataset(
                 dataset,
                 task_id_dataset,
                 repo_id=repo,
-                episode_index=episode_index,
+                episode_index=ep_idx,
             )
 
         if data_config.prompt_from_task:
@@ -178,11 +534,24 @@ def override_create_torch_dataset(
 
         return dataset
 
+    def create_loader_with_augment(*args, **kwargs):
+        return create_torch_data_loader(
+            *args,
+            augment=True,
+            augment_task_id=augment_task_id,
+            augment_inference_fn=augment_inference_fn,
+            **kwargs,
+        )
+
     _data_loader.create_torch_dataset = create_dataset
+    if augment:
+        _data_loader.create_torch_data_loader = create_loader_with_augment
     try:
         yield
     finally:
-        _data_loader.create_torch_dataset = original
+        _data_loader.create_torch_dataset = original_create_dataset
+        if augment:
+            _data_loader.create_torch_data_loader = original_create_torch_data_loader
 
 
 def extract_prompt_from_filename(name: str) -> str:
@@ -367,13 +736,18 @@ class Libero90MirrorTransform(transforms.DataTransformFn):
 
 
 __all__ = [
+    "AugmentedDataset",
     "FilteredDataset",
+    "MakePseudoLabelTransform",
     "LIBERO_90_TASK_IDS_MAPPING",
     "Libero90MirrorTransform",
     "convert_to_lerobot_dataset",
+    "create_torch_data_loader",
     "extract_prompt_from_filename",
+    "make_pseudo_label_inference_fn",
     "mirror_action_chunks_jnp",
     "mirror_images_jnp",
     "override_create_torch_dataset",
     "prepare_task_dataset",
+    "augment_dataset_with_pseudo_labels",
 ]
