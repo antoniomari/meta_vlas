@@ -294,10 +294,14 @@ def train_step(
         ),
     )
 
+    # Magnitude of parameter shift: L2 norm of the updates applied this step.
+    update_norm = optax.global_norm(updates)
+
     info = {
         "loss": loss,
         "grad_norm": optax.global_norm(grads),
         "param_norm": optax.global_norm(kernel_params),
+        "update_norm": update_norm,
     }
 
     return new_state, info
@@ -414,6 +418,8 @@ def train_model_on_fly(
     aux_num_samples: int = 10,
     # Optional callback (step, loss) after each gradient step (e.g. for UI streaming).
     on_step_callback: Optional[Callable[[int, float], None]] = None,
+    # Optional callback (step, info_dict) with full step info (loss, grad_norm, update_norm).
+    on_step_info_callback: Optional[Callable[[int, dict], None]] = None,
     # Optional validation: compute loss on validation set every N steps.
     validation_data_loader: Optional[_data_loader.DataLoader] = None,
     validation_interval: int = 5,
@@ -644,10 +650,20 @@ def train_model_on_fly(
         # Logging - aligned with train.py info structure
         loss_val = float(jax.device_get(info["loss"]))
         grad_norm = float(jax.device_get(info["grad_norm"]))
+        update_norm = float(jax.device_get(info["update_norm"]))
         losses.append(loss_val)  # Store loss for plotting
         if on_step_callback is not None:
             on_step_callback(step, loss_val)
-        infos.append({"loss": loss_val, "grad_norm": grad_norm})
+        if on_step_info_callback is not None:
+            on_step_info_callback(
+                step,
+                {
+                    "loss": loss_val,
+                    "grad_norm": grad_norm,
+                    "update_norm": update_norm,
+                },
+            )
+        infos.append({"loss": loss_val, "grad_norm": grad_norm, "update_norm": update_norm})
 
         # Optional: compute validation loss at step 0 and every N steps (uses cached batches, no disk I/O).
         if (
@@ -859,11 +875,19 @@ def copy_model(model, train_config: _config.TrainConfig):
         ),
     )
 
-    # Create a fresh copy of the original model for training
+    # Create a fresh copy of the original model for training.
+    # Must deep-copy params so model_phase2 has independent buffers; otherwise
+    # init_train_state (donate_argnums=5) invalidates shared buffers and
+    # model_phase1 (used for augment_inference_fn) would produce garbage.
     def copy_param(x):
         if isinstance(x, jax.Array):
             jax.block_until_ready(x)
             return jnp.array(np.asarray(x))  # Force copy through CPU
+        if hasattr(x, "value") and hasattr(x, "replace"):
+            # nnx.Param / nnx.Variable
+            jax.block_until_ready(x.value)
+            new_val = jnp.array(np.asarray(x.value))
+            return x.replace(value=new_val)
         return x
 
     original_params_copy = jax.tree.map(copy_param, original_model_params)

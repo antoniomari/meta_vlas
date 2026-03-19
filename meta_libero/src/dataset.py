@@ -269,7 +269,7 @@ class AugmentedDataset(Dataset):
 
 
 def _collate_pair_fn(items: list[dict[str, Any]]) -> dict[str, Any]:
-    """Collate items from AugmentedDataset: stack (B, 2, ...) then reshape to (2B, ...)."""
+    """Collate items from AugmentedDataset or CotrainingDataset: stack (B, 2, ...) then reshape to (2B, ...)."""
     stacked = jax.tree.map(
         lambda *xs: np.stack([np.asarray(x) for x in xs], axis=0),
         *items,
@@ -278,6 +278,42 @@ def _collate_pair_fn(items: list[dict[str, Any]]) -> dict[str, Any]:
         lambda x: np.reshape(np.asarray(x), (-1,) + x.shape[2:]),
         stacked,
     )
+
+
+class CotrainingDataset(Dataset):
+    """Dataset that yields (sample1, sample2) pairs from two datasets with independent sampling.
+
+    Each __getitem__(i) returns dataset1[perm1[i % n1]] and dataset2[perm2[i % n2]]
+    where perm1, perm2 are different random permutations. This provides independent
+    sampling from both tasks for cotraining.
+    """
+
+    def __init__(
+        self,
+        dataset1: Dataset,
+        dataset2: Dataset,
+        seed: int = 0,
+    ):
+        self._d1 = dataset1
+        self._d2 = dataset2
+        n1, n2 = len(dataset1), len(dataset2)
+        self._len = max(n1, n2)
+        rng = np.random.default_rng(seed)
+        self._perm1 = rng.permutation(n1)
+        self._perm2 = rng.permutation(n2)
+
+    def __len__(self) -> int:
+        return self._len
+
+    def __getitem__(self, idx: int) -> dict[str, Any]:
+        n1, n2 = len(self._d1), len(self._d2)
+        s1 = self._d1[int(self._perm1[idx % n1])]
+        s2 = self._d2[int(self._perm2[idx % n2])]
+        return jax.tree.map(
+            lambda a, b: np.concatenate([np.asarray(a)[None, ...], np.asarray(b)[None, ...]], axis=0),
+            s1,
+            s2,
+        )
 
 
 class _FlexibleTorchDataLoader:
@@ -375,6 +411,8 @@ def create_torch_data_loader(
     augment_task_id: int | None = None,
     augment_inference_fn: Callable[[dict[str, Any]], np.ndarray] | None = None,
     single_epoch: bool = False,
+    cotraining: bool = False,
+    cotraining_dataset: Dataset | None = None,
 ):
     """Create a data loader for training.
 
@@ -382,6 +420,8 @@ def create_torch_data_loader(
     Uses transform_dataset (which applies data_config.model_transforms.inputs).
     When augment=True: creates two datasets (normal + augmented), samples from both
     for each batch, and concatenates (batch size becomes 2x).
+    When cotraining=True: combines base_dataset with cotraining_dataset, sampling
+    independently from each (batch size becomes 2x).
     Options:
       - augment_task_id is None: "do nothing" prompt + zero actions
       - augment_task_id is set: use that task's prompt; augment_inference_fn for
@@ -389,7 +429,12 @@ def create_torch_data_loader(
     """
     base_dataset = _data_loader.create_torch_dataset(data_config, action_horizon, model_config)
 
-    if augment:
+    if cotraining and cotraining_dataset is not None:
+        dataset1 = transform_dataset(base_dataset, data_config, skip_norm_stats=skip_norm_stats)
+        dataset2 = transform_dataset(cotraining_dataset, data_config, skip_norm_stats=skip_norm_stats)
+        dataset = CotrainingDataset(dataset1, dataset2, seed=seed)
+        local_batch_size = batch_size
+    elif augment:
         # augment_inference_fn is a closure (from make_pseudo_label_inference_fn) that
         # captures the policy; it cannot be pickled for DataLoader multiprocessing.
         if augment_inference_fn is not None and num_workers > 0:
@@ -408,11 +453,12 @@ def create_torch_data_loader(
         )
         dataset = AugmentedDataset(dataset_normal, dataset_augmented)
         # Each "sample" is a (normal, null) pair -> 2 samples. Use half batch size for pairs.
-        local_batch_size = batch_size // 2
+        local_batch_size = batch_size  #  // 2
     else:
         dataset = transform_dataset(base_dataset, data_config, skip_norm_stats=skip_norm_stats)
         local_batch_size = batch_size
 
+    use_pair_collate = augment or (cotraining and cotraining_dataset is not None)
     sampler = None
     if framework == "pytorch":
         if torch.distributed.is_initialized():
@@ -432,9 +478,10 @@ def create_torch_data_loader(
     if single_epoch:
         num_batches = len(dataset) // local_batch_size
 
-    if augment:
+    if use_pair_collate:
+        mode = "cotraining" if cotraining else "augmented"
         logging.info(
-            f"local_batch_size: {local_batch_size} pairs -> {2 * local_batch_size} samples (augmented)"
+            f"local_batch_size: {local_batch_size} pairs -> {2 * local_batch_size} samples ({mode})"
         )
         data_loader = _FlexibleTorchDataLoader(
             dataset,
@@ -476,19 +523,26 @@ def override_create_torch_dataset(
     augment: bool = False,
     augment_task_id: int | None = None,
     augment_inference_fn: Callable[[dict[str, Any]], np.ndarray] | None = None,
+    cotraining: bool = False,
+    cotraining_task_id: int | None = None,
 ):
     """Temporarily override OpenPI create_torch_dataset with LIBERO-aware one.
 
     If augment is True, also overrides create_torch_data_loader to use our
     create_torch_data_loader, concatenating each batch with an augmented copy.
+    If cotraining is True, samples batches from task_id and cotraining_task_id
+    independently and concatenates (no pseudo-labels).
     Options: augment_task_id=None for "do nothing"+zeros; augment_task_id set
     for task prompt + augment_inference_fn (pseudo-labels).
     """
     original_create_dataset = _data_loader.create_torch_dataset
     original_create_torch_data_loader = _data_loader.create_torch_data_loader
 
-    def create_dataset(
-        data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
+    def create_dataset_impl(
+        task_id_to_use: int | None,
+        data_config: _config.DataConfig,
+        action_horizon: int,
+        model_config: Any,
     ) -> Dataset:
         del model_config
         repo = repo_id if repo_id is not None else data_config.repo_id
@@ -510,14 +564,14 @@ def override_create_torch_dataset(
                 _ = dataset.hf_dataset[:]
                 print(f"Dataset loaded into memory: {len(dataset)} samples")
 
-        if task_id is not None:
+        if task_id_to_use is not None:
             if repo_id == "antoniomari/libero_90":
-                task_id_dataset = LIBERO_90_TASK_IDS_MAPPING.get(task_id, task_id)
+                task_id_dataset = LIBERO_90_TASK_IDS_MAPPING.get(task_id_to_use, task_id_to_use)
             else:
                 raise NotImplementedError(f"Only supported for antoniomari/libero_90, got {repo_id}")
             ep_idx = episode_index
             if ep_idx is None and single_episode:
-                ep_idx = int(SINGLE_EPISODE_TASK_TO_EPISODE_INDEX.get(task_id, 0))
+                ep_idx = int(SINGLE_EPISODE_TASK_TO_EPISODE_INDEX.get(task_id_to_use, 0))
             dataset = FilteredDataset(
                 dataset,
                 task_id_dataset,
@@ -534,6 +588,11 @@ def override_create_torch_dataset(
 
         return dataset
 
+    def create_dataset(
+        data_config: _config.DataConfig, action_horizon: int, model_config: Any
+    ) -> Dataset:
+        return create_dataset_impl(task_id, data_config, action_horizon, model_config)
+
     def create_loader_with_augment(*args, **kwargs):
         return create_torch_data_loader(
             *args,
@@ -543,14 +602,29 @@ def override_create_torch_dataset(
             **kwargs,
         )
 
+    def create_loader_with_cotraining(*args, **kwargs):
+        # Create cotraining dataset for cotraining_task_id
+        data_config = args[0] if args else kwargs["data_config"]
+        action_horizon = kwargs.get("action_horizon")
+        model_config = kwargs.get("model_config")
+        cotraining_ds = create_dataset_impl(
+            cotraining_task_id, data_config, action_horizon, model_config
+        )
+        return create_torch_data_loader(
+            *args,
+            **{**kwargs, "cotraining": True, "cotraining_dataset": cotraining_ds},
+        )
+
     _data_loader.create_torch_dataset = create_dataset
     if augment:
         _data_loader.create_torch_data_loader = create_loader_with_augment
+    elif cotraining and cotraining_task_id is not None:
+        _data_loader.create_torch_data_loader = create_loader_with_cotraining
     try:
         yield
     finally:
         _data_loader.create_torch_dataset = original_create_dataset
-        if augment:
+        if augment or cotraining:
             _data_loader.create_torch_data_loader = original_create_torch_data_loader
 
 
@@ -737,6 +811,7 @@ class Libero90MirrorTransform(transforms.DataTransformFn):
 
 __all__ = [
     "AugmentedDataset",
+    "CotrainingDataset",
     "FilteredDataset",
     "MakePseudoLabelTransform",
     "LIBERO_90_TASK_IDS_MAPPING",
