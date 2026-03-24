@@ -567,7 +567,7 @@ def main() -> None:
         if phase2_on_policy_self_replay
         else config
     )
-    with override_create_txorch_dataset(
+    with override_create_torch_dataset(
         repo_id=repo_id,
         task_id=task2,
         mirror_data=True,
