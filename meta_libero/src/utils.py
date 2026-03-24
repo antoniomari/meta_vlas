@@ -342,8 +342,25 @@ def compute_alignment_ratio(
     action_chunk: _model.Actions,
     curr_obs_dict: dict[str, Any],
     noise: np.ndarray | jnp.ndarray | None = None,
-    cfg_weight: float = 1.0
-) -> tuple[float, _model.Actions]:
+    cfg_weight: float = 1.0,
+    return_per_sample: bool = False,
+) -> float | jnp.ndarray:
+    """Compute alignment ratio: ||action - action_empty|| / (||action_empty|| + eps).
+
+    Norm is taken over axes 1 and 2 (action horizon, action dim). Batched: returns shape (B,).
+
+    Args:
+        policy: Policy used for inference.
+        action_chunk: Actions to compare (e.g. reference model output).
+        curr_obs_dict: Observation dict (modified in-place for empty prompt).
+        noise: Optional noise for policy inference.
+        cfg_weight: Unused, kept for API compatibility.
+        return_per_sample: If True, return per-sample ratios (shape (N,)); else return scalar mean.
+
+    Returns:
+        Scalar mean alignment ratio, or per-sample ratios when return_per_sample=True.
+    """
+    del cfg_weight  # unused
     original_prompt = curr_obs_dict["prompt"]
     if isinstance(original_prompt, list):
         curr_obs_dict["prompt"] = [""] * len(original_prompt)
@@ -376,11 +393,15 @@ def compute_alignment_ratio(
     action_chunk_overlap = action_chunk_jax[:s, :h, :d]
     action_chunk_empty_overlap = action_chunk_empty_jax[:s, :h, :d]
 
-    num = jnp.linalg.norm(action_chunk_overlap - action_chunk_empty_overlap, axis=(1, 2))
+    # Norm over axes 1 and 2, then ratio -> shape (B,)
+    diff = action_chunk_overlap - action_chunk_empty_overlap
+    num = jnp.linalg.norm(diff, axis=(1, 2))
     den = jnp.linalg.norm(action_chunk_empty_overlap, axis=(1, 2))
-    alignment_ratio = float(jax.device_get(jnp.mean(num / den)))
+    ratios = num / (den + 1e-12)
 
-    return alignment_ratio
+    if return_per_sample:
+        return ratios
+    return float(jax.device_get(jnp.mean(ratios)))
 
 __all__ = [
     "PRINT_MEMORY_CHECKPOINT",

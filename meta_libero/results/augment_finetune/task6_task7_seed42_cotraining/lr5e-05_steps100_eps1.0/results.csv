@@ -1,0 +1,5 @@
+metric,value
+merging_eps,1.0
+phase1_eval_task1_success_rate,1.0
+phase2_eval_task1_success_rate,0.9
+phase2_eval_task2_success_rate,0.8

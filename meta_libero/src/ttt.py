@@ -7,11 +7,12 @@ warnings.filterwarnings("ignore")
 warnings.filterwarnings(
     "ignore", message=".*shape requires ndarray or scalar arguments.*"
 )
+warnings.filterwarnings("ignore", category=DeprecationWarning, message=".*linear_util.wrap_init.*")
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="flax.core.scope")
 
 import dataclasses
 import functools
-from typing import Any, Iterator, SupportsIndex, Tuple, Optional, List, Callable
+from typing import Any, Iterator, SupportsIndex, Tuple, Optional, List, Callable, Union
 from collections import defaultdict
 
 from meta_libero.src.nn_fetcher import NearestNeighborFetcher
@@ -34,6 +35,8 @@ import imageio
 from PIL import Image, ImageDraw, ImageFont
 import sys
 import random
+import re
+import gc
 import h5py
 
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.95"
@@ -218,16 +221,67 @@ def _legacy_load_pi05_libero_model(
     return model, config
 
 
+def _duplicate_observation_along_batch(obs: _model.Observation) -> _model.Observation:
+    """Concatenate observation with itself along batch dim (2*B samples)."""
+    def cat_twice(x):
+        if x is None:
+            return None
+        return jnp.concatenate([x, x], axis=0)
+
+    return dataclasses.replace(
+        obs,
+        images={k: jnp.concatenate([v, v], axis=0) for k, v in obs.images.items()},
+        image_masks={k: jnp.concatenate([v, v], axis=0) for k, v in obs.image_masks.items()},
+        state=jnp.concatenate([obs.state, obs.state], axis=0),
+        tokenized_prompt=cat_twice(obs.tokenized_prompt),
+        tokenized_prompt_mask=cat_twice(obs.tokenized_prompt_mask),
+        token_ar_mask=cat_twice(obs.token_ar_mask),
+        token_loss_mask=cat_twice(obs.token_loss_mask),
+    )
+
+
+def _expand_self_check_batch(
+    rng: at.KeyArrayLike,
+    train_state: training_utils.TrainState,
+    batch: tuple[_model.Observation, _model.Actions],
+    lambda_kl: float,
+) -> tuple[_model.Observation, _model.Actions, at.Array]:
+    """Duplicate batch: first half ground-truth actions, second half pseudo-actions from current model."""
+    observation, actions = batch[0], batch[1]
+    model = nnx.merge(train_state.model_def, train_state.params)
+    model.eval()
+    step_i = int(jax.device_get(train_state.step))
+    sample_rng = jax.random.fold_in(rng, step_i)
+    pseudo_actions = jnp.asarray(
+        model.sample_actions(sample_rng, observation), dtype=actions.dtype
+    )
+    obs_dup = _duplicate_observation_along_batch(observation)
+    B = int(actions.shape[0])
+    actions_dup = jnp.concatenate([actions, pseudo_actions], axis=0)
+    weights = jnp.concatenate(
+        [
+            jnp.ones(B, dtype=jnp.float32),
+            jnp.full(B, float(lambda_kl), dtype=jnp.float32),
+        ]
+    )
+    del model
+    return (obs_dup, actions_dup, weights)
+
+
 @at.typecheck
 @functools.partial(
-    jax.jit, static_argnums=(0,), donate_argnums=(2,)
-)  # config is static (Python object, not JAX array) - use argnums instead of argnames
+    jax.jit, static_argnums=(0,), donate_argnums=(2, 4)
+)  # config is static; donate state and prev_grads
 def train_step(
     config: _config.TrainConfig,
     rng: at.KeyArrayLike,
     state: training_utils.TrainState,
-    batch: tuple[_model.Observation, _model.Actions],
-) -> tuple[training_utils.TrainState, dict[str, at.Array]]:
+    batch: Union[
+        tuple[_model.Observation, _model.Actions],
+        tuple[_model.Observation, _model.Actions, at.Array],
+    ],
+    prev_grads: Any,
+) -> tuple[training_utils.TrainState, dict[str, at.Array], Any]:
     # Memory checkpoint: start of train_step
     # NOTE: Removed all jax.lax.cond print statements to avoid recompilation
     # When step_int changes (0, 1, 2, then >= 3), JAX sees different execution paths
@@ -243,19 +297,27 @@ def train_step(
         rng: at.KeyArrayLike,
         observation: _model.Observation,
         actions: _model.Actions,
+        sample_weights: at.Array,
     ):
         # Note: I set train=False to avoid preprocessing observation
         # TODO: consider what is the best thing to do here
         chunked_loss = model.compute_loss(rng, observation, actions, train=False)
-        return jnp.mean(chunked_loss)
+        # chunked_loss has shape (B, action_horizon); reduce to per-sample
+        loss_per_sample = jnp.mean(chunked_loss, axis=tuple(range(1, chunked_loss.ndim)))
+        # Weighted loss: sum(loss * weights) / max(sum(weights), eps); weights=1 gives mean loss
+        return jnp.sum(loss_per_sample * sample_weights) / jnp.maximum(
+            jnp.sum(sample_weights), 1e-8
+        )
 
     train_rng = jax.random.fold_in(rng, state.step)
-    observation, actions = batch
+    observation, actions = batch[0], batch[1]
+    batch_size = jnp.shape(actions)[0]
+    sample_weights = batch[2] if len(batch) == 3 else jnp.ones(batch_size)
 
     # Filter out frozen params.
     diff_state = nnx.DiffState(0, config.trainable_filter)
     loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(
-        model, train_rng, observation, actions
+        model, train_rng, observation, actions, sample_weights
     )
 
     params = state.params.filter(config.trainable_filter)
@@ -297,14 +359,225 @@ def train_step(
     # Magnitude of parameter shift: L2 norm of the updates applied this step.
     update_norm = optax.global_norm(updates)
 
+    # Cosine similarity between current and previous gradient (nan at step 0).
+    grad_norm_curr = optax.global_norm(grads)
+    grad_norm_prev = optax.global_norm(prev_grads)
+    grad_dot = sum(
+        jnp.sum(g * p)
+        for g, p in zip(
+            jax.tree_util.tree_leaves(grads),
+            jax.tree_util.tree_leaves(prev_grads),
+        )
+    )
+    grad_cosine_sim = jnp.where(
+        grad_norm_prev > 1e-9,
+        grad_dot / (grad_norm_curr * grad_norm_prev + 1e-12),
+        jnp.nan,
+    )
+
     info = {
         "loss": loss,
-        "grad_norm": optax.global_norm(grads),
+        "grad_norm": grad_norm_curr,
         "param_norm": optax.global_norm(kernel_params),
         "update_norm": update_norm,
+        "grad_cosine_sim": grad_cosine_sim,
     }
 
-    return new_state, info
+    return new_state, info, grads
+
+
+@functools.partial(jax.jit, static_argnums=(0,), donate_argnums=(3,))
+def _compute_grads_and_loss(
+    config: _config.TrainConfig,
+    rng: at.KeyArrayLike,
+    state: training_utils.TrainState,
+    batch: Union[
+        tuple[_model.Observation, _model.Actions],
+        tuple[_model.Observation, _model.Actions, at.Array],
+    ],
+) -> tuple[dict, at.Array]:
+    """Compute gradients and loss for a batch without applying updates. For gradient accumulation."""
+    model = nnx.merge(state.model_def, state.params)
+    model.train()
+
+    def loss_fn(
+        model: _model.BaseModel,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        actions: _model.Actions,
+        sample_weights: at.Array,
+    ):
+        chunked_loss = model.compute_loss(rng, observation, actions, train=False)
+        loss_per_sample = jnp.mean(chunked_loss, axis=tuple(range(1, chunked_loss.ndim)))
+        return jnp.sum(loss_per_sample * sample_weights) / jnp.maximum(
+            jnp.sum(sample_weights), 1e-8
+        )
+
+    # Use provided rng directly (caller folds in step+accum_i for per-micro-batch randomness)
+    train_rng = rng
+    observation, actions = batch[0], batch[1]
+    batch_size = jnp.shape(actions)[0]
+    sample_weights = batch[2] if len(batch) == 3 else jnp.ones(batch_size)
+
+    diff_state = nnx.DiffState(0, config.trainable_filter)
+    loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(
+        model, train_rng, observation, actions, sample_weights
+    )
+    return grads, loss
+
+
+@functools.partial(jax.jit, static_argnums=(0,), donate_argnums=(2, 3))
+def _apply_accumulated_grads(
+    config: _config.TrainConfig,
+    state: training_utils.TrainState,
+    accumulated_grads: dict,
+    prev_grads: Any,
+) -> tuple[training_utils.TrainState, dict[str, at.Array], Any]:
+    """Apply averaged accumulated gradients and return new state. For gradient accumulation."""
+    model = nnx.merge(state.model_def, state.params)
+    params = state.params.filter(config.trainable_filter)
+    updates, new_opt_state = state.tx.update(
+        accumulated_grads, state.opt_state, params
+    )
+    new_params = optax.apply_updates(params, updates)
+    nnx.update(model, new_params)
+    new_params = nnx.state(model)
+    new_state = dataclasses.replace(
+        state, step=state.step + 1, params=new_params, opt_state=new_opt_state
+    )
+    if state.ema_decay is not None:
+        new_state = dataclasses.replace(
+            new_state,
+            ema_params=jax.tree.map(
+                lambda old, new: state.ema_decay * old + (1 - state.ema_decay) * new,
+                state.ema_params,
+                new_params,
+            ),
+        )
+    kernel_params = nnx.state(
+        model,
+        nnx.All(
+            nnx.Param,
+            nnx.Not(
+                nnx_utils.PathRegex(".*/(bias|scale|pos_embedding|input_embedding)")
+            ),
+            lambda _, x: x.value.ndim > 1,
+        ),
+    )
+    update_norm = optax.global_norm(updates)
+    grad_norm_curr = optax.global_norm(accumulated_grads)
+    grad_norm_prev = optax.global_norm(prev_grads)
+    grad_dot = sum(
+        jnp.sum(g * p)
+        for g, p in zip(
+            jax.tree_util.tree_leaves(accumulated_grads),
+            jax.tree_util.tree_leaves(prev_grads),
+        )
+    )
+    grad_cosine_sim = jnp.where(
+        grad_norm_prev > 1e-9,
+        grad_dot / (grad_norm_curr * grad_norm_prev + 1e-12),
+        jnp.nan,
+    )
+    info = {
+        "grad_norm": grad_norm_curr,
+        "param_norm": optax.global_norm(kernel_params),
+        "update_norm": update_norm,
+        "grad_cosine_sim": grad_cosine_sim,
+    }
+    return new_state, info, accumulated_grads
+
+
+# Matches OpenPI Pi0 action-expert params (see pi0_config.get_freeze_filter / PathRegex(".*llm.*_1.*")).
+_ACTION_EXPERT_PATH_RE = re.compile(r".*llm.*_1.*")
+
+
+def _lr_schedule_for_peak(learning_rate: float, warmup_steps: int):
+    """Same schedule shape as init_train_state: warmup then constant, or cosine decay when no warmup."""
+    if warmup_steps > 0:
+        return optax.join_schedules(
+            schedules=[
+                optax.linear_schedule(0.0, learning_rate, warmup_steps),
+                optax.constant_schedule(learning_rate),
+            ],
+            boundaries=[warmup_steps],
+        )
+    return optax.warmup_cosine_decay_schedule(
+        init_value=learning_rate,
+        peak_value=learning_rate,
+        warmup_steps=0,
+        decay_steps=30000,
+        end_value=learning_rate * 0.1,
+    )
+
+
+def _optimizer_branch_no_wd(lr_peak: float, warmup_steps: int) -> optax.GradientTransformation:
+    return optax.chain(
+        optax.scale_by_adam(),
+        optax.scale_by_schedule(_lr_schedule_for_peak(lr_peak, warmup_steps)),
+        optax.scale(-1.0),
+    )
+
+
+def _optimizer_branch_wd(
+    weight_decay: float, lr_peak: float, warmup_steps: int
+) -> optax.GradientTransformation:
+    return optax.chain(
+        optax.scale_by_adam(),
+        optax.add_decayed_weights(weight_decay),
+        optax.scale_by_schedule(_lr_schedule_for_peak(lr_peak, warmup_steps)),
+        optax.scale(-1.0),
+    )
+
+
+def _param_labels_action_expert_vs_base(trainable_params: Any) -> Any:
+    """PyTree matching trainable_params; each leaf is 'action_expert' or 'base' for multi_transform."""
+
+    def label(path: Any, _leaf: Any) -> str:
+        path_s = jax.tree_util.keystr(path)
+        return "action_expert" if _ACTION_EXPERT_PATH_RE.search(path_s) else "base"
+
+    return jax.tree_util.tree_map_with_path(label, trainable_params)
+
+
+def init_train_state_two_lrs(
+    config: _config.TrainConfig,
+    weight_decay: float,
+    warmup_steps: int,
+    lr_action_expert: float,
+    lr_base: float,
+    graphdef: nnx.GraphDef,
+    params: at.Params,
+) -> training_utils.TrainState:
+    """Train state with separate Adam + LR schedules for action expert vs rest (not JIT — label tree is Python)."""
+    trainable = params.filter(config.trainable_filter)
+    labels = _param_labels_action_expert_vs_base(trainable)
+    if weight_decay > 0:
+        transforms = {
+            "action_expert": _optimizer_branch_wd(
+                weight_decay, lr_action_expert, warmup_steps
+            ),
+            "base": _optimizer_branch_wd(weight_decay, lr_base, warmup_steps),
+        }
+    else:
+        transforms = {
+            "action_expert": _optimizer_branch_no_wd(lr_action_expert, warmup_steps),
+            "base": _optimizer_branch_no_wd(lr_base, warmup_steps),
+        }
+    tx = optax.chain(
+        optax.clip_by_global_norm(1.0),
+        optax.multi_transform(transforms, labels),
+    )
+    opt_state = tx.init(trainable)
+    return training_utils.TrainState(
+        step=0,
+        params=params,
+        model_def=graphdef,
+        tx=tx,
+        opt_state=opt_state,
+        ema_decay=config.ema_decay,
+        ema_params=None if config.ema_decay is None else params,
+    )
 
 
 @functools.partial(
@@ -322,14 +595,7 @@ def init_train_state(
     # Get graphdef for the model (static structure)
     # graphdef = nnx.graphdef(model)
 
-    # Initialize optimizer with cosine decay schedule
-    lr_schedule = optax.warmup_cosine_decay_schedule(
-        init_value=learning_rate / (warmup_steps + 1),
-        peak_value=learning_rate,
-        warmup_steps=warmup_steps,
-        decay_steps=30000,
-        end_value=learning_rate * 0.1,
-    )
+    lr_schedule = _lr_schedule_for_peak(learning_rate, warmup_steps)
 
     # Create optimizer
     if weight_decay > 0:
@@ -396,6 +662,71 @@ def print_trainable_parameters(params: at.Params, trainable_filter):
     del param_counts
 
 
+def _index_tree_at(tree: Any, idx: int) -> Any:
+    """Index a PyTree at the given batch index (for arrays)."""
+
+    def _index(x: Any) -> Any:
+        if hasattr(x, "shape") and len(getattr(x, "shape", ())) > 0:
+            arr = np.asarray(x) if hasattr(x, "numpy") or hasattr(x, "__array__") else x
+            return arr[idx]
+        return x
+
+    return jax.tree.map(_index, tree)
+
+
+def _compute_alignment_weights_for_batch(
+    policy: Any,
+    observation: _model.Observation,
+    actions: at.Array,
+    threshold: float,
+    rng: at.KeyArrayLike,
+    task1_only: bool,
+) -> tuple[jnp.ndarray, float]:
+    """Compute sample weights: 1 if alignment_ratio <= threshold else 0.
+
+    When task1_only=True, only task1 samples (odd indices) are filtered; task2 get weight=1.
+    Returns (weights, avg_ratio) where avg_ratio is the mean alignment ratio over task1 samples.
+    """
+    batch_size = int(np.shape(actions)[0])
+    weights = np.ones(batch_size, dtype=np.float32)
+    if not task1_only:
+        return jnp.asarray(weights), 0.0
+    task1_indices = list(range(1, batch_size, 2))
+    if not task1_indices:
+        return jnp.asarray(weights), 0.0
+    obs_dict = observation.to_dict() if hasattr(observation, "to_dict") else observation
+    if "prompt" not in obs_dict:
+        obs_dict = dict(obs_dict)
+        obs_dict["prompt"] = ""
+    horizon, action_dim = int(actions.shape[1]), int(actions.shape[2])
+    ratio_sum = 0.0
+    for i, idx in enumerate(task1_indices):
+        obs_i = _index_tree_at(obs_dict, idx)
+        obs_i = dict(obs_i) if isinstance(obs_i, dict) else obs_i
+        if isinstance(obs_i, dict) and "prompt" not in obs_i:
+            obs_i = dict(obs_i)
+            obs_i["prompt"] = ""
+        actions_i = np.asarray(actions[idx])
+        if actions_i.ndim == 2:
+            actions_i = actions_i[None, ...]
+        step_rng = jax.random.fold_in(rng, idx)
+        noise = jax.random.normal(step_rng, (1, horizon, action_dim))
+        try:
+            ratios = compute_alignment_ratio(
+                policy, actions_i, obs_i, noise=noise, return_per_sample=True
+            )
+            ratios_arr = jnp.asarray(ratios)
+            ratio_val = float(
+                jax.device_get(ratios_arr[0] if ratios_arr.ndim > 0 else ratios_arr)
+            )
+        except (KeyError, IndexError, TypeError):
+            ratio_val = 0.0
+        ratio_sum += ratio_val
+        weights[idx] = 1.0 if ratio_val <= threshold else 0.0
+    avg_ratio = ratio_sum / len(task1_indices)
+    return jnp.asarray(weights), avg_ratio
+
+
 def train_model_on_fly(
     model: _model.BaseModel,
     training_data_loader: _data_loader.DataLoader,
@@ -424,6 +755,21 @@ def train_model_on_fly(
     validation_data_loader: Optional[_data_loader.DataLoader] = None,
     validation_interval: int = 5,
     on_validation_callback: Optional[Callable[[int, float], None]] = None,
+    # Optional evaluation: run env evaluation every N steps (e.g. every 20 steps).
+    evaluation_interval: int = 20,
+    on_evaluation_callback: Optional[Callable[[int, _model.BaseModel], None]] = None,
+    # Self-replay alignment weighting: filter task1 samples by alignment ratio.
+    alignment_ratio_threshold: float | None = None,
+    alignment_reference_policy: Optional[Any] = None,
+    alignment_weight_task1_only: bool = False,
+    # Gradient accumulation: accumulate gradients over N batches before applying (e.g. 2 when batch size is halved).
+    gradient_accumulation_steps: int = 1,
+    # Dynamic self-check: duplicate each batch with pseudo-actions from the current training model (not a fixed ref).
+    self_check_lambda_kl: float | None = None,
+    # Two learning rates: action expert (Pi0 llm *_1*) vs rest; uses optax.multi_transform (init not JIT).
+    two_lrs: bool = False,
+    lr_action_expert: float = 2.5e-4,
+    lr_base: float = 2.5e-5,
 ) -> tuple[_model.BaseModel, list[float], training_utils.TrainState]:
     """
     Train a model on the fly and return a copy of the trained model, training losses, and final train state.
@@ -520,9 +866,20 @@ def train_model_on_fly(
         print_memory_checkpoint("Before JIT compilation of init_train_state", 560)
 
         graphdef = nnx.graphdef(model)
-        train_state = init_train_state(
-            config, weight_decay, learning_rate, warmup_steps, graphdef, initial_params
-        )
+        if two_lrs:
+            train_state = init_train_state_two_lrs(
+                config,
+                weight_decay,
+                warmup_steps,
+                lr_action_expert,
+                lr_base,
+                graphdef,
+                initial_params,
+            )
+        else:
+            train_state = init_train_state(
+                config, weight_decay, learning_rate, warmup_steps, graphdef, initial_params
+            )
         # NOTE: after this we go from 12.58 GB -> 25.13 GB why?
         print_memory_checkpoint("After JIT compilation of init_train_state", 566)
 
@@ -556,7 +913,6 @@ def train_model_on_fly(
     # Training loop
     # Initialize losses from resume_losses if provided, otherwise start fresh
     losses = list(resume_losses) if resume_losses else []
-    infos = []
     aux_losses_by_step: list[list[float]] = []
     aux_enabled = aux_observation is not None and aux_actions is not None
     if aux_enabled and aux_num_samples < 1:
@@ -587,32 +943,133 @@ def train_model_on_fly(
     # Following marco.py: no separate warmup, first training step will compile naturally
     print_memory_checkpoint("Before training loop starts", 604)
 
+    # Zero-initialized prev_grads for step 0 (grad_cosine_sim will be nan)
+    trainable_params = train_state.params.filter(config.trainable_filter)
+
+    def _zero_like(x):
+        v = x.value if hasattr(x, "value") else x
+        return jnp.zeros_like(v)
+
+    prev_grads = jax.tree.map(_zero_like, trainable_params)
+    del trainable_params
+
+    accum_steps = gradient_accumulation_steps
+    if accum_steps > 1:
+        print(f"Gradient accumulation: {accum_steps} steps per optimizer update")
+    if self_check_lambda_kl is not None:
+        print(
+            f"Dynamic self-check: pseudo-labels from current model each step, lambda_kl={self_check_lambda_kl}"
+        )
+
     for step in pbar:
-        # Get batch from training set - aligned with train.py
-        # TIMING: Measure how long it takes to fetch and move batch to GPU
-        t0_fetch = time.perf_counter()
-        try:
-            batch = next(data_iter)
-        except StopIteration:
-            data_iter = iter(training_data_loader)
-            batch = next(data_iter)
-        t1_fetch = time.perf_counter()
-        batch_fetch_time = (t1_fetch - t0_fetch) * 1000  # Convert to ms
-        if PRINT_TIME_EXECUTION:
-            print(f"[TIMING] Batch fetch took {batch_fetch_time:.2f} ms")
-
-        # Training step - aligned with train.py: pass rng, state, batch
-        # TIMING: Measure training step (includes GPU computation)
-        t0_before_call = time.perf_counter()
-        if PRINT_TIME_EXECUTION:
-            print(f"[TIMING] About to call train_step_jit at step {step}")
-
         t0_train = time.perf_counter()
-        # JAX compilation logging is enabled via JAX_LOG_COMPILES=1
-        # JAX will automatically log compilation events (cache hits/misses)
+        t0_fetch = time.perf_counter()
 
-        # Call train_step directly (it's already JIT-compiled via decorator)
-        train_state, info = train_step_jit(rng, train_state, batch)
+        if accum_steps == 1:
+            # Single-step path: fetch one batch, apply train_step
+            try:
+                batch = next(data_iter)
+            except StopIteration:
+                data_iter = iter(training_data_loader)
+                batch = next(data_iter)
+            t1_fetch = time.perf_counter()
+            batch_fetch_time = (t1_fetch - t0_fetch) * 1000
+            if PRINT_TIME_EXECUTION:
+                print(f"[TIMING] Batch fetch took {batch_fetch_time:.2f} ms")
+
+            if self_check_lambda_kl is not None:
+                batch = _expand_self_check_batch(
+                    rng, train_state, batch, self_check_lambda_kl
+                )
+
+            if (
+                alignment_ratio_threshold is not None
+                and alignment_reference_policy is not None
+                and alignment_weight_task1_only
+            ):
+                step_rng = jax.random.fold_in(rng, step)
+                sample_weights, avg_ratio = _compute_alignment_weights_for_batch(
+                    policy=alignment_reference_policy,
+                    observation=batch[0],
+                    actions=batch[1],
+                    threshold=alignment_ratio_threshold,
+                    rng=step_rng,
+                    task1_only=True,
+                )
+                batch = (batch[0], batch[1], sample_weights)
+                alignment_step_info = {"alignment_task1_avg_ratio": avg_ratio}
+            else:
+                alignment_step_info = {}
+
+            train_state, info, prev_grads = train_step_jit(
+                rng, train_state, batch, prev_grads
+            )
+        else:
+            # Gradient accumulation: fetch N batches, compute grads, average, apply
+            accum_grads = None
+            accum_losses = []
+            alignment_ratios = []
+            for accum_i in range(accum_steps):
+                try:
+                    batch = next(data_iter)
+                except StopIteration:
+                    data_iter = iter(training_data_loader)
+                    batch = next(data_iter)
+                if self_check_lambda_kl is not None:
+                    batch = _expand_self_check_batch(
+                        rng, train_state, batch, self_check_lambda_kl
+                    )
+                if (
+                    alignment_ratio_threshold is not None
+                    and alignment_reference_policy is not None
+                    and alignment_weight_task1_only
+                ):
+                    step_rng = jax.random.fold_in(
+                        rng, step * accum_steps + accum_i
+                    )
+                    sample_weights, avg_ratio = _compute_alignment_weights_for_batch(
+                        policy=alignment_reference_policy,
+                        observation=batch[0],
+                        actions=batch[1],
+                        threshold=alignment_ratio_threshold,
+                        rng=step_rng,
+                        task1_only=True,
+                    )
+                    batch = (batch[0], batch[1], sample_weights)
+                    alignment_ratios.append(avg_ratio)
+                micro_rng = jax.random.fold_in(
+                    rng, int(step) * accum_steps + accum_i
+                )
+                grads, loss = _compute_grads_and_loss(
+                    config, micro_rng, train_state, batch
+                )
+                if accum_grads is None:
+                    accum_grads = grads
+                else:
+                    accum_grads = jax.tree.map(
+                        lambda a, b: a + b, accum_grads, grads
+                    )
+                    del grads  # Free promptly to reduce peak memory
+                accum_losses.append(loss)
+            t1_fetch = time.perf_counter()
+            batch_fetch_time = (t1_fetch - t0_fetch) * 1000
+
+            mean_grads = jax.tree.map(
+                lambda g: g / accum_steps, accum_grads
+            )
+            del accum_grads  # Free before apply to reduce peak memory
+            train_state, info, prev_grads = _apply_accumulated_grads(
+                config, train_state, mean_grads, prev_grads
+            )
+            del mean_grads
+            mean_loss = jnp.mean(jnp.stack(accum_losses))
+            info["loss"] = mean_loss
+            alignment_step_info = (
+                {"alignment_task1_avg_ratio": float(np.mean(alignment_ratios))}
+                if alignment_ratios
+                else {}
+            )
+
         t1_after_call = time.perf_counter()
         call_time = (t1_after_call - t0_train) * 1000  # Time for JIT call to return
 
@@ -634,7 +1091,7 @@ def train_model_on_fly(
 
         t1_train = time.perf_counter()
         train_step_time = (t1_train - t0_train) * 1000  # Total time
-        time_before_call = (t0_train - t0_before_call) * 1000  # Time before calling
+        time_before_call = 0.0  # t0_train is at loop start
 
         if PRINT_TIME_EXECUTION:
             print(f"[TIMING] Breakdown for step {step}:")
@@ -651,19 +1108,19 @@ def train_model_on_fly(
         loss_val = float(jax.device_get(info["loss"]))
         grad_norm = float(jax.device_get(info["grad_norm"]))
         update_norm = float(jax.device_get(info["update_norm"]))
+        grad_cosine_sim = float(jax.device_get(info["grad_cosine_sim"]))
         losses.append(loss_val)  # Store loss for plotting
         if on_step_callback is not None:
             on_step_callback(step, loss_val)
         if on_step_info_callback is not None:
-            on_step_info_callback(
-                step,
-                {
-                    "loss": loss_val,
-                    "grad_norm": grad_norm,
-                    "update_norm": update_norm,
-                },
-            )
-        infos.append({"loss": loss_val, "grad_norm": grad_norm, "update_norm": update_norm})
+            step_info = {
+                "loss": loss_val,
+                "grad_norm": grad_norm,
+                "update_norm": update_norm,
+                "grad_cosine_sim": grad_cosine_sim,
+            }
+            step_info.update(alignment_step_info)
+            on_step_info_callback(step, step_info)
 
         # Optional: compute validation loss at step 0 and every N steps (uses cached batches, no disk I/O).
         if (
@@ -676,6 +1133,18 @@ def train_model_on_fly(
             val_loss = _compute_validation_loss(val_model, validation_batches, seed)
             on_validation_callback(step, val_loss)
             del val_model
+            gc.collect()  # Free Python refs promptly; avoids OOM on next step with grad accumulation
+
+        # Optional: run env evaluation every N steps (e.g. every 20 steps).
+        if (
+            on_evaluation_callback is not None
+            and step % evaluation_interval == 0
+        ):
+            eval_model = nnx.merge(train_state.model_def, train_state.params)
+            eval_model.eval()
+            on_evaluation_callback(step, eval_model)
+            del eval_model
+            gc.collect()
 
         # Optional: compute auxiliary denoising loss after each optimization step.
         if aux_enabled:
@@ -771,12 +1240,16 @@ def run_evaluation(
     video_out_path: str = "data/libero/videos",
     seed: int = 0,
     plot_observations: bool = False,
+    teacher_policy: _policy.Policy | None = None,
 ):
     """Run evaluation on a LIBERO task.
 
     Args:
         policy: The policy to evaluate. For reproducible results, create the policy with
                 `create_policy(..., rng_seed=seed)` to initialize its internal RNG state.
+        teacher_policy: If set, after each replanning inference of ``policy`` (same obs and
+                noise), runs the teacher and records mean L2 distance between action chunks;
+                saves ``teacher_student_action_l2_task{task_id}.pdf`` under ``video_out_path``.
         num_trials: Number of evaluation episodes to run.
         task_suite_name: Name of the LIBERO task suite (e.g., "libero_10", "libero_90").
         task_id: ID of the task within the suite to evaluate.
@@ -807,6 +1280,7 @@ def run_evaluation(
         ttt_k=1,
         plot_observations=plot_observations,
         disable_adaptation=True,
+        teacher_policy=teacher_policy,
         )
 
 
@@ -976,6 +1450,7 @@ def run_evaluation_ttt(
     num_samples: int = 1,
     debug_metrics: bool = False,
     merging_eps: float | None = None,
+    teacher_policy: _policy.Policy | None = None,
 ):
 
 
@@ -1011,6 +1486,7 @@ def run_evaluation_ttt(
         merging_eps=merging_eps,
         adapt_kwargs={},
         disable_adaptation=disable_adaptation,
+        teacher_policy=teacher_policy,
     )
 
 
@@ -1373,6 +1849,48 @@ def compute_action_distances(action_chunk: _model.Actions, ttt_action_chunk: _mo
 
     return action_distance
 
+
+def _plot_teacher_student_action_l2_pdf(
+    episodes_l2: list[list[tuple[int, float]]],
+    output_path: str | pathlib.Path,
+    *,
+    task_id: int,
+) -> pathlib.Path | None:
+    """One subplot per episode: env step vs L2 between teacher and student action chunks."""
+    if not episodes_l2 or all(len(ep) == 0 for ep in episodes_l2):
+        return None
+    path = pathlib.Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    n = len(episodes_l2)
+    ncols = min(3, max(1, n))
+    nrows = (n + ncols - 1) // ncols
+    fig, axes = plt.subplots(
+        nrows, ncols, figsize=(4.5 * ncols, 3.2 * nrows), squeeze=False
+    )
+    for i, series in enumerate(episodes_l2):
+        r, c = divmod(i, ncols)
+        ax = axes[r][c]
+        if series:
+            xs = [p[0] for p in series]
+            ys = [p[1] for p in series]
+            ax.plot(xs, ys, "b.-", linewidth=1.2, markersize=4)
+        ax.set_xlabel("Environment step")
+        ax.set_ylabel("L2 distance (teacher vs student)")
+        ax.set_title(f"Episode {i + 1}")
+        ax.grid(True, alpha=0.3)
+    for j in range(n, nrows * ncols):
+        r, c = divmod(j, ncols)
+        axes[r][c].set_visible(False)
+    fig.suptitle(
+        f"Teacher vs student action chunk distance (task {task_id})",
+        fontsize=11,
+    )
+    plt.tight_layout()
+    fig.savefig(path, format="pdf", dpi=150)
+    plt.close(fig)
+    return path
+
+
 def _run_single_episode_with_adaptation(
     *,
     env: Any,
@@ -1413,6 +1931,7 @@ def _run_single_episode_with_adaptation(
     ttt_count: int,
     jax_key: jax.Array,
     pbar: Any,
+    teacher_policy: _policy.Policy | None = None,
 ) -> tuple[
     bool,
     int,
@@ -1426,6 +1945,7 @@ def _run_single_episode_with_adaptation(
     int,
     _policy.Policy,
     jax.Array,
+    list[tuple[int, float]],
 ]:
     env.seed(episode_seed)
     env.reset()
@@ -1454,6 +1974,7 @@ def _run_single_episode_with_adaptation(
     episode_losses: list[list[float]] = []
     episode_test_losses: list[list[float]] = []
     neighbor_previews: list[dict[str, Any]] = []
+    teacher_l2_by_env_step: list[tuple[int, float]] = []
 
     if not no_reset:
         policy = new_policy_like(policy, original_model)
@@ -1621,6 +2142,13 @@ def _run_single_episode_with_adaptation(
                     f"[TTT {ttt_count}] At the end of the TTT update deleting objects", 1300
                 )
 
+            if teacher_policy is not None:
+                teacher_chunk = _infer_action_chunk_samples(
+                    teacher_policy, curr_obs_dict, noise
+                )
+                l2_ts = compute_action_distances(teacher_chunk, action_chunk)
+                teacher_l2_by_env_step.append((t, l2_ts))
+
             action_plan.extend(action_chunk[:replan_steps])
 
         action = action_plan.popleft()
@@ -1642,6 +2170,7 @@ def _run_single_episode_with_adaptation(
         ttt_count,
         policy,
         jax_key,
+        teacher_l2_by_env_step,
     )
 
 
@@ -1677,6 +2206,7 @@ def run_evaluation_with_adaptation(
     merging_eps: float | None = None,
     adapt_kwargs: dict[str, Any] = {},
     disable_adaptation: bool = False,
+    teacher_policy: _policy.Policy | None = None,
 ):
     """
     Run evaluation with test-time training (TTT).
@@ -1704,6 +2234,10 @@ def run_evaluation_with_adaptation(
     Returns:
         success_rate: Success rate across all evaluation episodes
     """
+    try:
+        run_evaluation.last_teacher_student_l2_pdf = None  # type: ignore[attr-defined]
+    except Exception:
+        pass
 
     #########################################################
     # Part 1: Initialize the environment and the policy
@@ -1744,6 +2278,7 @@ def run_evaluation_with_adaptation(
     # We will attach this data to the function object at the end without changing
     # the public return type.
     all_episode_metrics: list[dict[str, Any]] = []
+    all_teacher_l2_episodes: list[list[tuple[int, float]]] = []
     print(f"\nStarting TTT evaluation: {num_trials} trials (seed={seed})...")
     print(f"TTT settings: {ttt_num_steps} steps every {ttt_frequency} rollout steps")
 
@@ -1791,7 +2326,8 @@ def run_evaluation_with_adaptation(
     # Part 2: Run evaluation episodes
     #########################################################
 
-    # Run evaluation episodes
+    # Run evaluation episodes; env.close() after loop — OffScreenRenderEnv EGL/MuJoCo
+    # otherwise retains GPU memory across repeated run_evaluation during training.
     pbar = tqdm(range(num_trials), desc=f"Task {task_id} | Success: 0/0 (0.0%)")
     for episode_idx in pbar:
         pbar.write(f"Episode {episode_idx+1} of {num_trials}")
@@ -1808,6 +2344,7 @@ def run_evaluation_with_adaptation(
             ttt_count,
             policy,
             jax_key,
+            teacher_l2_trace,
         ) = _run_single_episode_with_adaptation(
             env=env,
             policy=policy,
@@ -1847,7 +2384,9 @@ def run_evaluation_with_adaptation(
             ttt_count=ttt_count,
             jax_key=jax_key,
             pbar=pbar,
+            teacher_policy=teacher_policy,
         )
+        all_teacher_l2_episodes.append(list(teacher_l2_trace))
 
         task_episodes += 1
         if done:
@@ -1914,6 +2453,30 @@ def run_evaluation_with_adaptation(
             pbar.write(
                 f"  Episodes: {task_episodes}, Successes: {task_successes} ({task_successes/task_episodes*100:.1f}%)"
             )
+
+    try:
+        env.close()
+    except Exception:
+        pass
+
+    teacher_l2_pdf: pathlib.Path | None = None
+    if teacher_policy is not None:
+        pdf_path = pathlib.Path(VIDEO_OUT_PATH) / (
+            f"teacher_student_action_l2_task{task_id}.pdf"
+        )
+        teacher_l2_pdf = _plot_teacher_student_action_l2_pdf(
+            all_teacher_l2_episodes,
+            pdf_path,
+            task_id=task_id,
+        )
+        if teacher_l2_pdf is not None:
+            print(f"Saved teacher vs student action L2 plot to {teacher_l2_pdf}")
+        try:
+            run_evaluation.last_teacher_student_l2_pdf = (  # type: ignore[attr-defined]
+                str(teacher_l2_pdf) if teacher_l2_pdf is not None else None
+            )
+        except Exception:
+            pass
 
     # Expose collected metrics on the function object without changing the
     # public return type, so scripts can read them after a call.

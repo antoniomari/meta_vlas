@@ -196,7 +196,7 @@ def make_pseudo_label_inference_fn(policy: Any) -> Callable[[dict[str, Any]], np
     builds policy obs format, runs policy.infer, and returns actions for one sample.
     """
     def fn(data: dict[str, Any]) -> np.ndarray:
-        p = data.get("prompt", "do nothing")
+        p = data["prompt"]
         obs = _data_to_policy_obs_dict(data, p)
         result = policy.infer(obs, noise=None)
         actions = np.asarray(result["actions"])
@@ -242,34 +242,57 @@ def augment_dataset_with_pseudo_labels(
     )
 
 
-class AugmentedDataset(Dataset):
-    """Dataset that returns (normal_sample, null_sample) pairs for the same index.
+class PairDataset(Dataset):
+    """Unified dataset that yields (sample1, sample2) pairs for batch training.
 
-    Each __getitem__(i) returns a dict where each value is the concatenation of
-    dataset_normal[i] and dataset_null[i] along axis 0 (shape (2, ...)).
+    Supports two sampling modes:
+    - paired=True (self_replay): same index for both, (dataset1[i], dataset2[i])
+    - paired=False (cotraining/on_policy): independent sampling,
+      (dataset1[perm1[i]], dataset2[perm2[i]])
     Used with _collate_pair_fn to produce batches of 2*B samples.
     """
 
-    def __init__(self, dataset_normal: Dataset, dataset_null: Dataset):
-        assert len(dataset_normal) == len(dataset_null)
-        self._normal = dataset_normal
-        self._null = dataset_null
+    def __init__(
+        self,
+        dataset1: Dataset,
+        dataset2: Dataset,
+        *,
+        paired: bool = True,
+        seed: int = 0,
+    ):
+        self._d1 = dataset1
+        self._d2 = dataset2
+        self._paired = paired
+        if paired:
+            assert len(dataset1) == len(dataset2), "paired mode requires same length"
+            self._len = len(dataset1)
+        else:
+            n1, n2 = len(dataset1), len(dataset2)
+            self._len = max(n1, n2)
+            rng = np.random.default_rng(seed)
+            self._perm1 = rng.permutation(n1)
+            self._perm2 = rng.permutation(n2)
 
     def __len__(self) -> int:
-        return len(self._normal)
+        return self._len
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
-        normal = self._normal[idx]
-        null = self._null[idx]
+        if self._paired:
+            s1 = self._d1[idx]
+            s2 = self._d2[idx]
+        else:
+            n1, n2 = len(self._d1), len(self._d2)
+            s1 = self._d1[int(self._perm1[idx % n1])]
+            s2 = self._d2[int(self._perm2[idx % n2])]
         return jax.tree.map(
             lambda a, b: np.concatenate([np.asarray(a)[None, ...], np.asarray(b)[None, ...]], axis=0),
-            normal,
-            null,
+            s1,
+            s2,
         )
 
 
 def _collate_pair_fn(items: list[dict[str, Any]]) -> dict[str, Any]:
-    """Collate items from AugmentedDataset or CotrainingDataset: stack (B, 2, ...) then reshape to (2B, ...)."""
+    """Collate items from PairDataset: stack (B, 2, ...) then reshape to (2B, ...)."""
     stacked = jax.tree.map(
         lambda *xs: np.stack([np.asarray(x) for x in xs], axis=0),
         *items,
@@ -280,40 +303,6 @@ def _collate_pair_fn(items: list[dict[str, Any]]) -> dict[str, Any]:
     )
 
 
-class CotrainingDataset(Dataset):
-    """Dataset that yields (sample1, sample2) pairs from two datasets with independent sampling.
-
-    Each __getitem__(i) returns dataset1[perm1[i % n1]] and dataset2[perm2[i % n2]]
-    where perm1, perm2 are different random permutations. This provides independent
-    sampling from both tasks for cotraining.
-    """
-
-    def __init__(
-        self,
-        dataset1: Dataset,
-        dataset2: Dataset,
-        seed: int = 0,
-    ):
-        self._d1 = dataset1
-        self._d2 = dataset2
-        n1, n2 = len(dataset1), len(dataset2)
-        self._len = max(n1, n2)
-        rng = np.random.default_rng(seed)
-        self._perm1 = rng.permutation(n1)
-        self._perm2 = rng.permutation(n2)
-
-    def __len__(self) -> int:
-        return self._len
-
-    def __getitem__(self, idx: int) -> dict[str, Any]:
-        n1, n2 = len(self._d1), len(self._d2)
-        s1 = self._d1[int(self._perm1[idx % n1])]
-        s2 = self._d2[int(self._perm2[idx % n2])]
-        return jax.tree.map(
-            lambda a, b: np.concatenate([np.asarray(a)[None, ...], np.asarray(b)[None, ...]], axis=0),
-            s1,
-            s2,
-        )
 
 
 class _FlexibleTorchDataLoader:
@@ -413,6 +402,10 @@ def create_torch_data_loader(
     single_epoch: bool = False,
     cotraining: bool = False,
     cotraining_dataset: Dataset | None = None,
+    on_policy_cotraining: bool = False,
+    on_policy_cotraining_dataset: Dataset | None = None,
+    on_policy_inference_fn: Callable[[dict[str, Any]], np.ndarray] | None = None,
+    on_policy_prompt: str = "do nothing",
 ):
     """Create a data loader for training.
 
@@ -422,17 +415,34 @@ def create_torch_data_loader(
     for each batch, and concatenates (batch size becomes 2x).
     When cotraining=True: combines base_dataset with cotraining_dataset, sampling
     independently from each (batch size becomes 2x).
+    When on_policy_cotraining=True: like cotraining but cotraining dataset uses
+    pseudo-labels (inputs from dataset, actions from on_policy_inference_fn).
     Options:
       - augment_task_id is None: "do nothing" prompt + zero actions
       - augment_task_id is set: use that task's prompt; augment_inference_fn for
         pseudo-labels (if None, actions=zeros).
     """
+
+    # It will use the overridden dataset
     base_dataset = _data_loader.create_torch_dataset(data_config, action_horizon, model_config)
 
-    if cotraining and cotraining_dataset is not None:
+    if on_policy_cotraining and on_policy_cotraining_dataset is not None:
+        if on_policy_inference_fn is not None and num_workers > 0:
+            num_workers = 0
+        dataset1 = transform_dataset(base_dataset, data_config, skip_norm_stats=skip_norm_stats)
+        dataset2 = augment_dataset_with_pseudo_labels(
+            on_policy_cotraining_dataset,
+            data_config,
+            skip_norm_stats=skip_norm_stats,
+            prompt=on_policy_prompt,
+            inference_fn=on_policy_inference_fn,
+        )
+        dataset = PairDataset(dataset1, dataset2, paired=False, seed=seed)
+        local_batch_size = batch_size
+    elif cotraining and cotraining_dataset is not None:
         dataset1 = transform_dataset(base_dataset, data_config, skip_norm_stats=skip_norm_stats)
         dataset2 = transform_dataset(cotraining_dataset, data_config, skip_norm_stats=skip_norm_stats)
-        dataset = CotrainingDataset(dataset1, dataset2, seed=seed)
+        dataset = PairDataset(dataset1, dataset2, paired=False, seed=seed)
         local_batch_size = batch_size
     elif augment:
         # augment_inference_fn is a closure (from make_pseudo_label_inference_fn) that
@@ -451,14 +461,14 @@ def create_torch_data_loader(
             prompt=augment_prompt,
             inference_fn=augment_inference_fn,
         )
-        dataset = AugmentedDataset(dataset_normal, dataset_augmented)
+        dataset = PairDataset(dataset_normal, dataset_augmented, paired=True)
         # Each "sample" is a (normal, null) pair -> 2 samples. Use half batch size for pairs.
         local_batch_size = batch_size  #  // 2
     else:
         dataset = transform_dataset(base_dataset, data_config, skip_norm_stats=skip_norm_stats)
         local_batch_size = batch_size
 
-    use_pair_collate = augment or (cotraining and cotraining_dataset is not None)
+    use_pair_collate = augment or (cotraining and cotraining_dataset is not None) or (on_policy_cotraining and on_policy_cotraining_dataset is not None)
     sampler = None
     if framework == "pytorch":
         if torch.distributed.is_initialized():
@@ -479,7 +489,7 @@ def create_torch_data_loader(
         num_batches = len(dataset) // local_batch_size
 
     if use_pair_collate:
-        mode = "cotraining" if cotraining else "augmented"
+        mode = "on_policy_cotraining" if on_policy_cotraining else ("cotraining" if cotraining else "augmented")
         logging.info(
             f"local_batch_size: {local_batch_size} pairs -> {2 * local_batch_size} samples ({mode})"
         )
@@ -525,6 +535,9 @@ def override_create_torch_dataset(
     augment_inference_fn: Callable[[dict[str, Any]], np.ndarray] | None = None,
     cotraining: bool = False,
     cotraining_task_id: int | None = None,
+    on_policy_self_replay: bool = False,
+    on_policy_cotraining_task_id: int | None = None,
+    on_policy_inference_fn: Callable[[dict[str, Any]], np.ndarray] | None = None,
 ):
     """Temporarily override OpenPI create_torch_dataset with LIBERO-aware one.
 
@@ -532,6 +545,8 @@ def override_create_torch_dataset(
     create_torch_data_loader, concatenating each batch with an augmented copy.
     If cotraining is True, samples batches from task_id and cotraining_task_id
     independently and concatenates (no pseudo-labels).
+    If on_policy_self_replay is True: cotraining where cotraining task uses
+    inputs from dataset but actions from on_policy_inference_fn (reference model).
     Options: augment_task_id=None for "do nothing"+zeros; augment_task_id set
     for task prompt + augment_inference_fn (pseudo-labels).
     """
@@ -588,6 +603,7 @@ def override_create_torch_dataset(
 
         return dataset
 
+    # Creates the main dataset with the given task_id
     def create_dataset(
         data_config: _config.DataConfig, action_horizon: int, model_config: Any
     ) -> Dataset:
@@ -615,16 +631,40 @@ def override_create_torch_dataset(
             **{**kwargs, "cotraining": True, "cotraining_dataset": cotraining_ds},
         )
 
+    def create_loader_with_on_policy_self_replay(*args, **kwargs):
+        data_config = args[0] if args else kwargs["data_config"]
+        action_horizon = kwargs.get("action_horizon")
+        model_config = kwargs.get("model_config")
+        on_policy_ds = create_dataset_impl(
+            on_policy_cotraining_task_id, data_config, action_horizon, model_config
+        )
+        on_policy_prompt = LIBERO_90_TASK_IDS_PROMPTS.get(
+            on_policy_cotraining_task_id, "do nothing"
+        )
+        return create_torch_data_loader(
+            *args,
+            **{
+                **kwargs,
+                "on_policy_cotraining": True,
+                "on_policy_cotraining_dataset": on_policy_ds,
+                "on_policy_inference_fn": on_policy_inference_fn,
+                "on_policy_prompt": on_policy_prompt,
+            },
+        )
+
+    # Create the main dataset with the given task_id
     _data_loader.create_torch_dataset = create_dataset
     if augment:
         _data_loader.create_torch_data_loader = create_loader_with_augment
+    elif on_policy_self_replay and on_policy_cotraining_task_id is not None and on_policy_inference_fn is not None:
+        _data_loader.create_torch_data_loader = create_loader_with_on_policy_self_replay
     elif cotraining and cotraining_task_id is not None:
         _data_loader.create_torch_data_loader = create_loader_with_cotraining
     try:
         yield
     finally:
         _data_loader.create_torch_dataset = original_create_dataset
-        if augment or cotraining:
+        if augment or cotraining or on_policy_self_replay:
             _data_loader.create_torch_data_loader = original_create_torch_data_loader
 
 
@@ -809,7 +849,12 @@ class Libero90MirrorTransform(transforms.DataTransformFn):
         return _mirror_libero90_example(data)
 
 
+# Backward compatibility: PairDataset replaces AugmentedDataset and CotrainingDataset
+AugmentedDataset = PairDataset  # paired=True
+CotrainingDataset = PairDataset  # paired=False (pass paired=False when constructing)
+
 __all__ = [
+    "PairDataset",
     "AugmentedDataset",
     "CotrainingDataset",
     "FilteredDataset",
