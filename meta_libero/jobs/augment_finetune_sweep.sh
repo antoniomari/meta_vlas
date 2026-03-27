@@ -26,8 +26,8 @@ FINETUNE_TYPES=("")  # ("" "lora" "action_expert_only")
 
 
 # Hyperparameters to sweep
-LEARNING_RATES=(2.5e-04)
-NUM_STEPS_LIST=(50)
+LEARNING_RATES=(1e-04)
+NUM_STEPS_LIST=(200)
 MERGING_EPS_LIST=(1 0.75)  # 1.0=keep phase2, 0=keep phase1, 0.5=50/50 blend
 # Alignment ratio threshold for self_replay/on_policy_self_replay: "" = disable, "0.2" = keep samples with ratio <= 0.2
 ALIGNMENT_RATIO_THRESHOLD_LIST=("") # ("" "0.2")

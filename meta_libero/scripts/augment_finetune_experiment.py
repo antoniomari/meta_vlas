@@ -63,6 +63,9 @@ from meta_libero.src.dataset import (  # type: ignore
     override_create_torch_dataset,
 )
 from meta_libero.src.ttt import (  # type: ignore
+    PAIR_STREAM_HALVES,
+    PAIR_STREAM_INTERLEAVED,
+    PAIR_STREAM_NONE,
     create_policy,
     run_evaluation,
     train_model_on_fly,
@@ -162,10 +165,22 @@ def _plot_training_curves_pdf(
     phase2_grad_cosine_sims: list[float],
     phase2_alignment_avg_ratios: list[float] | None = None,
     phase2_eval_by_step: list[dict] | None = None,
+    phase2_loss_stream_0: list[float] | None = None,
+    phase2_loss_stream_1: list[float] | None = None,
+    phase2_stream_labels: tuple[str, str] | None = None,
     pdf_path: Path | None = None,
 ) -> None:
-    """Create PDF with loss, grad norm, param update norm, grad cosine sim, alignment, and eval success."""
+    """Create PDF with loss, optional per-stream Phase 2 losses, grad norms, alignment, eval success."""
+    has_dual_streams = (
+        phase2_loss_stream_0 is not None
+        and phase2_loss_stream_1 is not None
+        and phase2_stream_labels is not None
+        and len(phase2_loss_stream_0) > 0
+        and len(phase2_loss_stream_0) == len(phase2_loss_stream_1)
+    )
     n_subplots = 4
+    if has_dual_streams:
+        n_subplots += 1
     if phase2_alignment_avg_ratios:
         n_subplots += 1
     if phase2_eval_by_step:
@@ -175,14 +190,15 @@ def _plot_training_curves_pdf(
         axes = [axes]
 
     phase1_len = len(phase1_train_losses)
+    ax_idx = 0
 
-    # Subplot 1: Loss
-    ax = axes[0]
+    # Subplot 1: Loss (combined)
+    ax = axes[ax_idx]
     if phase1_train_losses:
         ax.plot(range(phase1_len), phase1_train_losses, "b-", label="Phase 1 train (task_1)", linewidth=1.5)
     if phase2_train_losses:
         steps = [phase1_len + i for i in range(len(phase2_train_losses))]
-        ax.plot(steps, phase2_train_losses, "c-", label="Phase 2 train (task_2)", linewidth=1.5)
+        ax.plot(steps, phase2_train_losses, "c-", label="Phase 2 train (combined)", linewidth=1.5)
     if phase2_val_task1:
         steps = [phase1_len + x["step"] for x in phase2_val_task1]
         losses = [x["loss"] for x in phase2_val_task1]
@@ -191,9 +207,36 @@ def _plot_training_curves_pdf(
     ax.set_title("Fine-tune loss curves")
     ax.legend(loc="upper right", fontsize=8)
     ax.grid(True, alpha=0.3)
+    ax_idx += 1
 
-    # Subplot 2: Gradient norm
-    ax = axes[1]
+    # Subplot 2: Phase 2 per-stream losses (paired / double-dataset batches)
+    if has_dual_streams:
+        ax = axes[ax_idx]
+        assert phase2_loss_stream_0 is not None and phase2_loss_stream_1 is not None
+        assert phase2_stream_labels is not None
+        steps2 = [phase1_len + i for i in range(len(phase2_loss_stream_0))]
+        ax.plot(
+            steps2,
+            phase2_loss_stream_0,
+            "c-",
+            label=phase2_stream_labels[0],
+            linewidth=1.5,
+        )
+        ax.plot(
+            steps2,
+            phase2_loss_stream_1,
+            "m-",
+            label=phase2_stream_labels[1],
+            linewidth=1.5,
+        )
+        ax.set_ylabel("Loss")
+        ax.set_title("Phase 2 train loss by batch stream")
+        ax.legend(loc="upper right", fontsize=8)
+        ax.grid(True, alpha=0.3)
+        ax_idx += 1
+
+    # Gradient norm
+    ax = axes[ax_idx]
     if phase1_grad_norms:
         ax.plot(range(len(phase1_grad_norms)), phase1_grad_norms, "b-", label="Phase 1 train", linewidth=1.5)
     if phase2_grad_norms:
@@ -203,9 +246,10 @@ def _plot_training_curves_pdf(
     ax.set_title("Gradient norm per step")
     ax.legend(loc="upper right", fontsize=8)
     ax.grid(True, alpha=0.3)
+    ax_idx += 1
 
-    # Subplot 3: Param update norm (magnitude of parameter shift)
-    ax = axes[2]
+    # Param update norm
+    ax = axes[ax_idx]
     if phase1_update_norms:
         ax.plot(range(len(phase1_update_norms)), phase1_update_norms, "b-", label="Phase 1 train", linewidth=1.5)
     if phase2_update_norms:
@@ -215,9 +259,10 @@ def _plot_training_curves_pdf(
     ax.set_title("Parameter shift magnitude (L2 norm of updates)")
     ax.legend(loc="upper right", fontsize=8)
     ax.grid(True, alpha=0.3)
+    ax_idx += 1
 
-    # Subplot 4: Gradient cosine similarity (current vs previous gradient)
-    ax = axes[3]
+    # Grad cosine sim
+    ax = axes[ax_idx]
     if phase1_grad_cosine_sims:
         ax.plot(range(len(phase1_grad_cosine_sims)), phase1_grad_cosine_sims, "b-", label="Phase 1 train", linewidth=1.5)
     if phase2_grad_cosine_sims:
@@ -227,9 +272,8 @@ def _plot_training_curves_pdf(
     ax.set_title("Gradient cosine similarity (current vs previous)")
     ax.legend(loc="upper right", fontsize=8)
     ax.grid(True, alpha=0.3)
+    ax_idx += 1
 
-    # Subplot 5: Alignment ratio (avg over task1 samples in batch)
-    ax_idx = 4
     if phase2_alignment_avg_ratios:
         ax = axes[ax_idx]
         steps = [phase1_len + i for i in range(len(phase2_alignment_avg_ratios))]
@@ -240,7 +284,6 @@ def _plot_training_curves_pdf(
         ax.grid(True, alpha=0.3)
         ax_idx += 1
 
-    # Subplot 6: Eval success rate during Phase 2 (every 20 steps + final)
     if phase2_eval_by_step:
         ax = axes[ax_idx]
         steps = [phase1_len + x["step"] for x in phase2_eval_by_step]
@@ -428,6 +471,9 @@ def main() -> None:
         "phase1_train_grad_cosine_sims": [],
         "phase1_eval_task1_success_rate": None,
         "phase2_train_losses": [],
+        "phase2_loss_stream_0": [],
+        "phase2_loss_stream_1": [],
+        "phase2_stream_labels": ("", ""),
         "phase2_train_grad_norms": [],
         "phase2_train_update_norms": [],
         "phase2_train_grad_cosine_sims": [],
@@ -601,7 +647,36 @@ def main() -> None:
             single_epoch=True,
         )
 
+    if phase2_self_check:
+        pair_stream_phase2 = PAIR_STREAM_HALVES
+        phase2_stream_labels = (
+            "Phase 2 task2 (ground-truth)",
+            "Phase 2 pseudo (self-check)",
+        )
+    elif phase2_augment or phase2_cotraining or phase2_on_policy_self_replay:
+        pair_stream_phase2 = PAIR_STREAM_INTERLEAVED
+        if phase2_on_policy_self_replay:
+            phase2_stream_labels = (
+                "Phase 2 task2 (dataset)",
+                "Phase 2 task1 on-policy pseudo",
+            )
+        elif phase2_cotraining:
+            phase2_stream_labels = (
+                "Phase 2 task2 (dataset)",
+                "Phase 2 task1 (dataset)",
+            )
+        else:
+            phase2_stream_labels = (
+                "Phase 2 task2 (main)",
+                "Phase 2 augment (task1 pseudo)",
+            )
+    else:
+        pair_stream_phase2 = PAIR_STREAM_NONE
+        phase2_stream_labels = ("", "")
+
     phase2_train_losses: list[float] = []
+    phase2_loss_stream_0: list[float] = []
+    phase2_loss_stream_1: list[float] = []
     phase2_grad_norms: list[float] = []
     phase2_update_norms: list[float] = []
     phase2_grad_cosine_sims: list[float] = []
@@ -616,6 +691,13 @@ def main() -> None:
         phase2_grad_norms.append(info["grad_norm"])
         phase2_update_norms.append(info["update_norm"])
         phase2_grad_cosine_sims.append(info["grad_cosine_sim"])
+        if pair_stream_phase2 != PAIR_STREAM_NONE:
+            if "loss_stream_0" in info:
+                phase2_loss_stream_0.append(info["loss_stream_0"])
+                phase2_loss_stream_1.append(info["loss_stream_1"])
+            else:
+                phase2_loss_stream_0.append(float("nan"))
+                phase2_loss_stream_1.append(float("nan"))
         if "alignment_task1_avg_ratio" in info:
             phase2_alignment_avg_ratios.append(info["alignment_task1_avg_ratio"])
 
@@ -634,6 +716,7 @@ def main() -> None:
             save_video=False,
             video_out_path="",
             seed=seed,
+            show_progress_bar=False,
         )
         sr_t2, _ = run_evaluation(
             policy=policy,
@@ -644,6 +727,7 @@ def main() -> None:
             save_video=False,
             video_out_path="",
             seed=seed,
+            show_progress_bar=False,
         )
         phase2_eval_by_step.append({
             "step": step,
@@ -674,6 +758,7 @@ def main() -> None:
         on_validation_callback=_on_val_task1,
         evaluation_interval=20,
         on_evaluation_callback=_on_eval_phase2,
+        pair_stream_layout=pair_stream_phase2,
     )
     # Alignment weighting: filter task1 samples by alignment ratio (self_replay and on_policy_self_replay)
     if (
@@ -706,6 +791,9 @@ def main() -> None:
         )
 
     results["phase2_train_losses"] = phase2_train_losses
+    results["phase2_loss_stream_0"] = phase2_loss_stream_0
+    results["phase2_loss_stream_1"] = phase2_loss_stream_1
+    results["phase2_stream_labels"] = phase2_stream_labels
     results["phase2_train_grad_norms"] = phase2_grad_norms
     results["phase2_train_update_norms"] = phase2_update_norms
     results["phase2_train_grad_cosine_sims"] = phase2_grad_cosine_sims
@@ -773,6 +861,11 @@ def main() -> None:
         phase2_grad_cosine_sims=results["phase2_train_grad_cosine_sims"],
         phase2_alignment_avg_ratios=results["phase2_alignment_avg_ratios"],
         phase2_eval_by_step=results["phase2_eval_by_step"],
+        phase2_loss_stream_0=results["phase2_loss_stream_0"] or None,
+        phase2_loss_stream_1=results["phase2_loss_stream_1"] or None,
+        phase2_stream_labels=results["phase2_stream_labels"]
+        if pair_stream_phase2 != PAIR_STREAM_NONE
+        else None,
         pdf_path=losses_pdf,
     )
     print(f"\nSaved losses PDF to {losses_pdf}")
