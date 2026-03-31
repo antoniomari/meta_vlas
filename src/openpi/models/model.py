@@ -4,7 +4,7 @@ import dataclasses
 import enum
 import logging
 import pathlib
-from typing import Generic, TypeVar
+from typing import Any, Generic, Optional, TypeVar
 
 import augmax
 from flax import nnx
@@ -277,6 +277,9 @@ class BaseModel(nnx.Module, abc.ABC):
         actions: Actions,
         *,
         train: bool = False,
+        l1_loss: bool = False,
+        ref_model: Optional[Any] = None,
+        kl_lambda: float = 0.0,
     ) -> at.Float[at.Array, "*b ah"]: ...
 
     @abc.abstractmethod

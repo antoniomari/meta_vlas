@@ -196,7 +196,15 @@ class Pi0FAST(_model.BaseModel):
 
     @override
     def compute_loss(
-        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        actions: _model.Actions,
+        *,
+        train: bool = False,
+        l1_loss: bool = False,
+        ref_model: Any | None = None,
+        kl_lambda: float = 0.0,
     ) -> at.Float[at.Array, "*b ah"]:
         observation = _model.preprocess_observation(
             rng, observation, train=train, image_keys=list(observation.images.keys())
@@ -226,7 +234,10 @@ class Pi0FAST(_model.BaseModel):
         )
         logp = jax.nn.log_softmax(logits, axis=-1)
 
-        # Compute CE loss on token targets
+        # Pi0 FAST uses cross-entropy on tokens; no diffusion residual (API parity with Pi0).
+        _ = l1_loss
+        _ = ref_model
+        _ = kl_lambda
         assert observation.token_loss_mask is not None, "Token loss mask is required"
         loss_mask = observation.token_loss_mask[:, 1:]
         token_pplx = jnp.sum(targets * logp, axis=-1)

@@ -32,6 +32,10 @@ from openpi_client import image_tools  # type: ignore
 
 _TASK_INDICES_CACHE: dict[str, dict[int, list[int]]] = {}
 
+# Raw LIBERO low-dim proprio length. Training pads to ``model.action_dim`` (e.g. 32) via
+# ``PadStatesAndActions``; policy ``infer`` must receive unpadded state so quantile norm matches stats.
+_LIBERO_STATE_DIM = 8
+
 LIBERO_90_TASK_IDS_PROMPTS = {
     0: "close the top drawer of the cabinet",
     1: "close the top drawer of the cabinet and put the black bowl on top of it",
@@ -158,7 +162,11 @@ def _data_to_policy_obs_dict(data: dict[str, Any], prompt: str) -> dict[str, Any
     else:
         base_img = np.asarray(img) if img is not None else np.zeros((224, 224, 3), dtype=np.uint8)
         wrist_img = np.zeros((224, 224, 3), dtype=np.uint8)
-    state = np.asarray(data.get("state", data.get("observation/state", np.zeros(8, dtype=np.float32))))
+    state = np.asarray(
+        data.get("state", data.get("observation/state", np.zeros(_LIBERO_STATE_DIM, dtype=np.float32)))
+    )
+    if state.shape[-1] > _LIBERO_STATE_DIM:
+        state = state[..., :_LIBERO_STATE_DIM]
     return {
         "observation/image": base_img,
         "observation/wrist_image": wrist_img,

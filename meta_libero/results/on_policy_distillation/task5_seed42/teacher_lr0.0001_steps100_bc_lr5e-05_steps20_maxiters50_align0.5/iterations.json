@@ -1,0 +1,42 @@
+[
+  {
+    "iter": 0,
+    "rollout_success": false,
+    "success_rate": 0.0,
+    "n_new_examples": 80,
+    "alignment_n_kept": 74,
+    "alignment_n_dropped": 6,
+    "bc_train_size": 74,
+    "cumulative_buffer": false
+  },
+  {
+    "iter": 1,
+    "rollout_success": false,
+    "success_rate": 0.0,
+    "n_new_examples": 80,
+    "alignment_n_kept": 71,
+    "alignment_n_dropped": 9,
+    "bc_train_size": 71,
+    "cumulative_buffer": false
+  },
+  {
+    "iter": 2,
+    "rollout_success": false,
+    "success_rate": 0.0,
+    "n_new_examples": 80,
+    "alignment_n_kept": 71,
+    "alignment_n_dropped": 9,
+    "bc_train_size": 71,
+    "cumulative_buffer": false
+  },
+  {
+    "iter": 3,
+    "rollout_success": true,
+    "success_rate": 1.0,
+    "n_new_examples": 71,
+    "alignment_n_kept": 65,
+    "alignment_n_dropped": 6,
+    "bc_train_size": 65,
+    "cumulative_buffer": false
+  }
+]

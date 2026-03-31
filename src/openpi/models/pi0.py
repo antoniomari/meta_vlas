@@ -217,7 +217,15 @@ class Pi0(_model.BaseModel):
 
     @override
     def compute_loss(
-        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        actions: _model.Actions,
+        *,
+        train: bool = False,
+        l1_loss: bool = False,
+        ref_model: "Pi0 | None" = None,
+        kl_lambda: float = 0.0,
     ) -> at.Float[at.Array, "*b ah"]:
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
@@ -242,8 +250,32 @@ class Pi0(_model.BaseModel):
         )
         # v_t predicts "noise - action"
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
-
-        return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        err = v_t - u_t
+        if l1_loss:
+            teacher_chunk = jnp.mean(jnp.abs(err), axis=-1)
+        else:
+            teacher_chunk = jnp.mean(jnp.square(err), axis=-1)
+        if ref_model is not None and float(kl_lambda) != 0.0:
+            lam = jnp.asarray(kl_lambda, dtype=teacher_chunk.dtype)
+            prefix_tokens_r, prefix_mask_r, prefix_ar_mask_r = ref_model.embed_prefix(observation)
+            suffix_tokens_r, suffix_mask_r, suffix_ar_mask_r, adarms_cond_r = ref_model.embed_suffix(
+                observation, x_t, time
+            )
+            input_mask_r = jnp.concatenate([prefix_mask_r, suffix_mask_r], axis=1)
+            ar_mask_r = jnp.concatenate([prefix_ar_mask_r, suffix_ar_mask_r], axis=0)
+            attn_mask_r = make_attn_mask(input_mask_r, ar_mask_r)
+            positions_r = jnp.cumsum(input_mask_r, axis=1) - 1
+            (_, suffix_out_r), _ = ref_model.PaliGemma.llm(
+                [prefix_tokens_r, suffix_tokens_r],
+                mask=attn_mask_r,
+                positions=positions_r,
+                adarms_cond=[None, adarms_cond_r],
+            )
+            v_ref = ref_model.action_out_proj(suffix_out_r[:, -ref_model.action_horizon :])
+            v_ref = jax.lax.stop_gradient(v_ref)
+            kl_chunk = jnp.mean(jnp.square(v_t - v_ref), axis=-1)
+            return teacher_chunk + lam * kl_chunk
+        return teacher_chunk
 
     @override
     def sample_actions(

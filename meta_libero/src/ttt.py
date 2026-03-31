@@ -31,6 +31,11 @@ import collections
 import math
 import pathlib
 from pathlib import Path
+
+# Pair-batch layouts for logging per-stream losses (see train_step / train_model_on_fly).
+PAIR_STREAM_NONE = 0
+PAIR_STREAM_INTERLEAVED = 1  # PairDataset collate: s1,s2,s1,s2,... (task2 stream, task1 stream)
+PAIR_STREAM_HALVES = 2  # First half vs second half (e.g. self-check: GT then pseudo)
 import imageio
 from PIL import Image, ImageDraw, ImageFont
 import sys
@@ -243,7 +248,10 @@ def _duplicate_observation_along_batch(obs: _model.Observation) -> _model.Observ
 def _expand_self_check_batch(
     rng: at.KeyArrayLike,
     train_state: training_utils.TrainState,
-    batch: tuple[_model.Observation, _model.Actions],
+    batch: Union[
+        tuple[_model.Observation, _model.Actions],
+        tuple[_model.Observation, _model.Actions, at.Array],
+    ],
     lambda_kl: float,
 ) -> tuple[_model.Observation, _model.Actions, at.Array]:
     """Duplicate batch: first half ground-truth actions, second half pseudo-actions from current model."""
@@ -258,20 +266,48 @@ def _expand_self_check_batch(
     obs_dup = _duplicate_observation_along_batch(observation)
     B = int(actions.shape[0])
     actions_dup = jnp.concatenate([actions, pseudo_actions], axis=0)
-    weights = jnp.concatenate(
-        [
-            jnp.ones(B, dtype=jnp.float32),
-            jnp.full(B, float(lambda_kl), dtype=jnp.float32),
-        ]
+    base_w = (
+        batch[2]
+        if len(batch) == 3
+        else jnp.ones(B, dtype=jnp.float32)
     )
+    lam = jnp.asarray(lambda_kl, dtype=jnp.float32)
+    weights = jnp.concatenate([base_w, base_w * lam])
     del model
     return (obs_dup, actions_dup, weights)
 
 
+def _pair_stream_reduced_losses(
+    loss_per_sample: jax.Array,
+    sample_weights: jax.Array,
+    pair_stream_layout: int,
+) -> tuple[jax.Array, jax.Array]:
+    """Mean loss on stream A vs B (weighted). layout=0 -> nan,nan."""
+    nan = jnp.asarray(jnp.nan, dtype=loss_per_sample.dtype)
+    if pair_stream_layout == PAIR_STREAM_NONE:
+        return nan, nan
+    wt = sample_weights.astype(loss_per_sample.dtype)
+    B = loss_per_sample.shape[0]
+    if pair_stream_layout == PAIR_STREAM_INTERLEAVED:
+        m0 = (jnp.arange(B) % 2 == 0).astype(loss_per_sample.dtype)
+        m1 = 1.0 - m0
+    else:
+        half = B // 2
+        m0 = (jnp.arange(B) < half).astype(loss_per_sample.dtype)
+        m1 = 1.0 - m0
+    d0 = jnp.maximum(jnp.sum(wt * m0), 1e-8)
+    d1 = jnp.maximum(jnp.sum(wt * m1), 1e-8)
+    ls0 = jnp.sum(loss_per_sample * wt * m0) / d0
+    ls1 = jnp.sum(loss_per_sample * wt * m1) / d1
+    return ls0, ls1
+
+
 @at.typecheck
 @functools.partial(
-    jax.jit, static_argnums=(0,), donate_argnums=(2, 4)
-)  # config is static; donate state and prev_grads
+    jax.jit,
+    static_argnums=(0, 5, 6, 7, 8),
+    donate_argnums=(2, 4),
+)  # config, pair_stream_layout, l1_loss, kl_lambda, grpo_like static; ref_graphdef/ref_params dynamic
 def train_step(
     config: _config.TrainConfig,
     rng: at.KeyArrayLike,
@@ -281,6 +317,12 @@ def train_step(
         tuple[_model.Observation, _model.Actions, at.Array],
     ],
     prev_grads: Any,
+    pair_stream_layout: int = PAIR_STREAM_NONE,
+    l1_loss: bool = False,
+    kl_lambda: float = 0.0,
+    grpo_like: bool = False,
+    ref_graphdef: Any = None,
+    ref_params: Any = None,
 ) -> tuple[training_utils.TrainState, dict[str, at.Array], Any]:
     # Memory checkpoint: start of train_step
     # NOTE: Removed all jax.lax.cond print statements to avoid recompilation
@@ -290,6 +332,11 @@ def train_step(
 
     model = nnx.merge(state.model_def, state.params)
     model.train()
+
+    ref_m: _model.BaseModel | None = None
+    if float(kl_lambda) != 0.0 and ref_graphdef is not None:
+        ref_m = nnx.merge(ref_graphdef, ref_params)
+        ref_m.eval()
 
     @at.typecheck
     def loss_fn(
@@ -301,9 +348,24 @@ def train_step(
     ):
         # Note: I set train=False to avoid preprocessing observation
         # TODO: consider what is the best thing to do here
-        chunked_loss = model.compute_loss(rng, observation, actions, train=False)
+        chunked_loss = model.compute_loss(
+            rng,
+            observation,
+            actions,
+            train=False,
+            l1_loss=l1_loss,
+            ref_model=ref_m,
+            kl_lambda=kl_lambda,
+        )
         # chunked_loss has shape (B, action_horizon); reduce to per-sample
         loss_per_sample = jnp.mean(chunked_loss, axis=tuple(range(1, chunked_loss.ndim)))
+        if grpo_like:
+            # Surrogate for sum_i A_i * log pi(a_i|s): mean_i A_i * denoise_loss_i (signed A_i in sample_weights).
+            bsz = jnp.maximum(
+                jnp.asarray(jnp.shape(actions)[0], dtype=loss_per_sample.dtype),
+                jnp.asarray(1.0, dtype=loss_per_sample.dtype),
+            )
+            return jnp.sum(loss_per_sample * sample_weights) / bsz
         # Weighted loss: sum(loss * weights) / max(sum(weights), eps); weights=1 gives mean loss
         return jnp.sum(loss_per_sample * sample_weights) / jnp.maximum(
             jnp.sum(sample_weights), 1e-8
@@ -319,6 +381,23 @@ def train_step(
     loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(
         model, train_rng, observation, actions, sample_weights
     )
+
+    if pair_stream_layout != PAIR_STREAM_NONE:
+        chunked_m = model.compute_loss(
+            train_rng,
+            observation,
+            actions,
+            train=False,
+            l1_loss=l1_loss,
+            ref_model=ref_m,
+            kl_lambda=kl_lambda,
+        )
+        lps_m = jnp.mean(chunked_m, axis=tuple(range(1, chunked_m.ndim)))
+        ls0, ls1 = _pair_stream_reduced_losses(
+            lps_m, sample_weights, pair_stream_layout
+        )
+    else:
+        ls0 = ls1 = jnp.asarray(jnp.nan, dtype=loss.dtype)
 
     params = state.params.filter(config.trainable_filter)
 
@@ -382,11 +461,16 @@ def train_step(
         "update_norm": update_norm,
         "grad_cosine_sim": grad_cosine_sim,
     }
+    if pair_stream_layout != PAIR_STREAM_NONE:
+        info["loss_stream_0"] = ls0
+        info["loss_stream_1"] = ls1
 
     return new_state, info, grads
 
 
-@functools.partial(jax.jit, static_argnums=(0,), donate_argnums=(3,))
+@functools.partial(
+    jax.jit, static_argnums=(0, 4, 5, 6, 7), donate_argnums=(2,)
+)
 def _compute_grads_and_loss(
     config: _config.TrainConfig,
     rng: at.KeyArrayLike,
@@ -395,10 +479,21 @@ def _compute_grads_and_loss(
         tuple[_model.Observation, _model.Actions],
         tuple[_model.Observation, _model.Actions, at.Array],
     ],
-) -> tuple[dict, at.Array]:
+    pair_stream_layout: int = PAIR_STREAM_NONE,
+    l1_loss: bool = False,
+    kl_lambda: float = 0.0,
+    grpo_like: bool = False,
+    ref_graphdef: Any = None,
+    ref_params: Any = None,
+) -> tuple[dict, at.Array, jax.Array, jax.Array]:
     """Compute gradients and loss for a batch without applying updates. For gradient accumulation."""
     model = nnx.merge(state.model_def, state.params)
     model.train()
+
+    ref_m: _model.BaseModel | None = None
+    if float(kl_lambda) != 0.0 and ref_graphdef is not None:
+        ref_m = nnx.merge(ref_graphdef, ref_params)
+        ref_m.eval()
 
     def loss_fn(
         model: _model.BaseModel,
@@ -407,8 +502,22 @@ def _compute_grads_and_loss(
         actions: _model.Actions,
         sample_weights: at.Array,
     ):
-        chunked_loss = model.compute_loss(rng, observation, actions, train=False)
+        chunked_loss = model.compute_loss(
+            rng,
+            observation,
+            actions,
+            train=False,
+            l1_loss=l1_loss,
+            ref_model=ref_m,
+            kl_lambda=kl_lambda,
+        )
         loss_per_sample = jnp.mean(chunked_loss, axis=tuple(range(1, chunked_loss.ndim)))
+        if grpo_like:
+            bsz = jnp.maximum(
+                jnp.asarray(jnp.shape(actions)[0], dtype=loss_per_sample.dtype),
+                jnp.asarray(1.0, dtype=loss_per_sample.dtype),
+            )
+            return jnp.sum(loss_per_sample * sample_weights) / bsz
         return jnp.sum(loss_per_sample * sample_weights) / jnp.maximum(
             jnp.sum(sample_weights), 1e-8
         )
@@ -423,7 +532,23 @@ def _compute_grads_and_loss(
     loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(
         model, train_rng, observation, actions, sample_weights
     )
-    return grads, loss
+    if pair_stream_layout != PAIR_STREAM_NONE:
+        chunked_m = model.compute_loss(
+            train_rng,
+            observation,
+            actions,
+            train=False,
+            l1_loss=l1_loss,
+            ref_model=ref_m,
+            kl_lambda=kl_lambda,
+        )
+        lps_m = jnp.mean(chunked_m, axis=tuple(range(1, chunked_m.ndim)))
+        ls0, ls1 = _pair_stream_reduced_losses(
+            lps_m, sample_weights, pair_stream_layout
+        )
+    else:
+        ls0 = ls1 = jnp.asarray(jnp.nan, dtype=loss.dtype)
+    return grads, loss, ls0, ls1
 
 
 @functools.partial(jax.jit, static_argnums=(0,), donate_argnums=(2, 3))
@@ -770,6 +895,15 @@ def train_model_on_fly(
     two_lrs: bool = False,
     lr_action_expert: float = 2.5e-4,
     lr_base: float = 2.5e-5,
+    # Log per-stream mean loss for paired batches (PAIR_STREAM_INTERLEAVED / PAIR_STREAM_HALVES).
+    pair_stream_layout: int = PAIR_STREAM_NONE,
+    # Pi0 diffusion BC: L1 on residual (|v-u|) instead of L2 (squared error).
+    l1_loss: bool = False,
+    # Pi0 only: extra MSE between student v_t and stop-grad(ref) v_t (same noise/time/x_t); weight kl_lambda.
+    kl_lambda: float = 0.0,
+    ref_model_for_kl: _model.BaseModel | None = None,
+    # GRPO-like: batch loss = mean_i (advantage_i * denoise_loss_i); advantages in distill_sample_weight (signed).
+    grpo_like: bool = False,
 ) -> tuple[_model.BaseModel, list[float], training_utils.TrainState]:
     """
     Train a model on the fly and return a copy of the trained model, training losses, and final train state.
@@ -888,10 +1022,39 @@ def train_model_on_fly(
     # Define trainable_filter for training step
     _trainable_filter = _trainable_filter_for_init
 
+    if float(kl_lambda) != 0.0 and ref_model_for_kl is None:
+        raise ValueError(
+            "train_model_on_fly: kl_lambda != 0 requires ref_model_for_kl (frozen snapshot of the student)."
+        )
+    kl_ref_graphdef: Any = None
+    kl_ref_params: Any = None
+    if float(kl_lambda) != 0.0:
+        kl_ref_graphdef = nnx.graphdef(ref_model_for_kl)
+        kl_ref_params = nnx.state(ref_model_for_kl)
+
     # train_step is now automatically JIT-compiled via decorator
     # No need to create train_step_jit - just call train_step directly
     # JAX will automatically cache the compilation based on function signature and input shapes
-    train_step_jit = functools.partial(train_step, config)
+    train_step_jit = functools.partial(
+        train_step,
+        config,
+        pair_stream_layout=pair_stream_layout,
+        l1_loss=l1_loss,
+        kl_lambda=float(kl_lambda),
+        grpo_like=grpo_like,
+        ref_graphdef=kl_ref_graphdef,
+        ref_params=kl_ref_params,
+    )
+    compute_grads_loss_jit = functools.partial(
+        _compute_grads_and_loss,
+        config,
+        pair_stream_layout=pair_stream_layout,
+        l1_loss=l1_loss,
+        kl_lambda=float(kl_lambda),
+        grpo_like=grpo_like,
+        ref_graphdef=kl_ref_graphdef,
+        ref_params=kl_ref_params,
+    )
 
     # Check if compilation cache is enabled
     cache_dir = jax.config.jax_compilation_cache_dir
@@ -960,6 +1123,17 @@ def train_model_on_fly(
         print(
             f"Dynamic self-check: pseudo-labels from current model each step, lambda_kl={self_check_lambda_kl}"
         )
+    if l1_loss:
+        print("BC loss: L1 (mean |v_t - u_t| on diffusion residual); default is L2 MSE.")
+    if float(kl_lambda) != 0.0:
+        print(
+            f"KL proxy: MSE(student v_t vs frozen ref v_t, same noise) weighted by kl_lambda={kl_lambda}"
+        )
+    if grpo_like:
+        print(
+            "GRPO-like objective: minimize mean_i (advantage_i * diffusion_BC_loss_i); "
+            "advantages (signed) must be stored in batch distill_sample_weight."
+        )
 
     for step in pbar:
         t0_train = time.perf_counter()
@@ -996,6 +1170,8 @@ def train_model_on_fly(
                     rng=step_rng,
                     task1_only=True,
                 )
+                if len(batch) == 3:
+                    sample_weights = sample_weights * batch[2]
                 batch = (batch[0], batch[1], sample_weights)
                 alignment_step_info = {"alignment_task1_avg_ratio": avg_ratio}
             else:
@@ -1008,6 +1184,8 @@ def train_model_on_fly(
             # Gradient accumulation: fetch N batches, compute grads, average, apply
             accum_grads = None
             accum_losses = []
+            accum_ls0: list[jax.Array] = []
+            accum_ls1: list[jax.Array] = []
             alignment_ratios = []
             for accum_i in range(accum_steps):
                 try:
@@ -1035,14 +1213,19 @@ def train_model_on_fly(
                         rng=step_rng,
                         task1_only=True,
                     )
+                    if len(batch) == 3:
+                        sample_weights = sample_weights * batch[2]
                     batch = (batch[0], batch[1], sample_weights)
                     alignment_ratios.append(avg_ratio)
                 micro_rng = jax.random.fold_in(
                     rng, int(step) * accum_steps + accum_i
                 )
-                grads, loss = _compute_grads_and_loss(
-                    config, micro_rng, train_state, batch
+                grads, loss, ls0_m, ls1_m = compute_grads_loss_jit(
+                    micro_rng, train_state, batch
                 )
+                if pair_stream_layout != PAIR_STREAM_NONE:
+                    accum_ls0.append(ls0_m)
+                    accum_ls1.append(ls1_m)
                 if accum_grads is None:
                     accum_grads = grads
                 else:
@@ -1064,6 +1247,9 @@ def train_model_on_fly(
             del mean_grads
             mean_loss = jnp.mean(jnp.stack(accum_losses))
             info["loss"] = mean_loss
+            if pair_stream_layout != PAIR_STREAM_NONE and accum_ls0:
+                info["loss_stream_0"] = jnp.mean(jnp.stack(accum_ls0))
+                info["loss_stream_1"] = jnp.mean(jnp.stack(accum_ls1))
             alignment_step_info = (
                 {"alignment_task1_avg_ratio": float(np.mean(alignment_ratios))}
                 if alignment_ratios
@@ -1086,6 +1272,9 @@ def train_model_on_fly(
 
         t0_block = time.perf_counter()
         jax.block_until_ready(info["loss"])  # Wait for GPU to finish
+        if pair_stream_layout != PAIR_STREAM_NONE and "loss_stream_0" in info:
+            jax.block_until_ready(info["loss_stream_0"])
+            jax.block_until_ready(info["loss_stream_1"])
         t1_block = time.perf_counter()
         block_time = (t1_block - t0_block) * 1000  # Time to block until ready
 
@@ -1120,6 +1309,12 @@ def train_model_on_fly(
                 "grad_cosine_sim": grad_cosine_sim,
             }
             step_info.update(alignment_step_info)
+            if pair_stream_layout != PAIR_STREAM_NONE and "loss_stream_0" in info:
+                lv0 = float(jax.device_get(info["loss_stream_0"]))
+                lv1 = float(jax.device_get(info["loss_stream_1"]))
+                if not math.isnan(lv0) and not math.isnan(lv1):
+                    step_info["loss_stream_0"] = lv0
+                    step_info["loss_stream_1"] = lv1
             on_step_info_callback(step, step_info)
 
         # Optional: compute validation loss at step 0 and every N steps (uses cached batches, no disk I/O).
@@ -1241,6 +1436,15 @@ def run_evaluation(
     seed: int = 0,
     plot_observations: bool = False,
     teacher_policy: _policy.Policy | None = None,
+    show_progress_bar: bool = True,
+    distillation_examples_out: list[dict[str, Any]] | None = None,
+    student_action_merge: float = 0.0,
+    group_size: int = 1,
+    temporal_decay: float = 1.0,
+    teacher_group_size: int = 1,
+    write_auxiliary_rollout_pdfs: bool = True,
+    after_each_rollout_episode: Callable[[int, int, int], None] | None = None,
+    grpo_like: bool = False,
 ):
     """Run evaluation on a LIBERO task.
 
@@ -1250,6 +1454,24 @@ def run_evaluation(
         teacher_policy: If set, after each replanning inference of ``policy`` (same obs and
                 noise), runs the teacher and records mean L2 distance between action chunks;
                 saves ``teacher_student_action_l2_task{task_id}.pdf`` under ``video_out_path``.
+        distillation_examples_out: If set (and ``teacher_policy`` is set), each **environment step**
+                appends one BC row (extra student/teacher forward passes; env still advances with
+                ``replan_steps=5`` open-loop chunks). Without a teacher, no distillation rows.
+        student_action_merge: In ``[0, 1]``. BC target actions are
+                ``(1 - α) * teacher_chunk + α * student_chunk`` with ``α = student_action_merge``.
+                ``0.0`` (default) matches pure teacher targets; ``1.0`` is pure student.
+        group_size: Number of independent noise samples per replan (student). ``1`` matches the
+                previous single-sample rollout. ``> 1`` runs G student forwards; the first sample
+                drives the env; if ``teacher_policy`` is set and ``write_auxiliary_rollout_pdfs``,
+                logs/plots per-episode ``group_action_sampling_ep*.pdf``.
+        teacher_group_size: Independent teacher noise samples per replan (for variance / alignment);
+                first sample is used for BC targets and teacher–student L2. ``1`` matches single teacher.
+        write_auxiliary_rollout_pdfs: If False, skip standalone rollout PDFs (group sampling, teacher–student
+                L2, per-episode alignment popups); callers can build a single combined PDF from
+                ``run_evaluation.last_episode_metrics``.
+        show_progress_bar: Episode tqdm bar. Set False when calling from inside another tqdm
+                (e.g. mid-training eval); otherwise both bars fight for the terminal and log files
+                fill with interleaved ANSI cursor spam.
         num_trials: Number of evaluation episodes to run.
         task_suite_name: Name of the LIBERO task suite (e.g., "libero_10", "libero_90").
         task_id: ID of the task within the suite to evaluate.
@@ -1259,10 +1481,22 @@ def run_evaluation(
         task_description: Description of the task (overridden by actual task description).
         seed: Random seed for environment and other randomness (but NOT policy RNG -
               policy RNG must be set during policy creation via create_policy's rng_seed parameter).
+        after_each_rollout_episode: Optional callback after each episode:
+              ``(episode_idx, task_episodes, task_successes)``.
 
     Returns:
         success_rate: Success rate across all evaluation episodes.
     """
+    if group_size < 1:
+        raise ValueError(f"group_size must be >= 1, got {group_size}")
+    if teacher_group_size < 1:
+        raise ValueError(f"teacher_group_size must be >= 1, got {teacher_group_size}")
+    if temporal_decay < 0:
+        raise ValueError(f"temporal_decay must be >= 0, got {temporal_decay}")
+    if grpo_like and int(group_size) < 2:
+        raise ValueError(
+            f"--grpo_like requires group_size >= 2, got {group_size}"
+        )
     return run_evaluation_ttt(
         policy=policy,
         nn_fetcher=None,
@@ -1281,12 +1515,27 @@ def run_evaluation(
         plot_observations=plot_observations,
         disable_adaptation=True,
         teacher_policy=teacher_policy,
-        )
+        show_progress_bar=show_progress_bar,
+        distillation_examples_out=distillation_examples_out,
+        student_action_merge=student_action_merge,
+        num_samples=group_size,
+        temporal_decay=temporal_decay,
+        teacher_group_size=teacher_group_size,
+        write_auxiliary_rollout_pdfs=write_auxiliary_rollout_pdfs,
+        after_each_rollout_episode=after_each_rollout_episode,
+        grpo_like=grpo_like,
+    )
 
 
 # Create a simple dataloader that returns the same batch every time
 class NeighborsDataLoader:
-    """A simple dataloader that returns the same batch (obs, actions) every time."""
+    """A simple dataloader that returns the same batch (obs, actions) every time.
+
+    **Memory:** The full collated buffer is kept on **CPU** (NumPy). Only each minibatch
+    is converted to device arrays in ``__iter__``. Holding the entire distillation /
+    GRPO buffer on GPU (the previous behavior) scales with ``N ×`` image size and
+    routinely OOMs when GRPO multiplies rows by ``group_size``.
+    """
 
     def __init__(
         self,
@@ -1300,20 +1549,21 @@ class NeighborsDataLoader:
         self._data_config = data_config
 
         # examples = [example for _ in range(repeat) for example in examples]
-        self.data = _data_loader._collate_fn(examples)
+        collated = _data_loader._collate_fn(examples)
 
-        def to_jax(x):
+        def to_numpy_leaf(x: Any) -> Any:
+            if x is None:
+                return None
             if isinstance(x, torch.Tensor):
-                return jnp.asarray(x)
-            elif isinstance(x, np.ndarray):
-                return jnp.asarray(x)
-            elif isinstance(x, jax.Array):
+                return np.asarray(x.detach().cpu())
+            if isinstance(x, np.ndarray):
                 return x
-            else:
-                return jnp.asarray(x)
+            if isinstance(x, jax.Array):
+                return np.asarray(jax.device_get(x))
+            return np.asarray(x)
 
-        self.data = jax.tree.map(to_jax, self.data)
-        leaves = jax.tree.leaves(self.data)
+        self._cpu_data: Any = jax.tree.map(to_numpy_leaf, collated)
+        leaves = jax.tree.leaves(self._cpu_data)
         if not leaves:
             raise ValueError("examples must not be empty")
         self.num_examples = int(leaves[0].shape[0])
@@ -1324,16 +1574,102 @@ class NeighborsDataLoader:
     def data_config(self) -> _config.DataConfig:
         return self._data_config
 
-    def __iter__(self) -> Iterator[tuple[_model.Observation, _model.Actions]]:
+    def __iter__(self) -> Iterator[
+        Union[
+            tuple[_model.Observation, _model.Actions],
+            tuple[_model.Observation, _model.Actions, jax.Array],
+        ]
+    ]:
         """Yield random fixed-size minibatches from collated neighbor data."""
         while True:
             # Sample a minibatch with replacement to keep a fixed shape.
             batch_idx = np.random.randint(0, self.num_examples, size=self.batch_size)
-            batch = jax.tree.map(
-                lambda x: jnp.take(x, batch_idx, axis=0),
-                self.data,
+            cpu_batch = jax.tree.map(
+                lambda x: np.take(x, batch_idx, axis=0) if x is not None else None,
+                self._cpu_data,
             )
-            yield (_model.Observation.from_dict(batch), batch["actions"])
+            batch = jax.tree.map(
+                lambda x: jnp.asarray(x) if x is not None else None,
+                cpu_batch,
+            )
+            obs = _model.Observation.from_dict(batch)
+            act = batch["actions"]
+            w = batch.get("distill_sample_weight")
+            if w is not None:
+                yield (obs, act, w)
+            else:
+                yield (obs, act)
+
+
+def _interleave_pair_batch_leaves(opd_b: Any, aug_b: Any) -> Any:
+    """Interleave batch dimension: (P,...) + (P,...) -> (2P,...) as o0,a0,o1,a1,..."""
+
+    def interleave(o: jax.Array, a: jax.Array) -> jax.Array:
+        stacked = jnp.stack([o, a], axis=1)
+        p = int(o.shape[0])
+        return stacked.reshape(2 * p, *tuple(o.shape[1:]))
+
+    return jax.tree.map(interleave, opd_b, aug_b)
+
+
+class PairedOnPolicySelfReplayDataLoader:
+    """BC loader: each step samples P on-policy distillation (task2 teacher) rows and P paired
+    same-observation rows with task1 prompt + reference-policy pseudo-actions; yields one batch
+    of size 2P in PAIR_STREAM_INTERLEAVED order (even indices = OPD, odd = task1 pseudo)."""
+
+    def __init__(
+        self,
+        opd_examples: List[Any],
+        aug_examples: List[Any],
+        pair_batch_size: int,
+        data_config: _config.DataConfig,
+    ):
+        if len(opd_examples) != len(aug_examples) or len(opd_examples) == 0:
+            raise ValueError("opd_examples and aug_examples must have the same non-empty length")
+        if pair_batch_size <= 0:
+            raise ValueError(f"pair_batch_size must be > 0, got {pair_batch_size}")
+        self._data_config = data_config
+        self.pair_batch_size = pair_batch_size
+        self.n = len(opd_examples)
+
+        def to_jax(x: Any) -> jax.Array:
+            if isinstance(x, torch.Tensor):
+                return jnp.asarray(x)
+            if isinstance(x, np.ndarray):
+                return jnp.asarray(x)
+            if isinstance(x, jax.Array):
+                return x
+            return jnp.asarray(x)
+
+        self.opd_data = jax.tree.map(to_jax, _data_loader._collate_fn(opd_examples))
+        self.aug_data = jax.tree.map(to_jax, _data_loader._collate_fn(aug_examples))
+        leaves = jax.tree.leaves(self.opd_data)
+        if not leaves:
+            raise ValueError("opd_examples collate produced empty tree")
+        if int(leaves[0].shape[0]) != self.n:
+            raise ValueError("internal: collated batch size mismatch")
+
+    def data_config(self) -> _config.DataConfig:
+        return self._data_config
+
+    def __iter__(self) -> Iterator[
+        Union[
+            tuple[_model.Observation, _model.Actions],
+            tuple[_model.Observation, _model.Actions, jax.Array],
+        ]
+    ]:
+        while True:
+            idx = np.random.randint(0, self.n, size=self.pair_batch_size)
+            opd_b = jax.tree.map(lambda x: jnp.take(x, idx, axis=0), self.opd_data)
+            aug_b = jax.tree.map(lambda x: jnp.take(x, idx, axis=0), self.aug_data)
+            merged = _interleave_pair_batch_leaves(opd_b, aug_b)
+            obs = _model.Observation.from_dict(merged)
+            act = merged["actions"]
+            w = merged.get("distill_sample_weight")
+            if w is not None:
+                yield (obs, act, w)
+            else:
+                yield (obs, act)
 
 
 def copy_model(model, train_config: _config.TrainConfig):
@@ -1451,6 +1787,14 @@ def run_evaluation_ttt(
     debug_metrics: bool = False,
     merging_eps: float | None = None,
     teacher_policy: _policy.Policy | None = None,
+    show_progress_bar: bool = True,
+    distillation_examples_out: list[dict[str, Any]] | None = None,
+    student_action_merge: float = 0.0,
+    temporal_decay: float = 1.0,
+    teacher_group_size: int = 1,
+    write_auxiliary_rollout_pdfs: bool = True,
+    after_each_rollout_episode: Callable[[int, int, int], None] | None = None,
+    grpo_like: bool = False,
 ):
 
 
@@ -1487,6 +1831,14 @@ def run_evaluation_ttt(
         adapt_kwargs={},
         disable_adaptation=disable_adaptation,
         teacher_policy=teacher_policy,
+        show_progress_bar=show_progress_bar,
+        distillation_examples_out=distillation_examples_out,
+        student_action_merge=student_action_merge,
+        temporal_decay=temporal_decay,
+        teacher_group_size=teacher_group_size,
+        write_auxiliary_rollout_pdfs=write_auxiliary_rollout_pdfs,
+        after_each_rollout_episode=after_each_rollout_episode,
+        grpo_like=grpo_like,
     )
 
 
@@ -1538,26 +1890,27 @@ def _infer_action_chunk_samples(
     obs_dict: dict[str, Any],
     noise_arr: np.ndarray | jnp.ndarray | None,
 ) -> _model.Actions:
-    """Stable per-sample inference helper used by rollout and TTT paths."""
+    """Infer action chunk(s). ``noise`` (H, D) or (1, H, D): one chunk (H, D).
 
-    return policy_obj.infer(obs_dict, noise=noise_arr)["actions"]
-
-    # TODO: restore this code for batched inference
+    ``noise`` (G, H, D) with G>1: G independent samples at the same obs; return (G, H, D).
     """
-    if noise_arr is None or getattr(noise_arr, "ndim", 0) <= 2:
-        action_chunk_single = policy_obj.infer(obs_dict, noise=noise_arr)["actions"]
-        if getattr(action_chunk_single, "ndim", 0) == 2:
-            action_chunk_single = action_chunk_single[None, ...]
-        return action_chunk_single
-
-    sample_count = int(noise_arr.shape[0])
-    action_chunks = []
-    for sample_idx in range(sample_count):
-        action_i = policy_obj.infer(obs_dict, noise=noise_arr[sample_idx])["actions"]
-        action_i = action_i if isinstance(action_i, jax.Array) else jnp.asarray(action_i)
-        action_chunks.append(action_i)
+    if noise_arr is None:
+        return policy_obj.infer(obs_dict, noise=None)["actions"]
+    n = jnp.asarray(noise_arr)
+    if n.ndim == 2:
+        return policy_obj.infer(obs_dict, noise=n)["actions"]
+    if n.ndim != 3:
+        raise ValueError(f"noise must be (H,D), (1,H,D), or (G,H,D); got shape {n.shape}")
+    g = int(n.shape[0])
+    if g == 1:
+        return policy_obj.infer(obs_dict, noise=n[0])["actions"]
+    action_chunks: list[jax.Array] = []
+    for gi in range(g):
+        action_i = policy_obj.infer(obs_dict, noise=n[gi])["actions"]
+        action_chunks.append(
+            action_i if isinstance(action_i, jax.Array) else jnp.asarray(action_i)
+        )
     return jnp.stack(action_chunks, axis=0)
-    """
 
 
 def _max_steps_for_task_suite(task_suite_name: str) -> int:
@@ -1850,6 +2203,151 @@ def compute_action_distances(action_chunk: _model.Actions, ttt_action_chunk: _mo
     return action_distance
 
 
+def _pad_action_chunk_for_model(
+    actions_np: np.ndarray,
+    *,
+    action_horizon: int,
+    action_dim: int,
+) -> np.ndarray:
+    """Match LeRobot/OpenPI training: (H, D) with H=action_horizon, D=action_dim (zero-pad)."""
+    a = np.asarray(actions_np, dtype=np.float32)
+    if a.ndim == 3 and int(a.shape[0]) == 1:
+        a = a[0]
+    if a.ndim != 2:
+        raise ValueError(
+            f"Expected teacher actions with shape (H, D) or (1, H, D), got {a.shape}"
+        )
+    h, d = int(a.shape[0]), int(a.shape[1])
+    if h > action_horizon:
+        a = a[:action_horizon]
+    elif h < action_horizon:
+        a = np.pad(a, ((0, action_horizon - h), (0, 0)), constant_values=0.0)
+        d = int(a.shape[1])
+    if d > action_dim:
+        a = a[:, :action_dim]
+    else:
+        a = transforms.pad_to_dim(a, action_dim, axis=-1)
+    return a
+
+
+def _compute_grpo_advantages(
+    student_stacked: jax.Array,
+    teacher_chunk: jax.Array,
+    *,
+    eps: float = 1e-8,
+) -> np.ndarray:
+    """GRPO-style advantages from negative L2 distance to teacher chunk.
+
+    R_i = -||a_i - a_teach||_2 (flattened). A_hat_i = (R_i - mean(R)) / std(R), or zeros if std ~ 0.
+    Returns shape (G,) float32 on CPU.
+    """
+    st = jnp.asarray(student_stacked)
+    tt = jnp.asarray(teacher_chunk)
+    if st.ndim == 2:
+        st = st[None, ...]
+    if tt.ndim == 3:
+        tt = tt[0]
+    g = int(st.shape[0])
+    if g < 1:
+        return np.zeros((0,), dtype=np.float32)
+    diff = st - tt[None, ...]
+    dists = jnp.linalg.norm(diff.reshape(g, -1), axis=1)
+    r = -dists
+    mean_r = jnp.mean(r)
+    std_r = jnp.std(r)
+    a_hat = jnp.where(
+        std_r > eps,
+        (r - mean_r) / std_r,
+        jnp.zeros_like(r),
+    )
+    return np.asarray(jax.device_get(a_hat), dtype=np.float32)
+
+
+def observation_actions_to_bc_example(
+    obs: _model.Observation,
+    actions: jax.Array | np.ndarray,
+    *,
+    model_action_horizon: int | None = None,
+    model_action_dim: int | None = None,
+    alignment_ratio: float | None = None,
+    replan_env_step: int | None = None,
+    temporal_decay: float = 1.0,
+    teacher_chunk_var_mean: float | None = None,
+    grpo_advantage: float | None = None,
+) -> dict[str, Any]:
+    """Build one OpenPI-style sample dict for ``_data_loader._collate_fn`` (no batch dimension).
+
+    Observations must come from ``make_observation_from_simulator(student_policy, ...)`` so
+    transforms match training. ``actions`` are distillation targets (full action chunk), typically
+    teacher-only or a ``(1-α)*teacher + α*student`` blend when ``student_action_merge`` is used.
+
+    Pi05 Libero uses ``action_dim=32`` with zero-padded proprio/actions (see ``PadStatesAndActions``).
+    Raw policy chunks are often ``(horizon, 7)``; pass ``model_action_*`` so BC batches match ``compute_loss``.
+
+    Optional ``alignment_ratio`` / ``replan_env_step`` / ``teacher_chunk_var_mean`` are metadata for
+    distillation filtering and plots; strip these keys before ``NeighborsDataLoader`` / ``Observation.from_dict``.
+    ``teacher_chunk_var_mean`` is mean_{h,d} Var_{teacher samples}(chunk[h,d]) when ``teacher_group_size``>1, else 0.
+
+    ``temporal_decay``: per-sample BC weight ``temporal_decay ** replan_env_step`` (env step at replan).
+    Default ``1.0`` gives uniform weights. Stored as ``distill_sample_weight`` (kept for the BC loader).
+
+    If ``grpo_advantage`` is set (GRPO-like training), ``distill_sample_weight`` is
+    ``grpo_advantage * temporal_decay ** replan_env_step`` (signed advantage times temporal factor).
+    """
+
+    def _strip_leading_batch(x: Any) -> Any:
+        if x is None:
+            return None
+        arr = np.asarray(jax.device_get(x))
+        if arr.ndim >= 1 and int(arr.shape[0]) == 1:
+            return np.squeeze(arr, axis=0)
+        return arr
+
+    act = jnp.asarray(actions)
+    if act.ndim == 3 and int(act.shape[0]) == 1:
+        act = act[0]
+    actions_np = np.asarray(jax.device_get(act), dtype=np.float32)
+
+    tree = obs.to_dict()
+    out: dict[str, Any] = jax.tree.map(
+        _strip_leading_batch, tree, is_leaf=lambda x: x is None
+    )
+    if (
+        model_action_horizon is not None
+        and model_action_dim is not None
+    ):
+        actions_np = _pad_action_chunk_for_model(
+            actions_np,
+            action_horizon=model_action_horizon,
+            action_dim=model_action_dim,
+        )
+        if out.get("state") is not None:
+            st = np.asarray(out["state"], dtype=np.float32)
+            if st.shape[-1] > model_action_dim:
+                st = st[..., :model_action_dim]
+            else:
+                st = transforms.pad_to_dim(st, model_action_dim, axis=-1)
+            out["state"] = st
+    out["actions"] = actions_np
+    if alignment_ratio is not None:
+        out["alignment_ratio"] = np.float32(alignment_ratio)
+    if replan_env_step is not None:
+        out["replan_env_step"] = np.int32(replan_env_step)
+        td = float(temporal_decay)
+        step_i = int(replan_env_step)
+        if grpo_advantage is not None:
+            out["distill_sample_weight"] = np.float32(
+                float(grpo_advantage) * (td**step_i)
+            )
+        else:
+            out["distill_sample_weight"] = np.float32(td**step_i)
+    elif grpo_advantage is not None:
+        out["distill_sample_weight"] = np.float32(float(grpo_advantage))
+    if teacher_chunk_var_mean is not None:
+        out["teacher_chunk_var_mean"] = np.float32(float(teacher_chunk_var_mean))
+    return out
+
+
 def _plot_teacher_student_action_l2_pdf(
     episodes_l2: list[list[tuple[int, float]]],
     output_path: str | pathlib.Path,
@@ -1885,6 +2383,50 @@ def _plot_teacher_student_action_l2_pdf(
         f"Teacher vs student action chunk distance (task {task_id})",
         fontsize=11,
     )
+    plt.tight_layout()
+    fig.savefig(path, format="pdf", dpi=150)
+    plt.close(fig)
+    return path
+
+
+def _plot_group_action_sampling_pdf(
+    trace: list[dict[str, Any]],
+    output_path: str | pathlib.Path,
+    *,
+    episode_idx: int,
+    group_size: int,
+) -> pathlib.Path | None:
+    """One PDF per rollout episode: chunk variance, teacher L2 distances, GRPO-style normalized distances."""
+    if not trace:
+        return None
+    path = pathlib.Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    steps = [int(x["env_step"]) for x in trace]
+    vars_ = [float(x["chunk_var_mean"]) for x in trace]
+    all_x: list[int] = []
+    all_d: list[float] = []
+    all_n: list[float] = []
+    for x in trace:
+        t = int(x["env_step"])
+        for d, nz in zip(x["dists"], x["norm_dists"]):
+            all_x.append(t)
+            all_d.append(float(d))
+            all_n.append(float(nz))
+    fig, axes = plt.subplots(3, 1, figsize=(7.0, 7.5), sharex=True)
+    fig.suptitle(
+        f"Group sampling (G={group_size}) — episode {episode_idx}",
+        fontsize=12,
+    )
+    axes[0].plot(steps, vars_, "b.-", linewidth=1.0, markersize=5)
+    axes[0].set_ylabel("Mean Var across chunk\n(var over samples)")
+    axes[0].grid(True, alpha=0.3)
+    axes[1].scatter(all_x, all_d, s=14, alpha=0.65, c="C0", edgecolors="none")
+    axes[1].set_ylabel(r"$\|a_g - a^{\mathrm{teacher}}\|_2$ (flat)")
+    axes[1].grid(True, alpha=0.3)
+    axes[2].scatter(all_x, all_n, s=14, alpha=0.65, c="C2", edgecolors="none")
+    axes[2].set_ylabel(r"Normalized: $(d - \bar d) / (\sigma_d+\epsilon)$")
+    axes[2].set_xlabel("Environment step (replan)")
+    axes[2].grid(True, alpha=0.3)
     plt.tight_layout()
     fig.savefig(path, format="pdf", dpi=150)
     plt.close(fig)
@@ -1932,6 +2474,11 @@ def _run_single_episode_with_adaptation(
     jax_key: jax.Array,
     pbar: Any,
     teacher_policy: _policy.Policy | None = None,
+    distillation_examples_out: list[dict[str, Any]] | None = None,
+    student_action_merge: float = 0.0,
+    temporal_decay: float = 1.0,
+    teacher_group_size: int = 1,
+    grpo_like: bool = False,
 ) -> tuple[
     bool,
     int,
@@ -1946,6 +2493,9 @@ def _run_single_episode_with_adaptation(
     _policy.Policy,
     jax.Array,
     list[tuple[int, float]],
+    list[dict[str, Any]],
+    list[tuple[int, float]],
+    list[dict[str, Any]],
 ]:
     env.seed(episode_seed)
     env.reset()
@@ -1975,6 +2525,15 @@ def _run_single_episode_with_adaptation(
     episode_test_losses: list[list[float]] = []
     neighbor_previews: list[dict[str, Any]] = []
     teacher_l2_by_env_step: list[tuple[int, float]] = []
+    group_sampling_trace: list[dict[str, Any]] = []
+    teacher_alignment_ratio_by_step: list[tuple[int, float]] = []
+    teacher_group_sampling_trace: list[dict[str, Any]] = []
+
+    if num_samples > 1 and not disable_adaptation:
+        raise ValueError(
+            "num_samples > 1 (group action sampling) requires disable_adaptation=True "
+            "(e.g. standard distillation rollout)."
+        )
 
     if not no_reset:
         policy = new_policy_like(policy, original_model)
@@ -2003,27 +2562,36 @@ def _run_single_episode_with_adaptation(
         img, wrist_img = _preprocess_images(obs, resize_size=resize_size)
         replay_images.append(_draw_step_on_frame(img, t))
 
+        replan_now = not action_plan
+
         if not action_plan:
 
             # Packing the observation dictionary (no image processing)
             curr_obs_dict = _build_curr_obs_dict(obs, img, wrist_img, task_description)
             policy._rng, rng = jax.random.split(policy._rng)
 
-            # TODO: support also > 1
-            assert num_samples == 1, "num_samples must be 1 (only currently supported)"
             noise = jax.random.normal(
-                    rng, (num_samples, original_model.action_horizon, original_model.action_dim)
+                rng, (num_samples, original_model.action_horizon, original_model.action_dim)
             )
 
-            # Sample action chunk from policy
-            action_chunk = _infer_action_chunk_samples(policy, curr_obs_dict, noise)
+            # Sample action chunk(s) from policy (G>1 → stacked (G,H,D); env uses first sample)
+            student_stacked = _infer_action_chunk_samples(policy, curr_obs_dict, noise)
+            if student_stacked.ndim == 3:
+                action_chunk = student_stacked[0]
+            else:
+                action_chunk = student_stacked
 
             # Compute alignment ratio between action chunk and the action the model would have sampled with empty prompt
             # action_chunk_cfg is the action taken with classifier free guidance ()
             alignment_ratio = compute_alignment_ratio(
-                policy, action_chunk, curr_obs_dict, noise=noise, cfg_weight=cfg_weight
+                policy,
+                action_chunk,
+                curr_obs_dict,
+                noise=noise,
+                cfg_weight=cfg_weight,
             )
-            pbar.write(f"[TTT] Alignment ratio: {alignment_ratio:.4f}")
+            # Enable in case of debugging
+            # pbar.write(f"[TTT] Alignment ratio: {alignment_ratio:.4f}")
             alignment_ratio_by_step.append((t, alignment_ratio))
 
 
@@ -2143,13 +2711,255 @@ def _run_single_episode_with_adaptation(
                 )
 
             if teacher_policy is not None:
-                teacher_chunk = _infer_action_chunk_samples(
-                    teacher_policy, curr_obs_dict, noise
+                tgs = max(1, int(teacher_group_size))
+                # teacher_group_size==1: same noise as student's first draw (legacy single-sample behavior).
+                if tgs == 1:
+                    teacher_noise = noise[0:1]
+                else:
+                    policy._rng, rng_teach = jax.random.split(policy._rng)
+                    teacher_noise = jax.random.normal(
+                        rng_teach,
+                        (tgs, original_model.action_horizon, original_model.action_dim),
+                    )
+                teacher_stacked = _infer_action_chunk_samples(
+                    teacher_policy, curr_obs_dict, teacher_noise
                 )
+                if teacher_stacked.ndim == 3:
+                    teacher_chunk = teacher_stacked[0]
+                else:
+                    teacher_chunk = teacher_stacked
+
+                tar = compute_alignment_ratio(
+                    teacher_policy,
+                    teacher_chunk,
+                    curr_obs_dict,
+                    noise=teacher_noise,
+                )
+                teacher_alignment_ratio_by_step.append((t, float(tar)))
+
                 l2_ts = compute_action_distances(teacher_chunk, action_chunk)
                 teacher_l2_by_env_step.append((t, l2_ts))
+                if num_samples > 1 and student_stacked.ndim == 3:
+                    st = jnp.asarray(student_stacked)
+                    tt = jnp.asarray(teacher_chunk)
+                    if tt.ndim == 3:
+                        tt = tt[0]
+                    diff = st - tt[None, ...]
+                    dists_vec = jnp.linalg.norm(diff.reshape(st.shape[0], -1), axis=1)
+                    dists_list = [float(v) for v in jax.device_get(dists_vec)]
+                    chunk_var_mean = float(jnp.mean(jnp.var(st, axis=0)))
+                    dm = float(np.mean(dists_list))
+                    ds = float(np.std(dists_list)) + 1e-8
+                    norm_list = [float((d - dm) / ds) for d in dists_list]
+                    group_sampling_trace.append(
+                        {
+                            "env_step": int(t),
+                            "chunk_var_mean": chunk_var_mean,
+                            "dists": dists_list,
+                            "norm_dists": norm_list,
+                        }
+                    )
+                else:
+                    group_sampling_trace.append(
+                        {
+                            "env_step": int(t),
+                            "chunk_var_mean": 0.0,
+                            "dists": [],
+                            "norm_dists": [],
+                        }
+                    )
+                teacher_var_row = 0.0
+                if tgs > 1 and teacher_stacked.ndim == 3:
+                    tt2 = jnp.asarray(teacher_stacked)
+                    teacher_var_row = float(jnp.mean(jnp.var(tt2, axis=0)))
+                    teacher_group_sampling_trace.append(
+                        {
+                            "env_step": int(t),
+                            "chunk_var_mean": teacher_var_row,
+                        }
+                    )
+                else:
+                    teacher_group_sampling_trace.append(
+                        {"env_step": int(t), "chunk_var_mean": 0.0},
+                    )
 
             action_plan.extend(action_chunk[:replan_steps])
+
+        # On-policy distillation BC: one row per env step (current obs), while the env still
+        # executes actions from the 5-step open-loop chunk. Reuse forwards on replan boundaries.
+        if (
+            teacher_policy is not None
+            and distillation_examples_out is not None
+            and t >= num_steps_wait
+        ):
+            if grpo_like:
+                if num_samples < 2:
+                    raise ValueError(
+                        "grpo_like distillation requires num_samples (group_size) >= 2 "
+                        "to form per-group advantages"
+                    )
+            alpha = float(student_action_merge)
+            if not (0.0 <= alpha <= 1.0):
+                raise ValueError(
+                    f"student_action_merge must be in [0, 1], got {alpha}"
+                )
+            if grpo_like:
+                if replan_now:
+                    st_d = jnp.asarray(student_stacked)
+                    adv_d = _compute_grpo_advantages(st_d, teacher_chunk)
+                    obs_m_d = make_observation_from_simulator(policy, curr_obs_dict)
+                    for i_gr in range(int(st_d.shape[0])):
+                        distillation_examples_out.append(
+                            observation_actions_to_bc_example(
+                                obs_m_d,
+                                st_d[i_gr],
+                                model_action_horizon=int(original_model.action_horizon),
+                                model_action_dim=int(original_model.action_dim),
+                                alignment_ratio=float(alignment_ratio),
+                                replan_env_step=int(t),
+                                temporal_decay=float(temporal_decay),
+                                teacher_chunk_var_mean=teacher_var_row,
+                                grpo_advantage=float(adv_d[i_gr]),
+                            )
+                        )
+                else:
+                    curr_obs_dict_d = _build_curr_obs_dict(
+                        obs, img, wrist_img, task_description
+                    )
+                    policy._rng, rng_dd = jax.random.split(policy._rng)
+                    noise_dd = jax.random.normal(
+                        rng_dd,
+                        (num_samples, original_model.action_horizon, original_model.action_dim),
+                    )
+                    student_stacked_dd = _infer_action_chunk_samples(
+                        policy, curr_obs_dict_d, noise_dd
+                    )
+                    if student_stacked_dd.ndim == 3:
+                        action_chunk_dd = student_stacked_dd[0]
+                    else:
+                        action_chunk_dd = student_stacked_dd
+                    alignment_ratio_dd = compute_alignment_ratio(
+                        policy,
+                        action_chunk_dd,
+                        curr_obs_dict_d,
+                        noise=noise_dd,
+                        cfg_weight=cfg_weight,
+                    )
+                    tgs_dd = max(1, int(teacher_group_size))
+                    if tgs_dd == 1:
+                        teacher_noise_dd = noise_dd[0:1]
+                    else:
+                        policy._rng, rng_tdd = jax.random.split(policy._rng)
+                        teacher_noise_dd = jax.random.normal(
+                            rng_tdd,
+                            (tgs_dd, original_model.action_horizon, original_model.action_dim),
+                        )
+                    teacher_stacked_dd = _infer_action_chunk_samples(
+                        teacher_policy, curr_obs_dict_d, teacher_noise_dd
+                    )
+                    if teacher_stacked_dd.ndim == 3:
+                        teacher_chunk_dd = teacher_stacked_dd[0]
+                    else:
+                        teacher_chunk_dd = teacher_stacked_dd
+                    teacher_var_row_dd = 0.0
+                    if tgs_dd > 1 and teacher_stacked_dd.ndim == 3:
+                        teacher_var_row_dd = float(
+                            jnp.mean(jnp.var(jnp.asarray(teacher_stacked_dd), axis=0))
+                        )
+                    st_dd = jnp.asarray(student_stacked_dd)
+                    adv_dd = _compute_grpo_advantages(st_dd, teacher_chunk_dd)
+                    obs_m_dd = make_observation_from_simulator(
+                        policy, curr_obs_dict_d
+                    )
+                    for i_gr in range(int(st_dd.shape[0])):
+                        distillation_examples_out.append(
+                            observation_actions_to_bc_example(
+                                obs_m_dd,
+                                st_dd[i_gr],
+                                model_action_horizon=int(original_model.action_horizon),
+                                model_action_dim=int(original_model.action_dim),
+                                alignment_ratio=float(alignment_ratio_dd),
+                                replan_env_step=int(t),
+                                temporal_decay=float(temporal_decay),
+                                teacher_chunk_var_mean=teacher_var_row_dd,
+                                grpo_advantage=float(adv_dd[i_gr]),
+                            )
+                        )
+            elif replan_now:
+                target_chunk_d = (1.0 - alpha) * teacher_chunk + alpha * action_chunk
+                obs_m_d = make_observation_from_simulator(policy, curr_obs_dict)
+                distillation_examples_out.append(
+                    observation_actions_to_bc_example(
+                        obs_m_d,
+                        target_chunk_d,
+                        model_action_horizon=int(original_model.action_horizon),
+                        model_action_dim=int(original_model.action_dim),
+                        alignment_ratio=float(alignment_ratio),
+                        replan_env_step=int(t),
+                        temporal_decay=float(temporal_decay),
+                        teacher_chunk_var_mean=teacher_var_row,
+                    )
+                )
+            else:
+                curr_obs_dict_d = _build_curr_obs_dict(
+                    obs, img, wrist_img, task_description
+                )
+                policy._rng, rng_dd = jax.random.split(policy._rng)
+                noise_dd = jax.random.normal(
+                    rng_dd,
+                    (num_samples, original_model.action_horizon, original_model.action_dim),
+                )
+                student_stacked_dd = _infer_action_chunk_samples(
+                    policy, curr_obs_dict_d, noise_dd
+                )
+                if student_stacked_dd.ndim == 3:
+                    action_chunk_dd = student_stacked_dd[0]
+                else:
+                    action_chunk_dd = student_stacked_dd
+                alignment_ratio_dd = compute_alignment_ratio(
+                    policy,
+                    action_chunk_dd,
+                    curr_obs_dict_d,
+                    noise=noise_dd,
+                    cfg_weight=cfg_weight,
+                )
+                tgs_dd = max(1, int(teacher_group_size))
+                if tgs_dd == 1:
+                    teacher_noise_dd = noise_dd[0:1]
+                else:
+                    policy._rng, rng_tdd = jax.random.split(policy._rng)
+                    teacher_noise_dd = jax.random.normal(
+                        rng_tdd,
+                        (tgs_dd, original_model.action_horizon, original_model.action_dim),
+                    )
+                teacher_stacked_dd = _infer_action_chunk_samples(
+                    teacher_policy, curr_obs_dict_d, teacher_noise_dd
+                )
+                if teacher_stacked_dd.ndim == 3:
+                    teacher_chunk_dd = teacher_stacked_dd[0]
+                else:
+                    teacher_chunk_dd = teacher_stacked_dd
+                teacher_var_row_dd = 0.0
+                if tgs_dd > 1 and teacher_stacked_dd.ndim == 3:
+                    teacher_var_row_dd = float(
+                        jnp.mean(jnp.var(jnp.asarray(teacher_stacked_dd), axis=0))
+                    )
+                target_chunk_dd = (1.0 - alpha) * teacher_chunk_dd + alpha * action_chunk_dd
+                obs_m_dd = make_observation_from_simulator(
+                    policy, curr_obs_dict_d
+                )
+                distillation_examples_out.append(
+                    observation_actions_to_bc_example(
+                        obs_m_dd,
+                        target_chunk_dd,
+                        model_action_horizon=int(original_model.action_horizon),
+                        model_action_dim=int(original_model.action_dim),
+                        alignment_ratio=float(alignment_ratio_dd),
+                        replan_env_step=int(t),
+                        temporal_decay=float(temporal_decay),
+                        teacher_chunk_var_mean=teacher_var_row_dd,
+                    )
+                )
 
         action = action_plan.popleft()
         obs, reward, done, info = env.step(action.tolist())
@@ -2171,6 +2981,9 @@ def _run_single_episode_with_adaptation(
         policy,
         jax_key,
         teacher_l2_by_env_step,
+        group_sampling_trace,
+        teacher_alignment_ratio_by_step,
+        teacher_group_sampling_trace,
     )
 
 
@@ -2201,12 +3014,20 @@ def run_evaluation_with_adaptation(
     use_test_task: bool = False,
     random_neighbors: bool = False,
     cfg_weight: float = 1.0,
-    num_samples: int = 10,
+    num_samples: int = 1,
     debug_metrics: bool = False,
     merging_eps: float | None = None,
     adapt_kwargs: dict[str, Any] = {},
     disable_adaptation: bool = False,
     teacher_policy: _policy.Policy | None = None,
+    show_progress_bar: bool = True,
+    distillation_examples_out: list[dict[str, Any]] | None = None,
+    student_action_merge: float = 0.0,
+    temporal_decay: float = 1.0,
+    teacher_group_size: int = 1,
+    write_auxiliary_rollout_pdfs: bool = True,
+    after_each_rollout_episode: Callable[[int, int, int], None] | None = None,
+    grpo_like: bool = False,
 ):
     """
     Run evaluation with test-time training (TTT).
@@ -2230,12 +3051,15 @@ def run_evaluation_with_adaptation(
         ttt_k: Number of nearest neighbors to retrieve for TTT
         ttt_batch_size: Batch size for TTT training
         ttt_use_modalities: List of modalities to use for retrieval (default: all available)
+        after_each_rollout_episode: If set, called after each trial with
+            ``(episode_idx, task_episodes, task_successes)``.
 
     Returns:
         success_rate: Success rate across all evaluation episodes
     """
     try:
         run_evaluation.last_teacher_student_l2_pdf = None  # type: ignore[attr-defined]
+        run_evaluation.last_episode_metrics = None  # type: ignore[attr-defined]
     except Exception:
         pass
 
@@ -2247,6 +3071,18 @@ def run_evaluation_with_adaptation(
     RESIZE_SIZE = 224
     REPLAN_STEPS = 5
     VIDEO_OUT_PATH = video_out_path
+    if distillation_examples_out is not None and teacher_policy is not None:
+        _grpo_msg = (
+            " GRPO-like: G student chunks per replan group, advantages from -L2(chunk, teacher), "
+            "train mean_i (A_i * denoise_loss_i)."
+            if grpo_like
+            else ""
+        )
+        print(
+            "Distillation rollout: env still uses replan_steps=5 for executed actions; "
+            "BC rows append every env step via on-policy student/teacher queries at current obs."
+            + _grpo_msg
+        )
 
     # Seed all random number generators for reproducibility
     np.random.seed(seed)
@@ -2271,6 +3107,15 @@ def run_evaluation_with_adaptation(
             raise ValueError(f"merging_eps must be in [0, 1], got {merging_eps}")
     elif merging_eps is not None:
         raise ValueError("merging_eps is only valid when meta_update='tt_reptile'")
+    if temporal_decay < 0:
+        raise ValueError(f"temporal_decay must be >= 0, got {temporal_decay}")
+    if teacher_group_size < 1:
+        raise ValueError(f"teacher_group_size must be >= 1, got {teacher_group_size}")
+    if grpo_like:
+        if int(num_samples) < 2:
+            raise ValueError(
+                f"grpo_like requires num_samples (group_size) >= 2, got {num_samples}"
+            )
 
     # Start evaluation
     task_episodes, task_successes = 0, 0
@@ -2328,7 +3173,11 @@ def run_evaluation_with_adaptation(
 
     # Run evaluation episodes; env.close() after loop — OffScreenRenderEnv EGL/MuJoCo
     # otherwise retains GPU memory across repeated run_evaluation during training.
-    pbar = tqdm(range(num_trials), desc=f"Task {task_id} | Success: 0/0 (0.0%)")
+    pbar = tqdm(
+        range(num_trials),
+        desc=f"Task {task_id} | Success: 0/0 (0.0%)",
+        disable=not show_progress_bar,
+    )
     for episode_idx in pbar:
         pbar.write(f"Episode {episode_idx+1} of {num_trials}")
         (
@@ -2345,6 +3194,9 @@ def run_evaluation_with_adaptation(
             policy,
             jax_key,
             teacher_l2_trace,
+            group_sampling_trace,
+            teacher_align_trace,
+            teacher_var_trace,
         ) = _run_single_episode_with_adaptation(
             env=env,
             policy=policy,
@@ -2385,6 +3237,11 @@ def run_evaluation_with_adaptation(
             jax_key=jax_key,
             pbar=pbar,
             teacher_policy=teacher_policy,
+            distillation_examples_out=distillation_examples_out,
+            student_action_merge=student_action_merge,
+            temporal_decay=temporal_decay,
+            teacher_group_size=teacher_group_size,
+            grpo_like=grpo_like,
         )
         all_teacher_l2_episodes.append(list(teacher_l2_trace))
 
@@ -2407,10 +3264,28 @@ def run_evaluation_with_adaptation(
                 "test_losses": episode_test_losses,
                 "num_steps": t,
                 "alignment_ratio_by_step": list(alignment_ratio_by_step),
+                "group_sampling_trace": list(group_sampling_trace),
+                "teacher_l2_by_env_step": list(teacher_l2_trace),
+                "teacher_alignment_ratio_by_step": list(teacher_align_trace),
+                "teacher_group_sampling_trace": list(teacher_var_trace),
             }
         )
 
-        _plot_alignment_ratio_by_step(list(alignment_ratio_by_step))
+        if write_auxiliary_rollout_pdfs and num_samples > 1 and group_sampling_trace:
+            gpdf = pathlib.Path(VIDEO_OUT_PATH) / (
+                f"group_action_sampling_ep{episode_idx:03d}.pdf"
+            )
+            outp = _plot_group_action_sampling_pdf(
+                group_sampling_trace,
+                gpdf,
+                episode_idx=episode_idx,
+                group_size=num_samples,
+            )
+            if outp is not None:
+                pbar.write(f"  Saved group sampling metrics plot to {outp}")
+
+        if write_auxiliary_rollout_pdfs:
+            _plot_alignment_ratio_by_step(list(alignment_ratio_by_step))
         _save_episode_losses_plot(
             episode_losses=episode_losses,
             ttt_num_steps=ttt_num_steps,
@@ -2448,6 +3323,9 @@ def run_evaluation_with_adaptation(
 
         del neighbor_previews, replay_images
 
+        if after_each_rollout_episode is not None:
+            after_each_rollout_episode(episode_idx, task_episodes, task_successes)
+
         # Log progress
         if (episode_idx + 1) % 1 == 0:
             pbar.write(
@@ -2459,8 +3337,15 @@ def run_evaluation_with_adaptation(
     except Exception:
         pass
 
+    if distillation_examples_out is not None:
+        n_d = len(distillation_examples_out)
+        print(
+            f"Distillation: collected {n_d} trajectory samples this evaluation run "
+            f"({num_trials} episode(s); one BC row per environment step when teacher is set)."
+        )
+
     teacher_l2_pdf: pathlib.Path | None = None
-    if teacher_policy is not None:
+    if teacher_policy is not None and write_auxiliary_rollout_pdfs:
         pdf_path = pathlib.Path(VIDEO_OUT_PATH) / (
             f"teacher_student_action_l2_task{task_id}.pdf"
         )
@@ -2477,11 +3362,17 @@ def run_evaluation_with_adaptation(
             )
         except Exception:
             pass
+    elif teacher_policy is not None:
+        try:
+            run_evaluation.last_teacher_student_l2_pdf = None  # type: ignore[attr-defined]
+        except Exception:
+            pass
 
     # Expose collected metrics on the function object without changing the
     # public return type, so scripts can read them after a call.
     try:
         run_evaluation_ttt.last_episode_metrics = all_episode_metrics  # type: ignore[attr-defined]
+        run_evaluation.last_episode_metrics = all_episode_metrics  # type: ignore[attr-defined]
     except Exception:
         pass
 

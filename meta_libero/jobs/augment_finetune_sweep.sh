@@ -11,22 +11,17 @@ mkdir -p "${LOG_DIR}"
 
 # ============== TASK PAIRS & AUGMENTATION ==============
 TASK_PAIRS=(
-  "1 3"
-  "3 1"
-  "4 5"
-  "5 4"
-  "6 7"
-  "7 6"
+  "7 0"
 )
 # Phase 2 mode: "self_replay", "two_lrs" (self-replay + dual LR), "cotraining", "on_policy_self_replay", "self_check", "no_augment"
-MODES=("on_policy_self_replay")   # e.g. "two_lrs" "self_replay" "cotraining"
+MODES=("self_replay" "no_augment" "cotraining" "on_policy_self_replay")   # e.g. "two_lrs" "self_replay" "cotraining"
 SINGLE_EPISODE_OPTS=("")   # ("" "--single_episode")
 # Finetune type: "" (full), "lora", or "action_expert_only"
-FINETUNE_TYPES=("")  # ("" "lora" "action_expert_only")
+FINETUNE_TYPES=("" "lora")  # ("" "lora" "action_expert_only")
 
 
 # Hyperparameters to sweep
-LEARNING_RATES=(1e-04)
+LEARNING_RATES=(2.5e-05)
 NUM_STEPS_LIST=(200)
 MERGING_EPS_LIST=(1 0.75)  # 1.0=keep phase2, 0=keep phase1, 0.5=50/50 blend
 # Alignment ratio threshold for self_replay/on_policy_self_replay: "" = disable, "0.2" = keep samples with ratio <= 0.2
