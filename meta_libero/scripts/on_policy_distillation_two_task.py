@@ -17,7 +17,6 @@
 #   python on_policy_distillation_two_task.py --task 0 --task2 1 --max_iters 25 --max_iters_task2 25
 #   python on_policy_distillation_two_task.py --task 0 --task2 1 --lora
 
-import importlib.util
 import os
 import sys
 
@@ -75,6 +74,18 @@ from meta_libero.src.dataset import (  # type: ignore
     make_pseudo_label_inference_fn,
     override_create_torch_dataset,
 )
+from meta_libero.src.on_policy_distillation.bc_data import (  # type: ignore
+    filter_examples_by_alignment,
+    strip_bc_metadata,
+)
+from meta_libero.src.on_policy_distillation.constants import (  # type: ignore
+    CHECKPOINT_DIR,
+    STUDENT_FINAL_EVAL_EPISODES,
+    TASK_SUITE_NAME,
+)
+from meta_libero.src.on_policy_distillation.plotting import (  # type: ignore
+    plot_distillation_iter_rollout_metrics_pdf,
+)
 from meta_libero.src.ttt import (  # type: ignore
     PAIR_STREAM_INTERLEAVED,
     NeighborsDataLoader,
@@ -86,28 +97,6 @@ from meta_libero.src.ttt import (  # type: ignore
     run_evaluation,
     train_model_on_fly,
 )
-
-# Match on_policy_distillation.py (do not diverge for CHECKPOINT_DIR / task suite).
-TASK_SUITE_NAME = "libero_90"
-STUDENT_FINAL_EVAL_EPISODES = 10
-CHECKPOINT_DIR = os.getenv(
-    "OPENPI_CHECKPOINT_DIR",
-    str(Path.home() / ".cache" / "openpi" / "openpi-assets" / "checkpoints" / "pi05_libero"),
-)
-
-# Lazy-load single-task module for alignment helpers only; avoids import/exec work before teacher FT+eval.
-_OP_PATH = Path(__file__).resolve().parent / "on_policy_distillation.py"
-_opd = None
-
-
-def _get_opd():
-    global _opd
-    if _opd is None:
-        spec = importlib.util.spec_from_file_location("_opd_single", _OP_PATH)
-        assert spec and spec.loader
-        _opd = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(_opd)
-    return _opd
 
 
 def _phase2_opd_paired_task1_pseudo_examples(
@@ -894,8 +883,6 @@ def main() -> None:
         f"({int(round(teacher_eval_sr1 * teval_n))}/{teval_n} episodes)"
     )
 
-    opd = _get_opd()
-
     print("\n" + "=" * 50)
     print("Phase 1 — Student: copy from base (not teacher1)")
     print("=" * 50)
@@ -975,7 +962,7 @@ def main() -> None:
             write_auxiliary_rollout_pdfs=False,
         )
         if episode_rollout_metrics:
-            _get_opd()._plot_distillation_iter_rollout_metrics_pdf(
+            plot_distillation_iter_rollout_metrics_pdf(
                 iter_idx=it,
                 task_id=task1_id,
                 episode_metrics=episode_rollout_metrics,
@@ -988,12 +975,12 @@ def main() -> None:
 
         ep_ok = success_rate >= 1.0 - 1e-6
         n_new = len(episode_examples)
-        filtered_ep, n_kept, n_dropped = opd._filter_examples_by_alignment(
+        filtered_ep, n_kept, n_dropped = filter_examples_by_alignment(
             episode_examples,
             alignment_ratio_threshold=align_th,
             align_min=align_min,
         )
-        stripped = [opd._strip_bc_metadata(e) for e in filtered_ep]
+        stripped = [strip_bc_metadata(e) for e in filtered_ep]
         if args.cumulative_buffer:
             bc_buffer.extend(stripped)
         else:
@@ -1203,7 +1190,7 @@ def main() -> None:
             write_auxiliary_rollout_pdfs=False,
         )
         if episode_rollout_metrics_t2:
-            _get_opd()._plot_distillation_iter_rollout_metrics_pdf(
+            plot_distillation_iter_rollout_metrics_pdf(
                 iter_idx=it,
                 task_id=task2_id,
                 episode_metrics=episode_rollout_metrics_t2,
@@ -1214,12 +1201,12 @@ def main() -> None:
 
         ep_ok = success_rate_t2 >= 1.0 - 1e-6
         n_new = len(episode_examples)
-        filtered_ep, n_kept, n_dropped = opd._filter_examples_by_alignment(
+        filtered_ep, n_kept, n_dropped = filter_examples_by_alignment(
             episode_examples,
             alignment_ratio_threshold=align_th,
             align_min=align_min,
         )
-        stripped = [opd._strip_bc_metadata(e) for e in filtered_ep]
+        stripped = [strip_bc_metadata(e) for e in filtered_ep]
         if args.cumulative_buffer:
             bc_buffer.extend(stripped)
         else:

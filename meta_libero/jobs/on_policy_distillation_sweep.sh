@@ -11,7 +11,7 @@ mkdir -p "${LOG_DIR}"
 
 # ============== TASKS & OPTIONS ==============
 # Single task id per job (teacher FT + student distillation on that task)
-TASKS=(0 1 3 7)
+TASKS=(6 7)
 
 # Optional sweeps (mirror augment_finetune_sweep.sh: add entries to sweep)
 SINGLE_EPISODE_OPTS=("")
@@ -26,7 +26,7 @@ FULL_EXPERIMENT_OPTS=("--full_experiment")
 # ============== HYPERPARAMETERS ==============
 TEACHER_LRS=(1e-04)
 TEACHER_STEPS_LIST=(200)
-BC_LRS=(2.5e-05)
+BC_LRS=(5e-05)
 BC_STEPS_LIST=(20)
 MAX_ITERS_LIST=(100)
 SEEDS=(42)
@@ -46,11 +46,11 @@ ALIGN_MIN_LIST=("")
 # Per-replan distillation BC weight = temporal_decay ** env_step; 1.0 = uniform (default)
 TEMPORAL_DECAY_LIST=(1)
 # "" = L2 MSE on diffusion residual (default); "--l1_bc_loss" = L1 (student BC only)
-L1_BC_LOSS_OPTS=("--l1_bc_loss")
+L1_BC_LOSS_OPTS=("--l1_bc_loss" "")
 # Student BC: weight on MSE(v_t, stop_grad(v_t^ref)) vs frozen snapshot (0 = off; run dir _kl… when non-zero)
 KL_LAMBDA_LIST=(0)
 # Student: G independent action-chunk samples per replan (1 = default; run dir _gG when G!=1)
-GROUP_SIZE_LIST=(1)
+GROUP_SIZE_LIST=(4)
 # Teacher: T independent noise draws per replan for variance in distillation_rollout_metrics.pdf (1 = default / legacy; run dir _tgT when T!=1)
 TEACHER_GROUP_SIZE_LIST=(1)
 # "" = no filter; else --max_teacher_variance (drop BC rows with mean_{h,d}Var(teacher samples) > this; run dir _mtv…)
@@ -64,7 +64,15 @@ STUDENT_PRETRAINING_EVAL_INTERVAL_LIST=(50)
 STUDENT_PRETRAINING_EVAL_EPISODES_LIST=(10)
 
 # "" = standard distillation BC; "--grpo_like" = advantage-weighted diffusion loss (requires GROUP_SIZE>=2)
-GRPO_LIKE_OPTS=("")
+GRPO_LIKE_OPTS=("--grpo_like")
+# GRPO only: "" = omit (raw student chunk as BC target); else e.g. "0.05" -> --grpo_trust_eps (run dir …_gte…)
+GRPO_TRUST_EPS_OPTS=("0.1")
+# GRPO only: "" = omit (--grpo_weight none); "mean_std" -> --grpo_weight mean_std (run dir …_gwms… from Python)
+GRPO_WEIGHT_OPTS=("" "mean_std")
+# Optional: set e.g. "1e-7" to pass --grpo_weight_eps (default in Python: 1e-8); leave empty to omit
+GRPO_WEIGHT_EPS=""
+# Distillation: BC rows every N env steps after --num_steps_wait (default 1; run dir …_dceN… when N!=1)
+DISTILL_COLLECT_EVERY=5
 
 # SLURM settings (match augment_finetune_sweep.sh)
 TIME="24:00:00"
@@ -109,7 +117,18 @@ for TASK in "${TASKS[@]}"; do
                         for save_video_opt in "${SAVE_VIDEO_OPTS[@]}"; do
                         for full_exp in "${FULL_EXPERIMENT_OPTS[@]}"; do
                         for GRPO_OPT in "${GRPO_LIKE_OPTS[@]}"; do
+                        for GRPO_TRUST_EPS in "${GRPO_TRUST_EPS_OPTS[@]}"; do
+                        for GRPO_WEIGHT in "${GRPO_WEIGHT_OPTS[@]}"; do
                           if [[ -n "${GRPO_OPT}" && "${GROUP_SIZE}" -lt 2 ]]; then
+                            continue
+                          fi
+                          if [[ -n "${GRPO_TRUST_EPS}" && -z "${GRPO_OPT}" ]]; then
+                            continue
+                          fi
+                          if [[ -n "${GRPO_WEIGHT}" && -z "${GRPO_OPT}" ]]; then
+                            continue
+                          fi
+                          if [[ -n "${GRPO_WEIGHT_EPS}" && -z "${GRPO_OPT}" ]]; then
                             continue
                           fi
                         suffix=""
@@ -173,6 +192,18 @@ for TASK in "${TASKS[@]}"; do
                           if [[ -n "${GRPO_OPT}" ]]; then
                             suffix="${suffix}_grpo"
                           fi
+                          if [[ -n "${GRPO_TRUST_EPS}" ]]; then
+                            suffix="${suffix}_gte${GRPO_TRUST_EPS}"
+                          fi
+                          if [[ "${GRPO_WEIGHT}" == "mean_std" ]]; then
+                            suffix="${suffix}_gwms"
+                          fi
+                          if [[ -n "${GRPO_WEIGHT_EPS}" ]]; then
+                            suffix="${suffix}_gwe${GRPO_WEIGHT_EPS}"
+                          fi
+                          if [[ "${DISTILL_COLLECT_EVERY}" != "1" ]]; then
+                            suffix="${suffix}_dce${DISTILL_COLLECT_EVERY}"
+                          fi
 
                           JOB_NAME="opdist_t${TASK}_tlr${TEACHER_LR}_ts${TEACHER_STEPS}_bc${BC_LR}_bs${BC_STEPS}_mi${MAX_ITERS}_s${SEED}${suffix}"
 
@@ -199,8 +230,20 @@ for TASK in "${TASKS[@]}"; do
                           if [[ -n "${SPT_LR_OPT}" ]]; then
                             SPT_LR_FLAG="--student_pretraining_lr ${SPT_LR_OPT}"
                           fi
+                          TRUST_FLAG=""
+                          if [[ -n "${GRPO_TRUST_EPS}" ]]; then
+                            TRUST_FLAG="--grpo_trust_eps ${GRPO_TRUST_EPS}"
+                          fi
+                          GRPO_WEIGHT_FLAG=""
+                          if [[ -n "${GRPO_WEIGHT}" ]]; then
+                            GRPO_WEIGHT_FLAG="--grpo_weight ${GRPO_WEIGHT}"
+                          fi
+                          GRPO_WEIGHT_EPS_FLAG=""
+                          if [[ -n "${GRPO_WEIGHT_EPS}" ]]; then
+                            GRPO_WEIGHT_EPS_FLAG="--grpo_weight_eps ${GRPO_WEIGHT_EPS}"
+                          fi
 
-                          echo "Submitting: task=${TASK} teacher_lr=${TEACHER_LR} teacher_steps=${TEACHER_STEPS} bc_lr=${BC_LR} bc_steps=${BC_STEPS} max_iters=${MAX_ITERS} seed=${SEED} spt_steps=${SPT_STEPS} spt_lr=${SPT_LR_OPT:-teacher} spt_ev_int=${SPT_EVAL_INT} spt_ev_ep=${SPT_EVAL_EP} teval_ep=${TEACHER_EVAL_EP} rollout_ep=${ROLLOUT_EP} sam=${SAM} td=${TEMPORAL_DECAY} l1=${L1_BC:-off} kl=${KL_LAMBDA} g=${GROUP_SIZE} tg=${TEACHER_GROUP_SIZE} max_tv=${MAX_TEACHER_VARIANCE:-none} align=${ALIGN_THRESH:-none} align_min=${ALIGN_MIN:-none} full_exp=${full_exp:-none} grpo=${GRPO_OPT:-off} ${single_episode} ${finetune_type} ${cumulative} ${save_video_opt}"
+                          echo "Submitting: task=${TASK} teacher_lr=${TEACHER_LR} teacher_steps=${TEACHER_STEPS} bc_lr=${BC_LR} bc_steps=${BC_STEPS} max_iters=${MAX_ITERS} seed=${SEED} spt_steps=${SPT_STEPS} spt_lr=${SPT_LR_OPT:-teacher} spt_ev_int=${SPT_EVAL_INT} spt_ev_ep=${SPT_EVAL_EP} teval_ep=${TEACHER_EVAL_EP} rollout_ep=${ROLLOUT_EP} sam=${SAM} td=${TEMPORAL_DECAY} l1=${L1_BC:-off} kl=${KL_LAMBDA} g=${GROUP_SIZE} tg=${TEACHER_GROUP_SIZE} max_tv=${MAX_TEACHER_VARIANCE:-none} align=${ALIGN_THRESH:-none} align_min=${ALIGN_MIN:-none} full_exp=${full_exp:-none} grpo=${GRPO_OPT:-off} grpo_trust=${GRPO_TRUST_EPS:-none} grpo_w=${GRPO_WEIGHT:-none} grpo_w_eps=${GRPO_WEIGHT_EPS:-default} ${single_episode} ${finetune_type} ${cumulative} ${save_video_opt}"
 
                           sbatch <<EOF
 #!/bin/bash
@@ -243,10 +286,16 @@ python meta_libero/scripts/on_policy_distillation.py \
   ${save_video_opt} \
   ${full_exp} \
   ${GRPO_OPT} \
+  ${TRUST_FLAG} \
+  ${GRPO_WEIGHT_FLAG} \
+  ${GRPO_WEIGHT_EPS_FLAG} \
+  --distill_collect_every "${DISTILL_COLLECT_EVERY}" \
   ${L1_BC}
 EOF
 
                           job_count=$((job_count + 1))
+                        done
+                        done
                         done
                         done
                         done

@@ -172,3 +172,5 @@ meta_libero/logs/
 # Ignore all files .mp4 inside results (videos)
 meta_libero/results/**/*.mp4
 meta_libero/results/**/*.pdf
+# Track loss curves (override the *.pdf rule above)
+!meta_libero/results/**/losses.pdf
