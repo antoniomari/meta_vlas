@@ -3,8 +3,8 @@
 # Implementation: ``meta_libero.src.on_policy_distillation`` (modular package). This file only sets up
 # the environment and delegates to :func:`meta_libero.src.on_policy_distillation.main.main`.
 #
-# Weights & Biases: pass --wandb_project YOUR_PROJECT to log. Set credentials once via ``wandb login``
-# (stores key in ~/.netrc) or set environment variable WANDB_API_KEY.
+# Weights & Biases: logs by default to project ``meta_libero_on_policy_distillation``; use ``--no_wandb``
+# to disable, or ``--wandb_project NAME`` to override. Authenticate with ``wandb login`` or WANDB_API_KEY.
 #
 # Usage:
 #   python on_policy_distillation.py --task 6 --teacher_steps 50 --bc_steps 20 --lr 1e-4

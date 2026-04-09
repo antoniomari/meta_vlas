@@ -11,7 +11,7 @@ mkdir -p "${LOG_DIR}"
 
 # ============== TASKS & OPTIONS ==============
 # Single task id per job (teacher FT + student distillation on that task)
-TASKS=(6 7)
+TASKS=(6)
 
 # Optional sweeps (mirror augment_finetune_sweep.sh: add entries to sweep)
 SINGLE_EPISODE_OPTS=("")
@@ -19,20 +19,22 @@ FINETUNE_TYPES=("lora")
 # "" = last-episode BC only; add "--cumulative_buffer" to sweep cumulative buffer
 CUMULATIVE_OPTS=("")
 # "" = save videos; add "--no_save_video" for lighter jobs
-SAVE_VIDEO_OPTS=("")
+SAVE_VIDEO_OPTS=("--no_save_video")
 # "" = early stop on rollout success (default); "--full_experiment" = run all max_iters, periodic 10-ep eval
 FULL_EXPERIMENT_OPTS=("--full_experiment")
 
 # ============== HYPERPARAMETERS ==============
 TEACHER_LRS=(1e-04)
 TEACHER_STEPS_LIST=(200)
-BC_LRS=(5e-05)
+BC_LRS=(2.5e-05)
 BC_STEPS_LIST=(20)
 MAX_ITERS_LIST=(100)
 SEEDS=(42)
 TEACHER_EVAL_EPISODES_LIST=(10)
 # Episodes per distillation outer iter (merged into one BC dataset); 1 = previous behavior
-ROLLOUT_EPISODES_LIST=(1)
+ROLLOUT_EPISODES_LIST=(8)
+# Parallel LIBERO envs per rollout wave (batched policy inference at replan); 1 = sequential sims
+ROLLOUT_NUM_ENVS_LIST=(8)
 # Distillation BC targets: (1-α)*teacher + α*student per replan; 0 = teacher-only (default)
 STUDENT_ACTION_MERGE_LIST=(0)
 BATCH_SIZE=32
@@ -66,9 +68,13 @@ STUDENT_PRETRAINING_EVAL_EPISODES_LIST=(10)
 # "" = standard distillation BC; "--grpo_like" = advantage-weighted diffusion loss (requires GROUP_SIZE>=2)
 GRPO_LIKE_OPTS=("--grpo_like")
 # GRPO only: "" = omit (raw student chunk as BC target); else e.g. "0.05" -> --grpo_trust_eps (run dir …_gte…)
-GRPO_TRUST_EPS_OPTS=("0.1")
+GRPO_TRUST_EPS_OPTS=("")
 # GRPO only: "" = omit (--grpo_weight none); "mean_std" -> --grpo_weight mean_std (run dir …_gwms… from Python)
-GRPO_WEIGHT_OPTS=("" "mean_std")
+GRPO_WEIGHT_OPTS=("")
+# GRPO only: full shuffled passes over the collected BC buffer per outer iter (--n_epoch; total grad steps = n_epoch * ceil(n/batch)). Ignored without --grpo_like.
+N_EPOCH_LIST=(1)
+# GRPO only: "" = one grad step per minibatch; "--grpo_grad_accum_per_trajectory" = one optimizer step per rollout trajectory (average microbatch grads; run dir …_gtrajaccum).
+GRPO_GRAD_ACCUM_OPTS=("--grpo_grad_accum_per_trajectory")
 # Optional: set e.g. "1e-7" to pass --grpo_weight_eps (default in Python: 1e-8); leave empty to omit
 GRPO_WEIGHT_EPS=""
 # Distillation: BC rows every N env steps after --num_steps_wait (default 1; run dir …_dceN… when N!=1)
@@ -99,6 +105,7 @@ for TASK in "${TASKS[@]}"; do
               for SPT_EVAL_EP in "${STUDENT_PRETRAINING_EVAL_EPISODES_LIST[@]}"; do
               for TEACHER_EVAL_EP in "${TEACHER_EVAL_EPISODES_LIST[@]}"; do
                 for ROLLOUT_EP in "${ROLLOUT_EPISODES_LIST[@]}"; do
+                for ROLLOUT_NUM_ENVS in "${ROLLOUT_NUM_ENVS_LIST[@]}"; do
                 for SAM in "${STUDENT_ACTION_MERGE_LIST[@]}"; do
                 for TEMPORAL_DECAY in "${TEMPORAL_DECAY_LIST[@]}"; do
                 for L1_BC in "${L1_BC_LOSS_OPTS[@]}"; do
@@ -119,6 +126,8 @@ for TASK in "${TASKS[@]}"; do
                         for GRPO_OPT in "${GRPO_LIKE_OPTS[@]}"; do
                         for GRPO_TRUST_EPS in "${GRPO_TRUST_EPS_OPTS[@]}"; do
                         for GRPO_WEIGHT in "${GRPO_WEIGHT_OPTS[@]}"; do
+                        for N_EPOCH in "${N_EPOCH_LIST[@]}"; do
+                        for GRPO_GRAD_ACCUM in "${GRPO_GRAD_ACCUM_OPTS[@]}"; do
                           if [[ -n "${GRPO_OPT}" && "${GROUP_SIZE}" -lt 2 ]]; then
                             continue
                           fi
@@ -129,6 +138,12 @@ for TASK in "${TASKS[@]}"; do
                             continue
                           fi
                           if [[ -n "${GRPO_WEIGHT_EPS}" && -z "${GRPO_OPT}" ]]; then
+                            continue
+                          fi
+                          if [[ -z "${GRPO_OPT}" && "${N_EPOCH}" != "1" ]]; then
+                            continue
+                          fi
+                          if [[ -n "${GRPO_GRAD_ACCUM}" && -z "${GRPO_OPT}" ]]; then
                             continue
                           fi
                         suffix=""
@@ -152,6 +167,9 @@ for TASK in "${TASKS[@]}"; do
                           fi
                           if [[ "${ROLLOUT_EP}" != "1" ]]; then
                             suffix="${suffix}_rep${ROLLOUT_EP}"
+                          fi
+                          if [[ "${ROLLOUT_NUM_ENVS}" != "1" ]]; then
+                            suffix="${suffix}_nenv${ROLLOUT_NUM_ENVS}"
                           fi
                           if [[ -n "${full_exp}" ]]; then
                             suffix="${suffix}_full"
@@ -204,6 +222,12 @@ for TASK in "${TASKS[@]}"; do
                           if [[ "${DISTILL_COLLECT_EVERY}" != "1" ]]; then
                             suffix="${suffix}_dce${DISTILL_COLLECT_EVERY}"
                           fi
+                          if [[ -n "${GRPO_OPT}" && "${N_EPOCH}" != "1" ]]; then
+                            suffix="${suffix}_ne${N_EPOCH}"
+                          fi
+                          if [[ -n "${GRPO_GRAD_ACCUM}" ]]; then
+                            suffix="${suffix}_gtrajaccum"
+                          fi
 
                           JOB_NAME="opdist_t${TASK}_tlr${TEACHER_LR}_ts${TEACHER_STEPS}_bc${BC_LR}_bs${BC_STEPS}_mi${MAX_ITERS}_s${SEED}${suffix}"
 
@@ -242,8 +266,16 @@ for TASK in "${TASKS[@]}"; do
                           if [[ -n "${GRPO_WEIGHT_EPS}" ]]; then
                             GRPO_WEIGHT_EPS_FLAG="--grpo_weight_eps ${GRPO_WEIGHT_EPS}"
                           fi
+                          N_EPOCH_FLAG=""
+                          if [[ -n "${GRPO_OPT}" ]]; then
+                            N_EPOCH_FLAG="--n_epoch ${N_EPOCH}"
+                          fi
+                          GRPO_GRAD_ACCUM_FLAG=""
+                          if [[ -n "${GRPO_GRAD_ACCUM}" ]]; then
+                            GRPO_GRAD_ACCUM_FLAG="${GRPO_GRAD_ACCUM}"
+                          fi
 
-                          echo "Submitting: task=${TASK} teacher_lr=${TEACHER_LR} teacher_steps=${TEACHER_STEPS} bc_lr=${BC_LR} bc_steps=${BC_STEPS} max_iters=${MAX_ITERS} seed=${SEED} spt_steps=${SPT_STEPS} spt_lr=${SPT_LR_OPT:-teacher} spt_ev_int=${SPT_EVAL_INT} spt_ev_ep=${SPT_EVAL_EP} teval_ep=${TEACHER_EVAL_EP} rollout_ep=${ROLLOUT_EP} sam=${SAM} td=${TEMPORAL_DECAY} l1=${L1_BC:-off} kl=${KL_LAMBDA} g=${GROUP_SIZE} tg=${TEACHER_GROUP_SIZE} max_tv=${MAX_TEACHER_VARIANCE:-none} align=${ALIGN_THRESH:-none} align_min=${ALIGN_MIN:-none} full_exp=${full_exp:-none} grpo=${GRPO_OPT:-off} grpo_trust=${GRPO_TRUST_EPS:-none} grpo_w=${GRPO_WEIGHT:-none} grpo_w_eps=${GRPO_WEIGHT_EPS:-default} ${single_episode} ${finetune_type} ${cumulative} ${save_video_opt}"
+                          echo "Submitting: task=${TASK} teacher_lr=${TEACHER_LR} teacher_steps=${TEACHER_STEPS} bc_lr=${BC_LR} bc_steps=${BC_STEPS} max_iters=${MAX_ITERS} seed=${SEED} spt_steps=${SPT_STEPS} spt_lr=${SPT_LR_OPT:-teacher} spt_ev_int=${SPT_EVAL_INT} spt_ev_ep=${SPT_EVAL_EP} teval_ep=${TEACHER_EVAL_EP} rollout_ep=${ROLLOUT_EP} rollout_num_envs=${ROLLOUT_NUM_ENVS} sam=${SAM} td=${TEMPORAL_DECAY} l1=${L1_BC:-off} kl=${KL_LAMBDA} g=${GROUP_SIZE} tg=${TEACHER_GROUP_SIZE} max_tv=${MAX_TEACHER_VARIANCE:-none} align=${ALIGN_THRESH:-none} align_min=${ALIGN_MIN:-none} full_exp=${full_exp:-none} grpo=${GRPO_OPT:-off} n_epoch=${N_EPOCH} gtrajaccum=${GRPO_GRAD_ACCUM:-off} grpo_trust=${GRPO_TRUST_EPS:-none} grpo_w=${GRPO_WEIGHT:-none} grpo_w_eps=${GRPO_WEIGHT_EPS:-default} ${single_episode} ${finetune_type} ${cumulative} ${save_video_opt}"
 
                           sbatch <<EOF
 #!/bin/bash
@@ -268,6 +300,7 @@ python meta_libero/scripts/on_policy_distillation.py \
   --max_iters "${MAX_ITERS}" \
   --teacher_eval_episodes "${TEACHER_EVAL_EP}" \
   --rollout_episodes "${ROLLOUT_EP}" \
+  --rollout_num_envs "${ROLLOUT_NUM_ENVS}" \
   --student_action_merge "${SAM}" \
   --group_size "${GROUP_SIZE}" \
   --teacher_group_size "${TEACHER_GROUP_SIZE}" \
@@ -289,6 +322,8 @@ python meta_libero/scripts/on_policy_distillation.py \
   ${TRUST_FLAG} \
   ${GRPO_WEIGHT_FLAG} \
   ${GRPO_WEIGHT_EPS_FLAG} \
+  ${N_EPOCH_FLAG} \
+  ${GRPO_GRAD_ACCUM_FLAG} \
   --distill_collect_every "${DISTILL_COLLECT_EVERY}" \
   ${L1_BC}
 EOF
@@ -299,9 +334,12 @@ EOF
                         done
                         done
                         done
+                        done
+                        done
                       done
                     done
                   done
+                done
                 done
                 done
                 done

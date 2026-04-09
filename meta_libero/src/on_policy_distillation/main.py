@@ -34,6 +34,10 @@ from meta_libero.src.on_policy_distillation.plotting import (
 )
 from meta_libero.src.on_policy_distillation.results_csv import save_results_csv
 from meta_libero.src.on_policy_distillation.run_layout import ensure_run_dir
+from meta_libero.src.on_policy_distillation.rlinf_wandb_metrics import (
+    rlinf_style_rollout_metrics,
+    rlinf_style_train_metrics,
+)
 from meta_libero.src.on_policy_distillation.wandb_run import init_wandb, summarize_rollout_metrics
 from meta_libero.src.ttt import (  # type: ignore
     NeighborsDataLoader,
@@ -58,6 +62,19 @@ def main() -> None:
     parser.add_argument("--bc_steps", type=int, default=10, help="BC gradient steps per outer iteration")
     parser.add_argument("--bc_lr", type=float, default=1e-4, help="LR for student BC")
     parser.add_argument(
+        "--n_epoch",
+        type=int,
+        default=1,
+        help=(
+            "GRPO-style (--grpo_like) only: full passes over the collected BC buffer per outer "
+            "iteration. Total gradient steps = n_epoch * steps_per_epoch. "
+            "Default path: steps_per_epoch = ceil(n_examples / batch) (shuffled minibatches). "
+            "With --grpo_grad_accum_per_trajectory: steps_per_epoch = number of distinct rollout "
+            "trajectories in the buffer (one optimizer step per trajectory; microbatch grad average). "
+            "Ignored when --grpo_like is off (use --bc_steps)."
+        ),
+    )
+    parser.add_argument(
         "--max_iters",
         type=int,
         default=50,
@@ -79,6 +96,17 @@ def main() -> None:
         help=(
             "Per outer distillation iteration: run this many student eval rollouts; "
             "all trajectories are merged into one BC dataset (same as num_trials in run_evaluation)."
+        ),
+    )
+    parser.add_argument(
+        "--rollout_num_envs",
+        type=int,
+        default=1,
+        help=(
+            "Parallel LIBERO simulator instances per rollout wave. When >1, observations are batched "
+            "and the student/teacher policies run one forward pass per replan step for all envs that "
+            "need a new chunk (distillation rollouts only). Must divide workload: episodes are run in "
+            "waves of min(rollout_num_envs, remaining_episodes)."
         ),
     )
     parser.add_argument("--save_video", action="store_true", default=True)
@@ -250,6 +278,16 @@ def main() -> None:
         help="Denominator epsilon for --grpo_weight mean_std (must be > 0).",
     )
     parser.add_argument(
+        "--grpo_grad_accum_per_trajectory",
+        action="store_true",
+        help=(
+            "GRPO only: one optimizer step per rollout trajectory; average gradients over microbatches "
+            "that cover that trajectory (same policy weights for all microbatches). Requires "
+            "rollout_trajectory_id on BC rows (set automatically). Incompatible with plain per-minibatch "
+            "GRPO steps; uses --n_epoch as number of shuffled passes over trajectories."
+        ),
+    )
+    parser.add_argument(
         "--distill_collect_every",
         type=int,
         default=1,
@@ -259,12 +297,16 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--no_wandb",
+        action="store_true",
+        help="Disable Weights & Biases logging (overrides --wandb_project).",
+    )
+    parser.add_argument(
         "--wandb_project",
         type=str,
-        default=None,
+        default="meta_libero_on_policy_distillation",
         help=(
-            "If set, log metrics to Weights & Biases (project name). "
-            "Authenticate with `wandb login` or set env WANDB_API_KEY (see script docstring)."
+            "W&B project name (default: on). Authenticate with `wandb login` or WANDB_API_KEY."
         ),
     )
     parser.add_argument(
@@ -292,6 +334,8 @@ def main() -> None:
         help="Optional comma-separated tags for the run.",
     )
     args = parser.parse_args()
+    if args.no_wandb:
+        args.wandb_project = None
     if args.alignment_ratio_threshold is not None and args.align_min is not None:
         parser.error("use only one of --alignment_ratio_threshold and --align_min")
     sam = float(args.student_action_merge)
@@ -315,6 +359,10 @@ def main() -> None:
         parser.error("--grpo_weight_eps must be > 0")
     if int(args.distill_collect_every) < 1:
         parser.error("--distill_collect_every must be >= 1")
+    if int(args.n_epoch) < 1:
+        parser.error("--n_epoch must be >= 1")
+    if args.grpo_grad_accum_per_trajectory and not args.grpo_like:
+        parser.error("--grpo_grad_accum_per_trajectory requires --grpo_like")
     distill_collect_every = int(args.distill_collect_every)
     temporal_decay = float(args.temporal_decay)
     if temporal_decay < 0:
@@ -344,12 +392,14 @@ def main() -> None:
     spt_eval_interval = max(1, int(args.student_pretraining_eval_interval))
     spt_eval_episodes = max(1, int(args.student_pretraining_eval_episodes))
     bc_steps = args.bc_steps
+    n_epoch = max(1, int(args.n_epoch))
     bc_lr = args.bc_lr
     max_iters = args.max_iters
     repo_id = "antoniomari/libero_90"
     align_th = args.alignment_ratio_threshold
     align_min = args.align_min
     rollout_episodes = max(1, int(args.rollout_episodes))
+    rollout_num_envs = max(1, int(args.rollout_num_envs))
 
     run_dir, video_dir, losses_pdf = ensure_run_dir(
         task_id=task_id,
@@ -365,6 +415,7 @@ def main() -> None:
         alignment_ratio_threshold=align_th,
         align_min=align_min,
         rollout_episodes=rollout_episodes,
+        rollout_num_envs=rollout_num_envs,
         full_experiment=args.full_experiment,
         student_action_merge=sam,
         group_size=group_size,
@@ -379,6 +430,10 @@ def main() -> None:
         grpo_weight=(args.grpo_weight if args.grpo_weight != "none" else None),
         grpo_weight_eps=float(args.grpo_weight_eps),
         distill_collect_every=distill_collect_every,
+        grpo_n_epoch=(n_epoch if bool(args.grpo_like) else None),
+        grpo_grad_accum_per_trajectory=bool(
+            args.grpo_like and args.grpo_grad_accum_per_trajectory
+        ),
     )
 
     print(f"Run directory: {run_dir}")
@@ -393,6 +448,7 @@ def main() -> None:
         "max_iters": max_iters,
         "batch_size": batch_size,
         "rollout_episodes": rollout_episodes,
+        "rollout_num_envs": rollout_num_envs,
         "student_action_merge": sam,
         "group_size": group_size,
         "teacher_group_size": teacher_group_size,
@@ -405,6 +461,8 @@ def main() -> None:
         "grpo_weight": args.grpo_weight,
         "grpo_weight_eps": float(args.grpo_weight_eps),
         "distill_collect_every": distill_collect_every,
+        "n_epoch": n_epoch,
+        "grpo_grad_accum_per_trajectory": bool(args.grpo_grad_accum_per_trajectory),
         "student_pretraining_steps": student_pretraining_steps,
         "cumulative_buffer": args.cumulative_buffer,
         "alignment_ratio_threshold": align_th,
@@ -670,6 +728,7 @@ def main() -> None:
     _flush_losses_pdf("after teacher + student SFT prep (if any); start distillation")
 
     bc_wandb_step = 0
+    last_bc_grad_steps = bc_steps
     for it in range(max_iters):
         iter_video = video_dir / f"iter_{it:03d}"
         iter_video.mkdir(parents=True, exist_ok=True)
@@ -703,6 +762,7 @@ def main() -> None:
             policy=student_policy,
             train_config=config,
             num_trials=rollout_episodes,
+            num_envs=rollout_num_envs,
             task_suite_name=TASK_SUITE_NAME,
             task_id=task_id,
             save_video=args.save_video,
@@ -724,6 +784,7 @@ def main() -> None:
             ),
             grpo_weight_eps=float(args.grpo_weight_eps),
             distill_collect_every=distill_collect_every,
+            distill_trajectory_id_offset=int(it) * 65536,
         )
         if episode_rollout_metrics:
             plot_distillation_iter_rollout_metrics_pdf(
@@ -781,6 +842,13 @@ def main() -> None:
                 "distill/rollout_episode_success": float(ep_success),
             }
             wlog.update(summarize_rollout_metrics(episode_rollout_metrics))
+            wlog.update(
+                rlinf_style_rollout_metrics(
+                    task_id=task_id,
+                    success_rate=float(success_rate),
+                    episode_metrics=episode_rollout_metrics,
+                )
+            )
             wandb.log(wlog)
 
         if ep_success:
@@ -825,19 +893,73 @@ def main() -> None:
 
         data_cfg = config.data.create(config.assets_dirs, config.model)
         bc_bs = min(batch_size, len(bc_buffer))
-        bc_loader = NeighborsDataLoader(bc_buffer, bc_bs, data_cfg)
+        bc_train_seed = seed + it + 777
+        if args.grpo_like:
+            if args.grpo_grad_accum_per_trajectory:
+                bc_loader = NeighborsDataLoader(
+                    bc_buffer,
+                    bc_bs,
+                    data_cfg,
+                    sequential_epochs=False,
+                    epoch_seed=bc_train_seed,
+                    n_epoch=n_epoch,
+                    grpo_one_grad_per_trajectory=True,
+                )
+                n_traj = bc_loader.num_trajectories()
+                steps_per_epoch = n_traj
+                num_bc_steps = n_epoch * n_traj
+                last_bc_grad_steps = num_bc_steps
+            else:
+                bc_loader = NeighborsDataLoader(
+                    bc_buffer,
+                    bc_bs,
+                    data_cfg,
+                    sequential_epochs=True,
+                    epoch_seed=bc_train_seed,
+                )
+                steps_per_epoch = len(bc_loader)
+                num_bc_steps = n_epoch * steps_per_epoch
+                last_bc_grad_steps = num_bc_steps
+        else:
+            bc_loader = NeighborsDataLoader(bc_buffer, bc_bs, data_cfg)
+            num_bc_steps = bc_steps
+            last_bc_grad_steps = num_bc_steps
 
         _bc_note = " (GRPO-weighted denoise loss)" if args.grpo_like else ""
-        print(
-            f"  BC train: {bc_steps} steps, lr={bc_lr}, examples={len(bc_buffer)}, batch={bc_bs}{_bc_note}"
-        )
+        if args.grpo_like:
+            _acc_note = (
+                " [1 grad step / traj, microbatch accum]"
+                if args.grpo_grad_accum_per_trajectory
+                else ""
+            )
+            print(
+                f"  BC train (GRPO){_acc_note}: n_epoch={n_epoch}, steps/epoch={steps_per_epoch}, "
+                f"total_grad_steps={num_bc_steps}, lr={bc_lr}, examples={len(bc_buffer)}, "
+                f"batch={bc_bs}{_bc_note}"
+            )
+        else:
+            print(
+                f"  BC train: {bc_steps} steps, lr={bc_lr}, examples={len(bc_buffer)}, "
+                f"batch={bc_bs}{_bc_note}"
+            )
         bc_loss_chunk: list[float] = []
 
-        def _on_bc_step(_step: int, loss_val: float) -> None:
+        def _on_bc_step_info(_step: int, step_info: dict) -> None:
             nonlocal bc_wandb_step
+            loss_val = float(step_info.get("loss", 0.0))
             bc_loss_chunk.append(loss_val)
             if wb_run is not None:
-                wandb.log({"bc_step": bc_wandb_step, "bc/loss": float(loss_val)})
+                wandb.log(
+                    {
+                        "bc_step": bc_wandb_step,
+                        "bc/loss": loss_val,
+                        **rlinf_style_train_metrics(
+                            loss=loss_val,
+                            lr=bc_lr,
+                            step_info=step_info,
+                        ),
+                    }
+                )
                 bc_wandb_step += 1
 
         ref_for_kl = None
@@ -850,18 +972,19 @@ def main() -> None:
             training_data_loader=bc_loader,
             config=config,
             learning_rate=bc_lr,
-            num_steps=bc_steps,
+            num_steps=num_bc_steps,
             warmup_steps=0,
             weight_decay=0.0,
-            log_interval=max(1, bc_steps // 5),
-            seed=seed + it + 777,
+            log_interval=max(1, num_bc_steps // 5),
+            seed=bc_train_seed,
             show_progress_bar=True,
             donate_buffers=False,
-            on_step_callback=_on_bc_step,
+            on_step_info_callback=_on_bc_step_info,
             l1_loss=bool(args.l1_bc_loss),
             kl_lambda=kl_lambda,
             ref_model_for_kl=ref_for_kl,
             grpo_like=bool(args.grpo_like),
+            grpo_one_grad_per_trajectory=bool(args.grpo_grad_accum_per_trajectory),
         )
         del ref_for_kl
         del bc_loader
@@ -952,9 +1075,12 @@ def main() -> None:
         "teacher_eval_success_rate": float(teacher_eval_sr),
         "teacher_final_loss": teacher_losses[-1] if teacher_losses else None,
         "bc_steps_per_iter": bc_steps,
+        "n_epoch": n_epoch,
+        "bc_grad_steps_last_iter": last_bc_grad_steps,
         "bc_lr": bc_lr,
         "max_iters": max_iters,
         "rollout_episodes": rollout_episodes,
+        "rollout_num_envs": rollout_num_envs,
         "student_final_eval_10ep_success_rate": student_final_eval_10ep_sr,
         "n_iters_ran": len(distill_eval_by_iter),
         "final_success": final_success,
@@ -974,6 +1100,7 @@ def main() -> None:
         "kl_lambda": kl_lambda,
         "max_teacher_variance": max_teacher_var,
         "grpo_like": bool(args.grpo_like),
+        "grpo_grad_accum_per_trajectory": bool(args.grpo_grad_accum_per_trajectory),
         "grpo_trust_eps": float(args.grpo_trust_eps) if args.grpo_trust_eps is not None else None,
         "grpo_weight": args.grpo_weight,
         "grpo_weight_eps": float(args.grpo_weight_eps),

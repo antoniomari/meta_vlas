@@ -105,6 +105,60 @@ class Policy(BasePolicy):
         }
         return outputs
 
+    def infer_batch(self, obs_list: list[dict], *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
+        """Batched inference: one forward pass over ``len(obs_list)`` observations (JAX).
+
+        Each ``obs`` must match :meth:`infer` (same keys); typically the same task prompt with
+        different images/states. PyTorch models fall back to a sequential loop.
+        """
+        if not obs_list:
+            raise ValueError("infer_batch requires a non-empty obs_list")
+        b = len(obs_list)
+        if self._is_pytorch_model:
+            actions_out: list[Any] = []
+            timings: list[float] = []
+            for i, obs in enumerate(obs_list):
+                n = None
+                if noise is not None:
+                    na = np.asarray(noise)
+                    n = na[i] if na.ndim >= 3 else na
+                r = self.infer(obs, noise=n)
+                actions_out.append(r["actions"])
+                timings.append(float(r.get("policy_timing", {}).get("infer_ms", 0.0)))
+            return {
+                "actions": np.stack(actions_out, axis=0),
+                "policy_timing": {"infer_ms": float(np.mean(timings)) if timings else 0.0},
+            }
+
+        transformed = [self._input_transform(jax.tree.map(lambda x: x, o)) for o in obs_list]
+        inputs = jax.tree.map(
+            lambda *xs: jnp.stack([jnp.asarray(x) for x in xs], axis=0),
+            *transformed,
+        )
+        self._rng, sample_rng = jax.random.split(self._rng)
+        sample_kwargs = dict(self._sample_kwargs)
+        if noise is not None:
+            noise_j = jnp.asarray(noise)
+            if noise_j.ndim == 2:
+                noise_j = noise_j[None, ...]
+            if noise_j.ndim != 3:
+                raise ValueError(f"noise must be (B,H,D) for infer_batch; got {noise_j.shape}")
+            if int(noise_j.shape[0]) != b:
+                raise ValueError(f"noise batch {noise_j.shape[0]} != len(obs_list) {b}")
+            sample_kwargs["noise"] = noise_j
+
+        observation = _model.Observation.from_dict(inputs)
+        start_time = time.monotonic()
+        outputs = {
+            "state": inputs["state"],
+            "actions": self._sample_actions(sample_rng, observation, **sample_kwargs),
+        }
+        model_time = time.monotonic() - start_time
+        outputs = jax.tree.map(lambda x: np.asarray(x), outputs)
+        outputs = self._output_transform(outputs)
+        outputs["policy_timing"] = {"infer_ms": (model_time) * 1000}
+        return outputs
+
     @property
     def metadata(self) -> dict[str, Any]:
         return self._metadata

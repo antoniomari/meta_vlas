@@ -62,6 +62,8 @@ def init_wandb(
     config: dict[str, Any],
 ) -> Any | None:
     """Initialize a Weights & Biases run; return the run object or None if disabled."""
+    if getattr(args, "no_wandb", False):
+        return None
     project = getattr(args, "wandb_project", None)
     if not project:
         return None
@@ -85,8 +87,10 @@ def init_wandb(
         wandb.define_metric("sft/*", step_metric="sft_step")
         wandb.define_metric("bc_step")
         wandb.define_metric("bc/*", step_metric="bc_step")
+        wandb.define_metric("train/*", step_metric="bc_step")
         wandb.define_metric("outer_iter")
         wandb.define_metric("distill/*", step_metric="outer_iter")
+        wandb.define_metric("rollout/*", step_metric="outer_iter")
     except Exception:
         pass
     return run

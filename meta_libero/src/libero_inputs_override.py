@@ -62,5 +62,12 @@ class BatchableLiberoOutputs(transforms.DataTransformFn):
     """Libero output transform matching OpenPI LiberoOutputs behavior."""
 
     def __call__(self, data: dict) -> dict:
-        return {"actions": np.asarray(data["actions"][:, :7])}
+        # Unpadded robot actions: first 7 dims. For single infer, actions are (H, D); for
+        # infer_batch they are (B, H, D). A plain [:, :7] would slice the wrong axis when B>1.
+        a = np.asarray(data["actions"])
+        if a.ndim == 2:
+            return {"actions": a[:, :7]}
+        if a.ndim == 3:
+            return {"actions": a[:, :, :7]}
+        raise ValueError(f"unexpected actions rank {a.ndim} with shape {a.shape}")
 

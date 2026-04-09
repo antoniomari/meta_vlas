@@ -13,6 +13,7 @@ def save_results_csv(run_dir: Path, results: dict) -> None:
         writer.writerow(["task_id", results.get("task_id")])
         writer.writerow(["seed", results.get("seed")])
         writer.writerow(["rollout_episodes_per_iter", results.get("rollout_episodes")])
+        writer.writerow(["rollout_num_envs", results.get("rollout_num_envs")])
         if results.get("rollout_episodes") == 1:
             writer.writerow(
                 [
@@ -26,6 +27,8 @@ def save_results_csv(run_dir: Path, results: dict) -> None:
         writer.writerow(["teacher_eval_success_rate", results.get("teacher_eval_success_rate")])
         writer.writerow(["teacher_final_loss", results.get("teacher_final_loss")])
         writer.writerow(["bc_steps_per_iter", results.get("bc_steps_per_iter")])
+        writer.writerow(["n_epoch", results.get("n_epoch")])
+        writer.writerow(["bc_grad_steps_last_iter", results.get("bc_grad_steps_last_iter")])
         writer.writerow(["bc_lr", results.get("bc_lr")])
         writer.writerow(["max_iters", results.get("max_iters")])
         writer.writerow(["cumulative_buffer", results.get("cumulative_buffer")])
@@ -44,6 +47,9 @@ def save_results_csv(run_dir: Path, results: dict) -> None:
         writer.writerow(["kl_lambda", results.get("kl_lambda")])
         writer.writerow(["max_teacher_variance", results.get("max_teacher_variance")])
         writer.writerow(["grpo_like", results.get("grpo_like")])
+        writer.writerow(
+            ["grpo_grad_accum_per_trajectory", results.get("grpo_grad_accum_per_trajectory")]
+        )
         writer.writerow(["grpo_trust_eps", results.get("grpo_trust_eps")])
         writer.writerow(["grpo_weight", results.get("grpo_weight")])
         writer.writerow(["grpo_weight_eps", results.get("grpo_weight_eps")])

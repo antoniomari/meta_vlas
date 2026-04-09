@@ -480,7 +480,13 @@ def train_step(
 
 
 @functools.partial(
-    jax.jit, static_argnums=(0, 4, 5, 6, 7), donate_argnums=(2,)
+    jax.jit,
+    static_argnums=(0, 4, 5, 6, 7),
+    # Do not donate `state`: gradient accumulation calls this multiple times per optimizer
+    # step with the same train_state (trajectory microbatches or accum_steps>1). Donating
+    # state on the first call invalidates buffers and can trigger XLA errors (e.g.
+    # PjRtBuffer::layout / has_layout) on subsequent calls.
+    donate_argnums=(),
 )
 def _compute_grads_and_loss(
     config: _config.TrainConfig,
@@ -915,6 +921,8 @@ def train_model_on_fly(
     ref_model_for_kl: _model.BaseModel | None = None,
     # GRPO-like: batch loss = mean_i (advantage_i * denoise_loss_i); advantages in distill_sample_weight (signed).
     grpo_like: bool = False,
+    # GRPO only: one optimizer update per trajectory; average microbatch grads (NeighborsDataLoader trajectory mode).
+    grpo_one_grad_per_trajectory: bool = False,
 ) -> tuple[_model.BaseModel, list[float], training_utils.TrainState]:
     """
     Train a model on the fly and return a copy of the trained model, training losses, and final train state.
@@ -1033,6 +1041,23 @@ def train_model_on_fly(
     # Define trainable_filter for training step
     _trainable_filter = _trainable_filter_for_init
 
+    if grpo_one_grad_per_trajectory:
+        if not grpo_like:
+            raise ValueError(
+                "train_model_on_fly: grpo_one_grad_per_trajectory requires grpo_like=True"
+            )
+        if int(gradient_accumulation_steps) != 1:
+            raise ValueError(
+                "train_model_on_fly: grpo_one_grad_per_trajectory is incompatible with "
+                "gradient_accumulation_steps != 1"
+            )
+        if not hasattr(training_data_loader, "iter_trajectory_microbatches"):
+            raise ValueError(
+                "train_model_on_fly: grpo_one_grad_per_trajectory requires a data loader with "
+                "iter_trajectory_microbatches() (e.g. NeighborsDataLoader with "
+                "grpo_one_grad_per_trajectory=True and rollout_trajectory_id on examples)."
+            )
+
     if float(kl_lambda) != 0.0 and ref_model_for_kl is None:
         raise ValueError(
             "train_model_on_fly: kl_lambda != 0 requires ref_model_for_kl (frozen snapshot of the student)."
@@ -1145,12 +1170,100 @@ def train_model_on_fly(
             "GRPO-like objective: minimize mean_i (advantage_i * diffusion_BC_loss_i); "
             "advantages (signed) must be stored in batch distill_sample_weight."
         )
+    if grpo_like and grpo_one_grad_per_trajectory:
+        print(
+            "GRPO trajectory accumulation: one optimizer update per trajectory; "
+            "microbatch gradients are averaged (same policy state across microbatches)."
+        )
+
+    traj_gen = None
+    if grpo_like and grpo_one_grad_per_trajectory:
+        traj_gen = training_data_loader.iter_trajectory_microbatches()
+    data_iter = iter(training_data_loader) if traj_gen is None else None
 
     for step in pbar:
         t0_train = time.perf_counter()
         t0_fetch = time.perf_counter()
 
-        if accum_steps == 1:
+        if traj_gen is not None:
+            try:
+                traj_batches = next(traj_gen)
+            except StopIteration as e:
+                raise RuntimeError(
+                    "trajectory microbatch iterator exhausted before completing num_steps"
+                ) from e
+            t1_fetch = time.perf_counter()
+            batch_fetch_time = (t1_fetch - t0_fetch) * 1000
+            accum_grads = None
+            accum_losses = []
+            accum_ls0 = []
+            accum_ls1 = []
+            alignment_ratios = []
+            n_micro = len(traj_batches)
+            if n_micro < 1:
+                raise RuntimeError("trajectory produced zero microbatches")
+            for accum_i in range(n_micro):
+                batch = traj_batches[accum_i]
+                if self_check_lambda_kl is not None:
+                    batch = _expand_self_check_batch(
+                        rng, train_state, batch, self_check_lambda_kl
+                    )
+                if (
+                    alignment_ratio_threshold is not None
+                    and alignment_reference_policy is not None
+                    and alignment_weight_task1_only
+                ):
+                    step_rng = jax.random.fold_in(
+                        rng, int(step) * 100_000 + accum_i
+                    )
+                    sample_weights, avg_ratio = _compute_alignment_weights_for_batch(
+                        policy=alignment_reference_policy,
+                        observation=batch[0],
+                        actions=batch[1],
+                        threshold=alignment_ratio_threshold,
+                        rng=step_rng,
+                        task1_only=True,
+                    )
+                    if len(batch) == 3:
+                        sample_weights = sample_weights * batch[2]
+                    batch = (batch[0], batch[1], sample_weights)
+                    alignment_ratios.append(avg_ratio)
+                micro_rng = jax.random.fold_in(
+                    rng, int(step) * 100_000 + accum_i
+                )
+                grads, loss, ls0_m, ls1_m = compute_grads_loss_jit(
+                    micro_rng, train_state, batch
+                )
+                if pair_stream_layout != PAIR_STREAM_NONE:
+                    accum_ls0.append(ls0_m)
+                    accum_ls1.append(ls1_m)
+                if accum_grads is None:
+                    accum_grads = grads
+                else:
+                    accum_grads = jax.tree.map(
+                        lambda a, b: a + b, accum_grads, grads
+                    )
+                    del grads
+                accum_losses.append(loss)
+            mean_grads = jax.tree.map(
+                lambda g: g / float(n_micro), accum_grads
+            )
+            del accum_grads
+            train_state, info, prev_grads = _apply_accumulated_grads(
+                config, train_state, mean_grads, prev_grads
+            )
+            del mean_grads
+            mean_loss = jnp.mean(jnp.stack(accum_losses))
+            info["loss"] = mean_loss
+            if pair_stream_layout != PAIR_STREAM_NONE and accum_ls0:
+                info["loss_stream_0"] = jnp.mean(jnp.stack(accum_ls0))
+                info["loss_stream_1"] = jnp.mean(jnp.stack(accum_ls1))
+            alignment_step_info = (
+                {"alignment_task1_avg_ratio": float(np.mean(alignment_ratios))}
+                if alignment_ratios
+                else {}
+            )
+        elif accum_steps == 1:
             # Single-step path: fetch one batch, apply train_step
             try:
                 batch = next(data_iter)
@@ -1460,6 +1573,8 @@ def run_evaluation(
     grpo_weight: str | None = None,
     grpo_weight_eps: float = 1e-8,
     distill_collect_every: int = 1,
+    distill_trajectory_id_offset: int = 0,
+    num_envs: int = 1,
 ):
     """Run evaluation on a LIBERO task.
 
@@ -1490,6 +1605,8 @@ def run_evaluation(
                 (e.g. mid-training eval); otherwise both bars fight for the terminal and log files
                 fill with interleaved ANSI cursor spam.
         num_trials: Number of evaluation episodes to run.
+        num_envs: Parallel LIBERO environments for distillation only; >1 batches policy inference
+            at replan (requires teacher distillation and ``disable_adaptation=True`` in the TTT runner).
         task_suite_name: Name of the LIBERO task suite (e.g., "libero_10", "libero_90").
         task_id: ID of the task within the suite to evaluate.
         num_steps_wait: Number of steps to wait for environment stabilization.
@@ -1562,6 +1679,8 @@ def run_evaluation(
         grpo_weight=grpo_weight,
         grpo_weight_eps=grpo_weight_eps,
         distill_collect_every=distill_collect_every,
+        distill_trajectory_id_offset=distill_trajectory_id_offset,
+        num_envs=num_envs,
     )
 
 
@@ -1573,6 +1692,21 @@ class NeighborsDataLoader:
     is converted to device arrays in ``__iter__``. Holding the entire distillation /
     GRPO buffer on GPU (the previous behavior) scales with ``N ×`` image size and
     routinely OOMs when GRPO multiplies rows by ``group_size``.
+
+    **Modes:**
+
+    * **Default (``sequential_epochs=False``):** infinite iterator with **random** minibatches
+      **with replacement** (legacy BC / distillation).
+    * **Sequential epochs (``sequential_epochs=True``):** each call to ``iter()`` yields
+      one **shuffled** pass over the dataset (non-overlapping batches of ``batch_size``,
+      last batch may be smaller), then **StopIteration**. Matches RL-style GRPO/PPO-style
+      reuse: ``num_steps = n_epoch * len(loader)`` in ``train_model_on_fly`` replays the
+      iterator after each epoch.
+    * **GRPO one step per trajectory (``grpo_one_grad_per_trajectory=True``):** examples must
+      carry ``rollout_trajectory_id`` (int). Training uses ``iter_trajectory_microbatches()``:
+      for each trajectory, yields a **list** of microbatches covering its rows; the optimizer
+      averages gradients over those microbatches (``train_model_on_fly(..., grpo_one_grad_per_trajectory=True)``).
+      Incompatible with ``sequential_epochs=True`` (use ``iter_trajectory_microbatches`` only).
     """
 
     def __init__(
@@ -1580,11 +1714,43 @@ class NeighborsDataLoader:
         examples: List[Any],
         batch_size: int,
         data_config: _config.DataConfig,
+        *,
+        sequential_epochs: bool = False,
+        epoch_seed: int = 0,
+        n_epoch: int = 1,
+        grpo_one_grad_per_trajectory: bool = False,
     ):
         if batch_size <= 0:
             raise ValueError(f"batch_size must be > 0, got {batch_size}")
+        if sequential_epochs and grpo_one_grad_per_trajectory:
+            raise ValueError(
+                "NeighborsDataLoader: sequential_epochs and grpo_one_grad_per_trajectory "
+                "are mutually exclusive"
+            )
         self.batch_size = batch_size
         self._data_config = data_config
+        self._sequential_epochs = bool(sequential_epochs)
+        self._epoch_seed = int(epoch_seed)
+        self._n_epoch = max(1, int(n_epoch))
+        self._grpo_one_grad_per_trajectory = bool(grpo_one_grad_per_trajectory)
+
+        prepared: List[Any] = []
+        traj_ids: list[int | None] = []
+        for ex in examples:
+            e = dict(ex)
+            tid = e.pop("rollout_trajectory_id", None)
+            traj_ids.append(int(tid) if tid is not None else None)
+            prepared.append(e)
+        examples = prepared
+        if self._grpo_one_grad_per_trajectory:
+            if any(t is None for t in traj_ids):
+                raise ValueError(
+                    "NeighborsDataLoader(grpo_one_grad_per_trajectory=True) requires "
+                    "rollout_trajectory_id on every example"
+                )
+            self._traj_ids = np.array([int(t) for t in traj_ids], dtype=np.int64)
+        else:
+            self._traj_ids = np.array([], dtype=np.int64)
 
         # examples = [example for _ in range(repeat) for example in examples]
         collated = _data_loader._collate_fn(examples)
@@ -1608,9 +1774,75 @@ class NeighborsDataLoader:
         if self.num_examples == 0:
             raise ValueError("examples must contain at least one sample")
 
-
     def data_config(self) -> _config.DataConfig:
         return self._data_config
+
+    def __len__(self) -> int:
+        """Gradient steps per epoch (sequential) or per full GRPO trajectory schedule."""
+        if self._grpo_one_grad_per_trajectory:
+            return int(self._n_epoch) * int(len(np.unique(self._traj_ids)))
+        if not self._sequential_epochs:
+            raise TypeError(
+                "NeighborsDataLoader: __len__ is only defined when sequential_epochs=True "
+                "or grpo_one_grad_per_trajectory=True"
+            )
+        return (self.num_examples + self.batch_size - 1) // self.batch_size
+
+    def num_trajectories(self) -> int:
+        """Number of distinct rollout trajectories (requires trajectory ids)."""
+        if not self._grpo_one_grad_per_trajectory or self._traj_ids.size == 0:
+            raise TypeError("num_trajectories() requires grpo_one_grad_per_trajectory=True and ids")
+        return int(len(np.unique(self._traj_ids)))
+
+    def iter_trajectory_microbatches(self):
+        """Yield lists of microbatches, one list per trajectory per shuffled pass (``n_epoch`` passes).
+
+        Each inner list covers all rows of that trajectory in temporal (index) order, split by
+        ``batch_size``. Caller (``train_model_on_fly``) averages gradients over the list.
+        """
+        if not self._grpo_one_grad_per_trajectory:
+            raise TypeError(
+                "iter_trajectory_microbatches() requires grpo_one_grad_per_trajectory=True"
+            )
+        uniq = np.unique(self._traj_ids)
+        n_traj = int(len(uniq))
+        for _ in range(self._n_epoch):
+            rng = np.random.default_rng(self._epoch_seed)
+            self._epoch_seed += 1
+            perm = rng.permutation(n_traj)
+            for j in range(n_traj):
+                tid = uniq[int(perm[j])]
+                idx = np.where(self._traj_ids == tid)[0]
+                idx.sort()
+                micros: list[
+                    Union[
+                        tuple[_model.Observation, _model.Actions],
+                        tuple[_model.Observation, _model.Actions, jax.Array],
+                    ]
+                ] = []
+                for start in range(0, len(idx), self.batch_size):
+                    chunk = idx[start : start + self.batch_size]
+                    micros.append(self._take_batch(chunk))
+                yield micros
+
+    def _take_batch(self, idx: np.ndarray) -> Union[
+        tuple[_model.Observation, _model.Actions],
+        tuple[_model.Observation, _model.Actions, jax.Array],
+    ]:
+        cpu_batch = jax.tree.map(
+            lambda x: np.take(x, idx, axis=0) if x is not None else None,
+            self._cpu_data,
+        )
+        batch = jax.tree.map(
+            lambda x: jnp.asarray(x) if x is not None else None,
+            cpu_batch,
+        )
+        obs = _model.Observation.from_dict(batch)
+        act = batch["actions"]
+        w = batch.get("distill_sample_weight")
+        if w is not None:
+            return (obs, act, w)
+        return (obs, act)
 
     def __iter__(self) -> Iterator[
         Union[
@@ -1618,7 +1850,16 @@ class NeighborsDataLoader:
             tuple[_model.Observation, _model.Actions, jax.Array],
         ]
     ]:
-        """Yield random fixed-size minibatches from collated neighbor data."""
+        """Yield minibatches: either infinite random (default) or one shuffled epoch."""
+        if self._sequential_epochs:
+            rng = np.random.default_rng(self._epoch_seed)
+            self._epoch_seed += 1
+            perm = rng.permutation(self.num_examples)
+            for start in range(0, self.num_examples, self.batch_size):
+                chunk = perm[start : start + self.batch_size]
+                yield self._take_batch(chunk)
+            return
+
         while True:
             # Sample a minibatch with replacement to keep a fixed shape.
             batch_idx = np.random.randint(0, self.num_examples, size=self.batch_size)
@@ -1837,6 +2078,8 @@ def run_evaluation_ttt(
     grpo_weight: str | None = None,
     grpo_weight_eps: float = 1e-8,
     distill_collect_every: int = 1,
+    distill_trajectory_id_offset: int = 0,
+    num_envs: int = 1,
 ):
 
 
@@ -1885,6 +2128,8 @@ def run_evaluation_ttt(
         grpo_weight=grpo_weight,
         grpo_weight_eps=grpo_weight_eps,
         distill_collect_every=distill_collect_every,
+        distill_trajectory_id_offset=distill_trajectory_id_offset,
+        num_envs=num_envs,
     )
 
 
@@ -1950,6 +2195,12 @@ def _infer_action_chunk_samples(
     g = int(n.shape[0])
     if g == 1:
         return policy_obj.infer(obs_dict, noise=n[0])["actions"]
+    # One batched forward for G samples at the same observation (JAX).
+    if not getattr(policy_obj, "_is_pytorch_model", False) and hasattr(
+        policy_obj, "infer_batch"
+    ):
+        acts = policy_obj.infer_batch([obs_dict] * g, noise=n)["actions"]
+        return jnp.asarray(acts)
     action_chunks: list[jax.Array] = []
     for gi in range(g):
         action_i = policy_obj.infer(obs_dict, noise=n[gi])["actions"]
@@ -1957,6 +2208,59 @@ def _infer_action_chunk_samples(
             action_i if isinstance(action_i, jax.Array) else jnp.asarray(action_i)
         )
     return jnp.stack(action_chunks, axis=0)
+
+
+def _infer_grouped_batch_multi_env(
+    policy_obj: _policy.Policy,
+    obs_list: list[dict[str, Any]],
+    noises_per_env: list[jnp.ndarray],
+) -> jnp.ndarray:
+    """Batched forward for B envs, each with G noise rows (same obs repeated G times).
+
+    Returns actions of shape ``(B, G, H, D)``.
+    """
+    if not obs_list:
+        raise ValueError("empty obs_list")
+    b = len(obs_list)
+    if len(noises_per_env) != b:
+        raise ValueError("noises_per_env length must match obs_list")
+    obs_exp: list[dict[str, Any]] = []
+    noise_blocks: list[jnp.ndarray] = []
+    g_sizes: list[int] = []
+    for i in range(b):
+        n = jnp.asarray(noises_per_env[i])
+        if n.ndim == 2:
+            n = n[None, ...]
+        g = int(n.shape[0])
+        g_sizes.append(g)
+        for _ in range(g):
+            obs_exp.append(obs_list[i])
+        noise_blocks.append(n)
+    if len(set(g_sizes)) != 1:
+        raise ValueError(
+            f"infer_grouped_batch_multi_env requires the same G for all envs; got {g_sizes}"
+        )
+    g0 = g_sizes[0]
+    noise_flat = jnp.concatenate(noise_blocks, axis=0)
+    if not getattr(policy_obj, "_is_pytorch_model", False) and hasattr(
+        policy_obj, "infer_batch"
+    ):
+        acts = policy_obj.infer_batch(obs_exp, noise=noise_flat)["actions"]
+        acts = jnp.asarray(acts)
+        return acts.reshape(b, g0, acts.shape[1], acts.shape[2])
+    # Fallback: sequential infer per row
+    out_rows: list[jnp.ndarray] = []
+    row = 0
+    for i in range(b):
+        for _gi in range(g0):
+            out_rows.append(
+                jnp.asarray(
+                    policy_obj.infer(obs_exp[row], noise=noise_flat[row])["actions"]
+                )
+            )
+            row += 1
+    stacked = jnp.stack(out_rows, axis=0)
+    return stacked.reshape(b, g0, stacked.shape[1], stacked.shape[2])
 
 
 def _max_steps_for_task_suite(task_suite_name: str) -> int:
@@ -2377,6 +2681,7 @@ def observation_actions_to_bc_example(
     teacher_chunk_var_mean: float | None = None,
     grpo_advantage: float | None = None,
     grpo_group_weight: float | None = None,
+    rollout_trajectory_id: int | None = None,
 ) -> dict[str, Any]:
     """Build one OpenPI-style sample dict for ``_data_loader._collate_fn`` (no batch dimension).
 
@@ -2451,6 +2756,8 @@ def observation_actions_to_bc_example(
         out["distill_sample_weight"] = np.float32(float(grpo_advantage) * gw)
     if teacher_chunk_var_mean is not None:
         out["teacher_chunk_var_mean"] = np.float32(float(teacher_chunk_var_mean))
+    if rollout_trajectory_id is not None:
+        out["rollout_trajectory_id"] = np.int32(int(rollout_trajectory_id))
     return out
 
 
@@ -2589,6 +2896,7 @@ def _run_single_episode_with_adaptation(
     grpo_weight: str | None = None,
     grpo_weight_eps: float = 1e-8,
     distill_collect_every: int = 1,
+    rollout_trajectory_id: int = 0,
 ) -> tuple[
     bool,
     int,
@@ -2952,6 +3260,7 @@ def _run_single_episode_with_adaptation(
                                 teacher_chunk_var_mean=teacher_var_row,
                                 grpo_advantage=float(adv_d[i_gr]),
                                 grpo_group_weight=w_grpo,
+                                rollout_trajectory_id=rollout_trajectory_id,
                             )
                         )
                 else:
@@ -3025,6 +3334,7 @@ def _run_single_episode_with_adaptation(
                                 teacher_chunk_var_mean=teacher_var_row_dd,
                                 grpo_advantage=float(adv_dd[i_gr]),
                                 grpo_group_weight=w_grpo_dd,
+                                rollout_trajectory_id=rollout_trajectory_id,
                             )
                         )
             elif replan_now:
@@ -3040,6 +3350,7 @@ def _run_single_episode_with_adaptation(
                         replan_env_step=int(t),
                         temporal_decay=float(temporal_decay),
                         teacher_chunk_var_mean=teacher_var_row,
+                        rollout_trajectory_id=rollout_trajectory_id,
                     )
                 )
             else:
@@ -3100,6 +3411,7 @@ def _run_single_episode_with_adaptation(
                         replan_env_step=int(t),
                         temporal_decay=float(temporal_decay),
                         teacher_chunk_var_mean=teacher_var_row_dd,
+                        rollout_trajectory_id=rollout_trajectory_id,
                     )
                 )
 
@@ -3174,6 +3486,8 @@ def run_evaluation_with_adaptation(
     grpo_weight: str | None = None,
     grpo_weight_eps: float = 1e-8,
     distill_collect_every: int = 1,
+    distill_trajectory_id_offset: int = 0,
+    num_envs: int = 1,
 ):
     """
     Run evaluation with test-time training (TTT).
@@ -3289,6 +3603,8 @@ def run_evaluation_with_adaptation(
         raise ValueError(
             f"distill_collect_every must be >= 1, got {distill_collect_every}"
         )
+    if int(num_envs) < 1:
+        raise ValueError(f"num_envs must be >= 1, got {num_envs}")
 
     # Start evaluation
     task_episodes, task_successes = 0, 0
@@ -3326,6 +3642,60 @@ def run_evaluation_with_adaptation(
     # Get task
     task = task_suite.get_task(task_id)
     initial_states = task_suite.get_task_init_states(task_id)
+
+    if int(num_envs) > 1:
+        if not disable_adaptation:
+            raise ValueError("num_envs > 1 requires disable_adaptation=True (no TTT during rollout)")
+        if plot_observations:
+            raise ValueError("num_envs > 1 requires plot_observations=False")
+        if teacher_policy is None or distillation_examples_out is None:
+            raise ValueError(
+                "num_envs > 1 is only implemented for on-policy distillation rollouts "
+                "(teacher_policy and distillation_examples_out must be set)."
+            )
+        original_model = policy._model
+        print_trainable_parameters(nnx.state(original_model), train_config.trainable_filter)
+        print(f"Task: {task.language}")
+        print(
+            f"Parallel distillation rollout: num_envs={num_envs} "
+            "(batched student/teacher policy inference when multiple envs replan on the same step)."
+        )
+        from meta_libero.src.ttt.parallel_distillation_rollout import (
+            run_parallel_distillation_waves,
+        )
+
+        return run_parallel_distillation_waves(
+            num_envs=int(num_envs),
+            policy=policy,
+            teacher_policy=teacher_policy,
+            original_model=original_model,
+            task=task,
+            task_suite_name=task_suite_name,
+            task_id=task_id,
+            task_description=str(task.language),
+            initial_states=initial_states,
+            num_trials=num_trials,
+            num_steps_wait=num_steps_wait,
+            max_steps=max_steps,
+            seed=seed,
+            save_video=save_video,
+            video_out_path=VIDEO_OUT_PATH,
+            show_progress_bar=show_progress_bar,
+            distillation_examples_out=distillation_examples_out,
+            student_action_merge=student_action_merge,
+            group_size=int(num_samples),
+            teacher_group_size=teacher_group_size,
+            temporal_decay=temporal_decay,
+            grpo_like=grpo_like,
+            grpo_trust_eps=grpo_trust_eps,
+            grpo_weight=grpo_weight,
+            grpo_weight_eps=grpo_weight_eps,
+            distill_collect_every=distill_collect_every,
+            distill_trajectory_id_offset=distill_trajectory_id_offset,
+            write_auxiliary_rollout_pdfs=write_auxiliary_rollout_pdfs,
+            cfg_weight=cfg_weight,
+            after_each_rollout_episode=after_each_rollout_episode,
+        )
 
     # Initialize environment
     env, task_description = _get_libero_env(task, LIBERO_ENV_RESOLUTION, seed)
@@ -3419,6 +3789,7 @@ def run_evaluation_with_adaptation(
             grpo_weight=grpo_weight,
             grpo_weight_eps=grpo_weight_eps,
             distill_collect_every=distill_collect_every,
+            rollout_trajectory_id=int(distill_trajectory_id_offset) + int(episode_idx),
         )
         all_teacher_l2_episodes.append(list(teacher_l2_trace))
 
