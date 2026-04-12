@@ -47,13 +47,16 @@ def save_results_csv(run_dir: Path, results: dict) -> None:
         writer.writerow(["kl_lambda", results.get("kl_lambda")])
         writer.writerow(["max_teacher_variance", results.get("max_teacher_variance")])
         writer.writerow(["grpo_like", results.get("grpo_like")])
-        writer.writerow(
-            ["grpo_grad_accum_per_trajectory", results.get("grpo_grad_accum_per_trajectory")]
-        )
         writer.writerow(["grpo_trust_eps", results.get("grpo_trust_eps")])
         writer.writerow(["grpo_weight", results.get("grpo_weight")])
         writer.writerow(["grpo_weight_eps", results.get("grpo_weight_eps")])
         writer.writerow(["distill_collect_every", results.get("distill_collect_every")])
+        writer.writerow(
+            [
+                "save_distillation_rollout_metrics_pdf",
+                results.get("save_distillation_rollout_metrics_pdf"),
+            ]
+        )
         writer.writerow(["student_pretraining_steps", results.get("student_pretraining_steps")])
         writer.writerow(["student_pretraining_lr", results.get("student_pretraining_lr")])
         writer.writerow(

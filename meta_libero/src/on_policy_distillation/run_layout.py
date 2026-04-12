@@ -35,7 +35,6 @@ def ensure_run_dir(
     grpo_weight_eps: float = 1e-8,
     distill_collect_every: int = 1,
     grpo_n_epoch: int | None = None,
-    grpo_grad_accum_per_trajectory: bool = False,
 ) -> tuple[Path, Path, Path]:
     """Return (run_dir, video_dir, losses_pdf)."""
     folder_base = "on_policy_distillation_single" if single_episode else "on_policy_distillation"
@@ -75,8 +74,6 @@ def ensure_run_dir(
         base_name = f"{base_name}_spts{int(student_pretraining_steps)}"
     if grpo_like:
         base_name = f"{base_name}_grpo"
-    if grpo_like and grpo_grad_accum_per_trajectory:
-        base_name = f"{base_name}_gtrajaccum"
     if grpo_like and grpo_n_epoch is not None and int(grpo_n_epoch) != 1:
         base_name = f"{base_name}_ne{int(grpo_n_epoch)}"
     if grpo_trust_eps is not None:

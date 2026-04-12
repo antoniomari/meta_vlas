@@ -11,7 +11,7 @@ mkdir -p "${LOG_DIR}"
 
 # ============== TASKS & OPTIONS ==============
 # Single task id per job (teacher FT + student distillation on that task)
-TASKS=(6)
+TASKS=(0 1 3 7)
 
 # Optional sweeps (mirror augment_finetune_sweep.sh: add entries to sweep)
 SINGLE_EPISODE_OPTS=("")
@@ -32,9 +32,9 @@ MAX_ITERS_LIST=(100)
 SEEDS=(42)
 TEACHER_EVAL_EPISODES_LIST=(10)
 # Episodes per distillation outer iter (merged into one BC dataset); 1 = previous behavior
-ROLLOUT_EPISODES_LIST=(8)
+ROLLOUT_EPISODES_LIST=(1)
 # Parallel LIBERO envs per rollout wave (batched policy inference at replan); 1 = sequential sims
-ROLLOUT_NUM_ENVS_LIST=(8)
+ROLLOUT_NUM_ENVS_LIST=(1)
 # Distillation BC targets: (1-α)*teacher + α*student per replan; 0 = teacher-only (default)
 STUDENT_ACTION_MERGE_LIST=(0)
 BATCH_SIZE=32
@@ -71,10 +71,8 @@ GRPO_LIKE_OPTS=("--grpo_like")
 GRPO_TRUST_EPS_OPTS=("")
 # GRPO only: "" = omit (--grpo_weight none); "mean_std" -> --grpo_weight mean_std (run dir …_gwms… from Python)
 GRPO_WEIGHT_OPTS=("")
-# GRPO only: full shuffled passes over the collected BC buffer per outer iter (--n_epoch; total grad steps = n_epoch * ceil(n/batch)). Ignored without --grpo_like.
+# GRPO only: pooled-buffer BC; total grad steps per outer iter = --n_epoch (one optimizer update per pass over all rollout samples). Ignored without --grpo_like.
 N_EPOCH_LIST=(1)
-# GRPO only: "" = one grad step per minibatch; "--grpo_grad_accum_per_trajectory" = one optimizer step per rollout trajectory (average microbatch grads; run dir …_gtrajaccum).
-GRPO_GRAD_ACCUM_OPTS=("--grpo_grad_accum_per_trajectory")
 # Optional: set e.g. "1e-7" to pass --grpo_weight_eps (default in Python: 1e-8); leave empty to omit
 GRPO_WEIGHT_EPS=""
 # Distillation: BC rows every N env steps after --num_steps_wait (default 1; run dir …_dceN… when N!=1)
@@ -127,7 +125,6 @@ for TASK in "${TASKS[@]}"; do
                         for GRPO_TRUST_EPS in "${GRPO_TRUST_EPS_OPTS[@]}"; do
                         for GRPO_WEIGHT in "${GRPO_WEIGHT_OPTS[@]}"; do
                         for N_EPOCH in "${N_EPOCH_LIST[@]}"; do
-                        for GRPO_GRAD_ACCUM in "${GRPO_GRAD_ACCUM_OPTS[@]}"; do
                           if [[ -n "${GRPO_OPT}" && "${GROUP_SIZE}" -lt 2 ]]; then
                             continue
                           fi
@@ -141,9 +138,6 @@ for TASK in "${TASKS[@]}"; do
                             continue
                           fi
                           if [[ -z "${GRPO_OPT}" && "${N_EPOCH}" != "1" ]]; then
-                            continue
-                          fi
-                          if [[ -n "${GRPO_GRAD_ACCUM}" && -z "${GRPO_OPT}" ]]; then
                             continue
                           fi
                         suffix=""
@@ -225,9 +219,6 @@ for TASK in "${TASKS[@]}"; do
                           if [[ -n "${GRPO_OPT}" && "${N_EPOCH}" != "1" ]]; then
                             suffix="${suffix}_ne${N_EPOCH}"
                           fi
-                          if [[ -n "${GRPO_GRAD_ACCUM}" ]]; then
-                            suffix="${suffix}_gtrajaccum"
-                          fi
 
                           JOB_NAME="opdist_t${TASK}_tlr${TEACHER_LR}_ts${TEACHER_STEPS}_bc${BC_LR}_bs${BC_STEPS}_mi${MAX_ITERS}_s${SEED}${suffix}"
 
@@ -270,12 +261,8 @@ for TASK in "${TASKS[@]}"; do
                           if [[ -n "${GRPO_OPT}" ]]; then
                             N_EPOCH_FLAG="--n_epoch ${N_EPOCH}"
                           fi
-                          GRPO_GRAD_ACCUM_FLAG=""
-                          if [[ -n "${GRPO_GRAD_ACCUM}" ]]; then
-                            GRPO_GRAD_ACCUM_FLAG="${GRPO_GRAD_ACCUM}"
-                          fi
 
-                          echo "Submitting: task=${TASK} teacher_lr=${TEACHER_LR} teacher_steps=${TEACHER_STEPS} bc_lr=${BC_LR} bc_steps=${BC_STEPS} max_iters=${MAX_ITERS} seed=${SEED} spt_steps=${SPT_STEPS} spt_lr=${SPT_LR_OPT:-teacher} spt_ev_int=${SPT_EVAL_INT} spt_ev_ep=${SPT_EVAL_EP} teval_ep=${TEACHER_EVAL_EP} rollout_ep=${ROLLOUT_EP} rollout_num_envs=${ROLLOUT_NUM_ENVS} sam=${SAM} td=${TEMPORAL_DECAY} l1=${L1_BC:-off} kl=${KL_LAMBDA} g=${GROUP_SIZE} tg=${TEACHER_GROUP_SIZE} max_tv=${MAX_TEACHER_VARIANCE:-none} align=${ALIGN_THRESH:-none} align_min=${ALIGN_MIN:-none} full_exp=${full_exp:-none} grpo=${GRPO_OPT:-off} n_epoch=${N_EPOCH} gtrajaccum=${GRPO_GRAD_ACCUM:-off} grpo_trust=${GRPO_TRUST_EPS:-none} grpo_w=${GRPO_WEIGHT:-none} grpo_w_eps=${GRPO_WEIGHT_EPS:-default} ${single_episode} ${finetune_type} ${cumulative} ${save_video_opt}"
+                          echo "Submitting: task=${TASK} teacher_lr=${TEACHER_LR} teacher_steps=${TEACHER_STEPS} bc_lr=${BC_LR} bc_steps=${BC_STEPS} max_iters=${MAX_ITERS} seed=${SEED} spt_steps=${SPT_STEPS} spt_lr=${SPT_LR_OPT:-teacher} spt_ev_int=${SPT_EVAL_INT} spt_ev_ep=${SPT_EVAL_EP} teval_ep=${TEACHER_EVAL_EP} rollout_ep=${ROLLOUT_EP} rollout_num_envs=${ROLLOUT_NUM_ENVS} sam=${SAM} td=${TEMPORAL_DECAY} l1=${L1_BC:-off} kl=${KL_LAMBDA} g=${GROUP_SIZE} tg=${TEACHER_GROUP_SIZE} max_tv=${MAX_TEACHER_VARIANCE:-none} align=${ALIGN_THRESH:-none} align_min=${ALIGN_MIN:-none} full_exp=${full_exp:-none} grpo=${GRPO_OPT:-off} n_epoch=${N_EPOCH} grpo_trust=${GRPO_TRUST_EPS:-none} grpo_w=${GRPO_WEIGHT:-none} grpo_w_eps=${GRPO_WEIGHT_EPS:-default} ${single_episode} ${finetune_type} ${cumulative} ${save_video_opt}"
 
                           sbatch <<EOF
 #!/bin/bash
@@ -323,13 +310,11 @@ python meta_libero/scripts/on_policy_distillation.py \
   ${GRPO_WEIGHT_FLAG} \
   ${GRPO_WEIGHT_EPS_FLAG} \
   ${N_EPOCH_FLAG} \
-  ${GRPO_GRAD_ACCUM_FLAG} \
   --distill_collect_every "${DISTILL_COLLECT_EVERY}" \
   ${L1_BC}
 EOF
 
                           job_count=$((job_count + 1))
-                        done
                         done
                         done
                         done

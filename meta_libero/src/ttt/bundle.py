@@ -921,8 +921,6 @@ def train_model_on_fly(
     ref_model_for_kl: _model.BaseModel | None = None,
     # GRPO-like: batch loss = mean_i (advantage_i * denoise_loss_i); advantages in distill_sample_weight (signed).
     grpo_like: bool = False,
-    # GRPO only: one optimizer update per trajectory; average microbatch grads (NeighborsDataLoader trajectory mode).
-    grpo_one_grad_per_trajectory: bool = False,
 ) -> tuple[_model.BaseModel, list[float], training_utils.TrainState]:
     """
     Train a model on the fly and return a copy of the trained model, training losses, and final train state.
@@ -1041,21 +1039,15 @@ def train_model_on_fly(
     # Define trainable_filter for training step
     _trainable_filter = _trainable_filter_for_init
 
-    if grpo_one_grad_per_trajectory:
-        if not grpo_like:
-            raise ValueError(
-                "train_model_on_fly: grpo_one_grad_per_trajectory requires grpo_like=True"
-            )
+    if grpo_like:
         if int(gradient_accumulation_steps) != 1:
             raise ValueError(
-                "train_model_on_fly: grpo_one_grad_per_trajectory is incompatible with "
-                "gradient_accumulation_steps != 1"
+                "train_model_on_fly: grpo_like is incompatible with gradient_accumulation_steps != 1"
             )
-        if not hasattr(training_data_loader, "iter_trajectory_microbatches"):
+        if not hasattr(training_data_loader, "iter_global_microbatches"):
             raise ValueError(
-                "train_model_on_fly: grpo_one_grad_per_trajectory requires a data loader with "
-                "iter_trajectory_microbatches() (e.g. NeighborsDataLoader with "
-                "grpo_one_grad_per_trajectory=True and rollout_trajectory_id on examples)."
+                "train_model_on_fly: grpo_like requires a data loader with iter_global_microbatches() "
+                "(e.g. NeighborsDataLoader with grpo_full_buffer=True)."
             )
 
     if float(kl_lambda) != 0.0 and ref_model_for_kl is None:
@@ -1170,15 +1162,15 @@ def train_model_on_fly(
             "GRPO-like objective: minimize mean_i (advantage_i * diffusion_BC_loss_i); "
             "advantages (signed) must be stored in batch distill_sample_weight."
         )
-    if grpo_like and grpo_one_grad_per_trajectory:
+    if grpo_like:
         print(
-            "GRPO trajectory accumulation: one optimizer update per trajectory; "
+            "GRPO: one optimizer update per --n_epoch pass over the pooled buffer (all rollouts); "
             "microbatch gradients are averaged (same policy state across microbatches)."
         )
 
     traj_gen = None
-    if grpo_like and grpo_one_grad_per_trajectory:
-        traj_gen = training_data_loader.iter_trajectory_microbatches()
+    if grpo_like:
+        traj_gen = training_data_loader.iter_global_microbatches()
     data_iter = iter(training_data_loader) if traj_gen is None else None
 
     for step in pbar:
@@ -1190,7 +1182,7 @@ def train_model_on_fly(
                 traj_batches = next(traj_gen)
             except StopIteration as e:
                 raise RuntimeError(
-                    "trajectory microbatch iterator exhausted before completing num_steps"
+                    "GRPO pooled-buffer microbatch iterator exhausted before completing num_steps"
                 ) from e
             t1_fetch = time.perf_counter()
             batch_fetch_time = (t1_fetch - t0_fetch) * 1000
@@ -1702,11 +1694,11 @@ class NeighborsDataLoader:
       last batch may be smaller), then **StopIteration**. Matches RL-style GRPO/PPO-style
       reuse: ``num_steps = n_epoch * len(loader)`` in ``train_model_on_fly`` replays the
       iterator after each epoch.
-    * **GRPO one step per trajectory (``grpo_one_grad_per_trajectory=True``):** examples must
-      carry ``rollout_trajectory_id`` (int). Training uses ``iter_trajectory_microbatches()``:
-      for each trajectory, yields a **list** of microbatches covering its rows; the optimizer
-      averages gradients over those microbatches (``train_model_on_fly(..., grpo_one_grad_per_trajectory=True)``).
-      Incompatible with ``sequential_epochs=True`` (use ``iter_trajectory_microbatches`` only).
+    * **GRPO pooled buffer (``grpo_full_buffer=True``):** all rollout rows are concatenated;
+      ``iter_global_microbatches()`` yields one **list** of microbatches per pass that covers **every**
+      row (shuffled, split by ``batch_size``); ``train_model_on_fly(..., grpo_like=True)`` performs one
+      optimizer update per yield, averaging gradients over that list. Incompatible with
+      ``sequential_epochs=True``.
     """
 
     def __init__(
@@ -1718,39 +1710,27 @@ class NeighborsDataLoader:
         sequential_epochs: bool = False,
         epoch_seed: int = 0,
         n_epoch: int = 1,
-        grpo_one_grad_per_trajectory: bool = False,
+        grpo_full_buffer: bool = False,
     ):
         if batch_size <= 0:
             raise ValueError(f"batch_size must be > 0, got {batch_size}")
-        if sequential_epochs and grpo_one_grad_per_trajectory:
+        if sequential_epochs and grpo_full_buffer:
             raise ValueError(
-                "NeighborsDataLoader: sequential_epochs and grpo_one_grad_per_trajectory "
-                "are mutually exclusive"
+                "NeighborsDataLoader: sequential_epochs and grpo_full_buffer are mutually exclusive"
             )
         self.batch_size = batch_size
         self._data_config = data_config
         self._sequential_epochs = bool(sequential_epochs)
         self._epoch_seed = int(epoch_seed)
         self._n_epoch = max(1, int(n_epoch))
-        self._grpo_one_grad_per_trajectory = bool(grpo_one_grad_per_trajectory)
+        self._grpo_full_buffer = bool(grpo_full_buffer)
 
         prepared: List[Any] = []
-        traj_ids: list[int | None] = []
         for ex in examples:
             e = dict(ex)
-            tid = e.pop("rollout_trajectory_id", None)
-            traj_ids.append(int(tid) if tid is not None else None)
+            e.pop("rollout_trajectory_id", None)
             prepared.append(e)
         examples = prepared
-        if self._grpo_one_grad_per_trajectory:
-            if any(t is None for t in traj_ids):
-                raise ValueError(
-                    "NeighborsDataLoader(grpo_one_grad_per_trajectory=True) requires "
-                    "rollout_trajectory_id on every example"
-                )
-            self._traj_ids = np.array([int(t) for t in traj_ids], dtype=np.int64)
-        else:
-            self._traj_ids = np.array([], dtype=np.int64)
 
         # examples = [example for _ in range(repeat) for example in examples]
         collated = _data_loader._collate_fn(examples)
@@ -1778,52 +1758,39 @@ class NeighborsDataLoader:
         return self._data_config
 
     def __len__(self) -> int:
-        """Gradient steps per epoch (sequential) or per full GRPO trajectory schedule."""
-        if self._grpo_one_grad_per_trajectory:
-            return int(self._n_epoch) * int(len(np.unique(self._traj_ids)))
+        """Gradient steps per epoch (sequential) or per GRPO pooled-buffer schedule."""
+        if self._grpo_full_buffer:
+            return int(self._n_epoch)
         if not self._sequential_epochs:
             raise TypeError(
                 "NeighborsDataLoader: __len__ is only defined when sequential_epochs=True "
-                "or grpo_one_grad_per_trajectory=True"
+                "or grpo_full_buffer=True"
             )
         return (self.num_examples + self.batch_size - 1) // self.batch_size
 
-    def num_trajectories(self) -> int:
-        """Number of distinct rollout trajectories (requires trajectory ids)."""
-        if not self._grpo_one_grad_per_trajectory or self._traj_ids.size == 0:
-            raise TypeError("num_trajectories() requires grpo_one_grad_per_trajectory=True and ids")
-        return int(len(np.unique(self._traj_ids)))
+    def iter_global_microbatches(self):
+        """Yield lists of microbatches: one list per shuffled full pass over **all** rows (``n_epoch`` passes).
 
-    def iter_trajectory_microbatches(self):
-        """Yield lists of microbatches, one list per trajectory per shuffled pass (``n_epoch`` passes).
-
-        Each inner list covers all rows of that trajectory in temporal (index) order, split by
-        ``batch_size``. Caller (``train_model_on_fly``) averages gradients over the list.
+        Each inner list partitions the pooled buffer (all rollouts) into non-overlapping microbatches
+        of ``batch_size`` (last may be smaller). Caller (``train_model_on_fly``) averages gradients
+        over the full list for one optimizer update per yield.
         """
-        if not self._grpo_one_grad_per_trajectory:
-            raise TypeError(
-                "iter_trajectory_microbatches() requires grpo_one_grad_per_trajectory=True"
-            )
-        uniq = np.unique(self._traj_ids)
-        n_traj = int(len(uniq))
+        if not self._grpo_full_buffer:
+            raise TypeError("iter_global_microbatches() requires grpo_full_buffer=True")
         for _ in range(self._n_epoch):
             rng = np.random.default_rng(self._epoch_seed)
             self._epoch_seed += 1
-            perm = rng.permutation(n_traj)
-            for j in range(n_traj):
-                tid = uniq[int(perm[j])]
-                idx = np.where(self._traj_ids == tid)[0]
-                idx.sort()
-                micros: list[
-                    Union[
-                        tuple[_model.Observation, _model.Actions],
-                        tuple[_model.Observation, _model.Actions, jax.Array],
-                    ]
-                ] = []
-                for start in range(0, len(idx), self.batch_size):
-                    chunk = idx[start : start + self.batch_size]
-                    micros.append(self._take_batch(chunk))
-                yield micros
+            perm = rng.permutation(self.num_examples)
+            micros: list[
+                Union[
+                    tuple[_model.Observation, _model.Actions],
+                    tuple[_model.Observation, _model.Actions, jax.Array],
+                ]
+            ] = []
+            for start in range(0, self.num_examples, self.batch_size):
+                chunk = perm[start : start + self.batch_size]
+                micros.append(self._take_batch(chunk))
+            yield micros
 
     def _take_batch(self, idx: np.ndarray) -> Union[
         tuple[_model.Observation, _model.Actions],

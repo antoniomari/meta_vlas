@@ -66,11 +66,9 @@ def main() -> None:
         type=int,
         default=1,
         help=(
-            "GRPO-style (--grpo_like) only: full passes over the collected BC buffer per outer "
-            "iteration. Total gradient steps = n_epoch * steps_per_epoch. "
-            "Default path: steps_per_epoch = ceil(n_examples / batch) (shuffled minibatches). "
-            "With --grpo_grad_accum_per_trajectory: steps_per_epoch = number of distinct rollout "
-            "trajectories in the buffer (one optimizer step per trajectory; microbatch grad average). "
+            "With --grpo_like: number of full passes over the pooled BC buffer per outer iteration. "
+            "Each pass performs one optimizer update that averages gradients over microbatches "
+            "covering every concatenated rollout sample (steps_per_epoch=1; total grad steps = n_epoch). "
             "Ignored when --grpo_like is off (use --bc_steps)."
         ),
     )
@@ -111,6 +109,14 @@ def main() -> None:
     )
     parser.add_argument("--save_video", action="store_true", default=True)
     parser.add_argument("--no_save_video", action="store_false", dest="save_video")
+    parser.add_argument(
+        "--save_distillation_rollout_metrics_pdf",
+        action="store_true",
+        help=(
+            "Write iter_*/distillation_rollout_metrics.pdf (per-iter rollout alignment / group metrics). "
+            "Default is off to reduce disk use."
+        ),
+    )
     parser.add_argument(
         "--cumulative_buffer",
         action="store_true",
@@ -278,16 +284,6 @@ def main() -> None:
         help="Denominator epsilon for --grpo_weight mean_std (must be > 0).",
     )
     parser.add_argument(
-        "--grpo_grad_accum_per_trajectory",
-        action="store_true",
-        help=(
-            "GRPO only: one optimizer step per rollout trajectory; average gradients over microbatches "
-            "that cover that trajectory (same policy weights for all microbatches). Requires "
-            "rollout_trajectory_id on BC rows (set automatically). Incompatible with plain per-minibatch "
-            "GRPO steps; uses --n_epoch as number of shuffled passes over trajectories."
-        ),
-    )
-    parser.add_argument(
         "--distill_collect_every",
         type=int,
         default=1,
@@ -361,8 +357,6 @@ def main() -> None:
         parser.error("--distill_collect_every must be >= 1")
     if int(args.n_epoch) < 1:
         parser.error("--n_epoch must be >= 1")
-    if args.grpo_grad_accum_per_trajectory and not args.grpo_like:
-        parser.error("--grpo_grad_accum_per_trajectory requires --grpo_like")
     distill_collect_every = int(args.distill_collect_every)
     temporal_decay = float(args.temporal_decay)
     if temporal_decay < 0:
@@ -431,9 +425,6 @@ def main() -> None:
         grpo_weight_eps=float(args.grpo_weight_eps),
         distill_collect_every=distill_collect_every,
         grpo_n_epoch=(n_epoch if bool(args.grpo_like) else None),
-        grpo_grad_accum_per_trajectory=bool(
-            args.grpo_like and args.grpo_grad_accum_per_trajectory
-        ),
     )
 
     print(f"Run directory: {run_dir}")
@@ -462,7 +453,6 @@ def main() -> None:
         "grpo_weight_eps": float(args.grpo_weight_eps),
         "distill_collect_every": distill_collect_every,
         "n_epoch": n_epoch,
-        "grpo_grad_accum_per_trajectory": bool(args.grpo_grad_accum_per_trajectory),
         "student_pretraining_steps": student_pretraining_steps,
         "cumulative_buffer": args.cumulative_buffer,
         "alignment_ratio_threshold": align_th,
@@ -471,6 +461,9 @@ def main() -> None:
         "single_episode": args.single_episode,
         "lora": args.lora,
         "action_expert_only": args.action_expert_only,
+        "save_distillation_rollout_metrics_pdf": bool(
+            args.save_distillation_rollout_metrics_pdf
+        ),
         "run_dir": str(run_dir),
     }
     wb_run = init_wandb(args, run_dir, config=wandb_cfg)
@@ -786,7 +779,10 @@ def main() -> None:
             distill_collect_every=distill_collect_every,
             distill_trajectory_id_offset=int(it) * 65536,
         )
-        if episode_rollout_metrics:
+        if (
+            args.save_distillation_rollout_metrics_pdf
+            and episode_rollout_metrics
+        ):
             plot_distillation_iter_rollout_metrics_pdf(
                 iter_idx=it,
                 task_id=task_id,
@@ -895,31 +891,18 @@ def main() -> None:
         bc_bs = min(batch_size, len(bc_buffer))
         bc_train_seed = seed + it + 777
         if args.grpo_like:
-            if args.grpo_grad_accum_per_trajectory:
-                bc_loader = NeighborsDataLoader(
-                    bc_buffer,
-                    bc_bs,
-                    data_cfg,
-                    sequential_epochs=False,
-                    epoch_seed=bc_train_seed,
-                    n_epoch=n_epoch,
-                    grpo_one_grad_per_trajectory=True,
-                )
-                n_traj = bc_loader.num_trajectories()
-                steps_per_epoch = n_traj
-                num_bc_steps = n_epoch * n_traj
-                last_bc_grad_steps = num_bc_steps
-            else:
-                bc_loader = NeighborsDataLoader(
-                    bc_buffer,
-                    bc_bs,
-                    data_cfg,
-                    sequential_epochs=True,
-                    epoch_seed=bc_train_seed,
-                )
-                steps_per_epoch = len(bc_loader)
-                num_bc_steps = n_epoch * steps_per_epoch
-                last_bc_grad_steps = num_bc_steps
+            bc_loader = NeighborsDataLoader(
+                bc_buffer,
+                bc_bs,
+                data_cfg,
+                sequential_epochs=False,
+                epoch_seed=bc_train_seed,
+                n_epoch=n_epoch,
+                grpo_full_buffer=True,
+            )
+            steps_per_epoch = 1
+            num_bc_steps = n_epoch
+            last_bc_grad_steps = num_bc_steps
         else:
             bc_loader = NeighborsDataLoader(bc_buffer, bc_bs, data_cfg)
             num_bc_steps = bc_steps
@@ -927,13 +910,8 @@ def main() -> None:
 
         _bc_note = " (GRPO-weighted denoise loss)" if args.grpo_like else ""
         if args.grpo_like:
-            _acc_note = (
-                " [1 grad step / traj, microbatch accum]"
-                if args.grpo_grad_accum_per_trajectory
-                else ""
-            )
             print(
-                f"  BC train (GRPO){_acc_note}: n_epoch={n_epoch}, steps/epoch={steps_per_epoch}, "
+                f"  BC train (GRPO): n_epoch={n_epoch}, steps/epoch={steps_per_epoch}, "
                 f"total_grad_steps={num_bc_steps}, lr={bc_lr}, examples={len(bc_buffer)}, "
                 f"batch={bc_bs}{_bc_note}"
             )
@@ -984,7 +962,6 @@ def main() -> None:
             kl_lambda=kl_lambda,
             ref_model_for_kl=ref_for_kl,
             grpo_like=bool(args.grpo_like),
-            grpo_one_grad_per_trajectory=bool(args.grpo_grad_accum_per_trajectory),
         )
         del ref_for_kl
         del bc_loader
@@ -1100,11 +1077,13 @@ def main() -> None:
         "kl_lambda": kl_lambda,
         "max_teacher_variance": max_teacher_var,
         "grpo_like": bool(args.grpo_like),
-        "grpo_grad_accum_per_trajectory": bool(args.grpo_grad_accum_per_trajectory),
         "grpo_trust_eps": float(args.grpo_trust_eps) if args.grpo_trust_eps is not None else None,
         "grpo_weight": args.grpo_weight,
         "grpo_weight_eps": float(args.grpo_weight_eps),
         "distill_collect_every": distill_collect_every,
+        "save_distillation_rollout_metrics_pdf": bool(
+            args.save_distillation_rollout_metrics_pdf
+        ),
         "student_pretraining_steps": student_pretraining_steps,
         "student_pretraining_lr": (float(spt_lr) if student_pretraining_steps > 0 else None),
         "student_pretraining_eval_interval": spt_eval_interval,
@@ -1139,10 +1118,16 @@ def main() -> None:
         f"(also updated during SFT prep, each rollout episode, after BC, and after teacher eval; "
         f"page 1: teacher + optional SFT prep + BC + success + ||Δθ|| per BC phase; page 2+: per-BC-phase)"
     )
-    print(
-        f"Distillation rollout metrics (multi-page PDF per iter): "
-        f"{video_dir}/iter_*/distillation_rollout_metrics.pdf"
-    )
+    if args.save_distillation_rollout_metrics_pdf:
+        print(
+            f"Distillation rollout metrics (multi-page PDF per iter): "
+            f"{video_dir}/iter_*/distillation_rollout_metrics.pdf"
+        )
+    else:
+        print(
+            "Per-iter distillation_rollout_metrics.pdf not written "
+            "(pass --save_distillation_rollout_metrics_pdf to enable)."
+        )
     print(f"Saved results to {run_dir / 'results.csv'} (includes teacher_eval_success_rate)")
 
     if wb_run is not None:
